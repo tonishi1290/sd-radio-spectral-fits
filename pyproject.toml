@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sd-radio-spectral-fits"
+version = "0.5.1"
+description = "Single-dish radio spectral SDFITS writer"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Toshikazu Onishi"}]
+dependencies = [
+  "numpy>=1.20",
+  "astropy>=5.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "pytest-cov"]
+
+[project.urls]
+Homepage = "https://example.invalid/sd-radio-spectral-fits"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
