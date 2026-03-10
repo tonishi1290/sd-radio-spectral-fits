@@ -2,9 +2,12 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
+[tool.setuptools.dynamic]
+version = {attr = "sd_radio_spectral_fits.__version__"} 
+
 [project]
 name = "sd-radio-spectral-fits"
-version = "0.5.1"
+dynamic = ["version"] 
 description = "Single-dish radio spectral SDFITS writer"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -13,6 +16,9 @@ authors = [{name = "Toshikazu Onishi"}]
 dependencies = [
   "numpy>=1.20",
   "astropy>=5.0",
+  "pandas",
+  "scipy",
+  "spectral_cube",
 ]
 
 [project.optional-dependencies]
@@ -22,7 +28,10 @@ test = ["pytest>=7", "pytest-cov"]
 Homepage = "https://example.invalid/sd-radio-spectral-fits"
 
 [tool.setuptools]
+# 複数の [tool.setuptools] ブロックを作らず、ここにまとめます
 package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = ["*"]  # src 以下のすべてのパッケージ（toolsを含む）を対象にする
+exclude = ["tools*"] 

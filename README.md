@@ -1,106 +1,151 @@
 # sd-radio-spectral-fits
 
-Single-dish radio spectral **SDFITS-style** FITS writer.
+Single-dish radio spectral analysis package for SDFITS/Scantable workflows.
 
-- Distribution / repo name: `sd-radio-spectral-fits`
+- Distribution / repository name: `sd-radio-spectral-fits`
 - Python import name: `sd_radio_spectral_fits`
 
-## Install (editable)
+## Overview
+
+`sd_radio_spectral_fits` is a practical package for single-dish radio spectroscopy.
+It supports a consistent workflow from raw spectra to calibrated data products, including
+SDFITS I/O, Scantable-based processing, interactive visualization, and 3D cube generation.
+
+Main capabilities:
+
+- SDFITS / Scantable read-write workflow
+- Ta* calibration, baseline fitting, rest-frequency handling, and velocity coadd
+- Interactive spectral viewers in `profile_view` (`viewer`, `montage`, `grid`)
+- OTF / PS mapping and 3D FITS cube generation in `map_3d`
+- NECST RawData tools for Sun-scan analysis and SDFITS conversion
+- Single-beam and multi-beam beam-measurement workflows
+
+## Installation
 
 ```bash
 pip install -e .
 ```
 
-## Quickstart
+## Quick start
 
 ```python
-from sd_radio_spectral_fits import (
-    Site, DatasetInfo, SpectralAxisUniform, Efficiency, SDRadioSpectralSDFITSWriter
+import sd_radio_spectral_fits.calibrate as cal
+import sd_radio_spectral_fits.coadd as coadd
+import sd_radio_spectral_fits.baseline as bsl
+import sd_radio_spectral_fits.fitsio as fitsio
+import sd_radio_spectral_fits.profile_view.viewer as pv
+
+sc_raw = fitsio.read_scantable("example_raw.fits")
+
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    vlsrk_range_kms=(-200, 200),
+    t_hot_k=300.0,
+    vcorr_chunk_sec=5,
+    dtype="float32",
 )
 
-site = Site(lat_deg=35.94, lon_deg=138.472, elev_m=1350.0)
-
-axis = SpectralAxisUniform(
-    crval1_hz=115.2712018e9,
-    cdelt1_hz=61e3,
-    crpix1=1.0,
-    restfreq_hz=115.2712018e9,
-    specsys="TOPOCENT",
-    veldef="RADIO",
-    refchan=1,
+sc_scan = coadd.run_velocity_coadd(
+    inputs=sc_cal,
+    group_mode="scan",
+    mode="rms_weight",
 )
 
-info = DatasetInfo(
-    telescope="MyDish",
-    observer="Observer",
-    project="DEMO",
-    object_name="Target",
-    radesys="ICRS",
-    equinox=2000.0,
-    src_radesys="ICRS",
-    src_equinox=2000.0,
-    eff=Efficiency(effstat="UNKNOWN"),
-    refr_included_in_corr=True,
-    doppler_tracking_applied=False,
-    spectral_axis=axis,
+sc_bsl = bsl.run_baseline_fit(
+    input_data=sc_scan,
+    poly_order=3,
+    vwin=["-30:-10", "20:50"],
 )
 
-w = SDRadioSpectralSDFITSWriter(n_chan=1024, site=site, info=info)
-# w.add_row(...)
-# w.write("out.fits")
+pv.view_spectra(sc_bsl, xrange=(-30, 50))
 ```
 
-## Public API policy
-
-The top-level package (`sd_radio_spectral_fits`) intentionally exports only the
-main writer and a small set of dataclasses.
-
-For advanced/low-level symbols (full schema constants, enums, helper types),
-import from:
+## 3D mapping example
 
 ```python
-from sd_radio_spectral_fits.sdfits_writer import SCHEMA
+from sd_radio_spectral_fits.map_3d.config import GridConfig
+from sd_radio_spectral_fits.map_3d.gridder import run_mapping_pipeline
+
+cfg = GridConfig(
+    x0=0.0,
+    y0=0.0,
+    nx=121,
+    ny=121,
+    cell_arcsec=7.5,
+    beam_fwhm_arcsec=16.0,
+    kernel="gjinc",
+)
+
+run_mapping_pipeline(
+    scantable=scantable,
+    config=cfg,
+    output_fits="otf_map.fits",
+    projection="SFL",
+    out_scale="TA*",
+    dv_kms=0.2,
+)
 ```
 
+## NECST-related command-line tools
 
-## Examples
+The repository also includes CLI tools for NECST RawData workflows.
 
-Run examples after installing:
+### Single-beam Sun-scan
 
 ```bash
-python -m examples.ex01_raw_on_off_hot
-python -m examples.ex02_tastar_dump_multi_points
-python -m examples.ex03_integrated_tastar_multi_points
-python -m examples.ex04_integrated_doppler_corrected
-python -m examples.ex05_otf_raw_hot_off_continuous_on
-python -m examples.ex06_sun_scan_raw_radec_target_azel_offset
-python -m examples.ex07_sun_scan_total_power_only
+sunscan_singlebeam RAWDATA \
+  --spectral-name xffts-board1 \
+  --outdir out_single
 ```
 
+### NECST RawData to SDFITS
 
-## Provenance (recommended)
+```bash
+necst_v4_sdfits_converter RAWDATA \
+  --spectrometer-config beams.toml \
+  --out output.fits
+```
 
-This writer records the software name and version in FITS headers:
+### Multi-beam workflow
 
-- `SWNAME = 'sd-radio-spectral-fits'`
-- `SWVER  = '<package version>'`
+```bash
+check_spectrometer_config beams.toml --out-csv config_check.csv
 
-These keywords also appear in console output when writing files.
+sunscan_extract_multibeam RAWDATA \
+  --spectrometer-config beams.toml \
+  --outdir out_extract
 
+sunscan_fit_multibeam \
+  out_extract/sunscan_multibeam_scan_summary_<TAG>.csv \
+  --spectrometer-config beams.toml \
+  --outdir out_fit \
+  --center-beam-id B00 \
+  --model both
+```
 
-## Header tracing (recommended)
+## Documentation
 
-To make future provenance tracking easier, the writer always records:
+Detailed manuals are available under `docs/`.
+Most of the current documentation is written in Japanese.
 
-- `SWNAME = 'sd-radio-spectral-fits'`
-- `SWVER  = '<package version>'`
+Recommended entry points:
 
-in both the primary header and the binary-table extension header.
+- `docs/sdrsf_package_manual_ja_v2.md`
+- `docs/sdrsf_cookbook_ja_v2.md`
+- `docs/sdfits_final_complete_manual_ja.md`
+- `docs/profile_view_manual_ja_v2.md`
+- `docs/package_manual_jp_map3d_complete_rev3_2026-03-10.md`
+- `docs/package_cookbook_jp_map3d_rev3_2026-03-10.md`
+- `docs/singlebeam_sunscan_converter_manual.md`
+- `docs/multibeam_beam_measurement_manual_v2.md`
 
-For spectral-frame handling, the extension header writes:
+## Notes
 
-- `SPECSYS`  : spectral reference frame of the stored axis
-- `SSYSOBS`  : observer frame (commonly `TOPOCENT`)
-- `VELDEF`   : velocity definition (`RADIO`/`OPTI`/`RELA`)
-- `VELREF`   : AIPS/casacore integer (adds `+256` when `VELDEF='RADIO'`)
+- `profile_view` is intended for interactive spectral inspection.
+- `map_3d` provides the practical pipeline for OTF / PS cube making.
+- The Sun-scan and converter tools are primarily designed for NECST RawData.
+- Multi-beam analysis is built on top of validated single-beam analysis and converter-compatible `beams.toml` settings.
 
+## License
+
+MIT License. See [LICENSE](LICENSE).

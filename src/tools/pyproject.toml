@@ -1,0 +1,16 @@
+[project]
+name = "sd-radio-spectral-fits-tools"
+version = "0.1.0"
+dependencies = ["sd-radio-spectral-fits"] # 本体に依存させる
+
+[project.scripts]
+necst_v4_sdfits_converter = "tools.necst.necst_v4_sdfits_converter:main"
+sunscan_singlebeam = "tools.necst.sunscan_singlebeam:main"
+sunscan_extract_multibeam = "tools.necst.sunscan_extract_multibeam:main"
+sunscan_make_pseudo_multibeam = "tools.necst.sunscan_make_pseudo_multibeam:main"
+check_spectrometer_config = "tools.necst.check_spectrometer_config:main"
+sunscan_multibeam = "tools.necst.sunscan_multibeam:main"
+
+[tool.setuptools]
+# どのフォルダをパッケージとして含めるかを明示
+packages = ["necst"]

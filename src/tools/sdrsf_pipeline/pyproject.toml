@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sdrsf-pipeline"
+version = "0.1.2"
+description = "Standalone HOT/ON/OFF -> Ta* pipeline tools (no changes to sd_radio_spectral_fits)"
+requires-python = ">=3.9"
+dependencies = [
+  "numpy>=1.21",
+  "pandas>=1.5",
+]
+
+[project.optional-dependencies]
+fits = ["astropy>=5.0"]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+sdrsf-make-rawspec = "sdrsf_pipeline.scripts.make_rawspec:main"
+sdrsf-make-tastar  = "sdrsf_pipeline.scripts.make_tastar:main"
+sdrsf-export-sdfits = "sdrsf_pipeline.scripts.export_sdfits:main"
+sdrsf-coadd-points = "sdrsf_pipeline.scripts.coadd_points:main"
+sdrsf-baseline-fit = "sdrsf_pipeline.scripts.baseline_fit_fits:main"
+sdrsf-concat-fits  = "sdrsf_pipeline.scripts.concat_fits:main"
+sdrsf-regrid-and-concat = "sdrsf_pipeline.scripts.regrid_and_concat:main"
+sdrsf-coadd-fits-vlsrk = "sdrsf_pipeline.scripts.coadd_fits_vlsrk:main"

@@ -1,0 +1,225 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
+from typing import Any, Dict, Optional
+import hashlib
+import json
+
+
+DEFAULT_SPECTRAL_NAME = "xffts-board1"
+DEFAULT_OUTDIR = "."
+DEFAULT_AZEL_SOURCE = "encoder"
+DEFAULT_ALTAZ_APPLY = "none"
+DEFAULT_ENCODER_SHIFT_SEC = 0.0
+DEFAULT_ENCODER_VAVG_SEC = 0.0
+DEFAULT_CHOPPER_WHEEL = True
+DEFAULT_TAMB_FALLBACK_K = 300.0
+DEFAULT_CHOPPER_WIN_SEC = 5.0
+DEFAULT_CHOPPER_STAT = "median"
+DEFAULT_RIPPLE_REMOVE = True
+DEFAULT_RIPPLE_MODEL = "auto"
+DEFAULT_RIPPLE_TARGET_HZ = 1.2
+DEFAULT_RIPPLE_SEARCH_HZ = 0.3
+DEFAULT_RIPPLE_BW_HZ = 0.7
+DEFAULT_RIPPLE_MAX_HARM = 8
+DEFAULT_RIPPLE_ORDER = 2
+DEFAULT_RIPPLE_NOTCH_PASS = 4
+DEFAULT_RIPPLE_TREND_WIN_SEC = 5.0
+DEFAULT_RIPPLE_RESAMPLE_DT_SEC = 0.0
+DEFAULT_RIPPLE_PRESET = "auto"
+DEFAULT_PROFILE_XLIM_DEG = 1.0
+DEFAULT_DEBUG_PLOT = False
+DEFAULT_RIPPLE_EVAL_BAND_HZ = 0.0
+DEFAULT_TRIM_SCAN = True
+DEFAULT_TRIM_VFRAC = 0.20
+DEFAULT_TRIM_VMIN = 1e-4
+DEFAULT_TRIM_GAP = 10
+DEFAULT_TRIM_MIN_SAMPLES = 100
+DEFAULT_TRIM_DOMINANT_AXIS = True
+DEFAULT_TRIM_AXIS_RATIO_MIN = 3.0
+DEFAULT_TRIM_VPERCENTILE = 95.0
+DEFAULT_TRIM_STEADY_SCAN = True
+DEFAULT_TRIM_USE_ON_ONLY = True
+DEFAULT_TRIM_SCAN_SPEED_MIN_ARCSEC_S = 20.0
+DEFAULT_TRIM_XWIN_FACTOR = 1.2
+DEFAULT_TRIM_CROSS_OFFSET_MAX_DEG = 0.5
+DEFAULT_TRIM_STEADY_CV_MAX = 0.8
+DEFAULT_STRICT_DERIV = True
+DEFAULT_CONTINUE_ON_ERROR = False
+DEFAULT_EDGE_FIT = True
+DEFAULT_EDGE_FIT_WIN_DEG = 0.15
+DEFAULT_EDGE_FIT_THRESHOLD = 0.20
+DEFAULT_HPBW_INIT_ARCSEC = 324.0
+DEFAULT_EDGE_FIT_PLOT_MAX_SCANS = 3
+DEFAULT_HPBW_FACTOR = 1.2
+DEFAULT_DISH_DIAMETER_M = 1.85
+
+
+@dataclass
+class InputConfig:
+    rawdata_path: Path
+    spectral_name: str = DEFAULT_SPECTRAL_NAME
+    azel_source: str = DEFAULT_AZEL_SOURCE
+    altaz_apply: str = DEFAULT_ALTAZ_APPLY
+    encoder_shift_sec: float = DEFAULT_ENCODER_SHIFT_SEC
+    encoder_vavg_sec: float = DEFAULT_ENCODER_VAVG_SEC
+
+
+@dataclass
+class CalibrationConfig:
+    chopper_wheel: bool = DEFAULT_CHOPPER_WHEEL
+    tamb_k: Optional[float] = None
+    chopper_win_sec: float = DEFAULT_CHOPPER_WIN_SEC
+    chopper_stat: str = DEFAULT_CHOPPER_STAT
+
+
+@dataclass
+class RippleConfig:
+    enabled: bool = DEFAULT_RIPPLE_REMOVE
+    preset: str = DEFAULT_RIPPLE_PRESET
+    model: str = DEFAULT_RIPPLE_MODEL
+    target_hz: float = DEFAULT_RIPPLE_TARGET_HZ
+    search_hz: float = DEFAULT_RIPPLE_SEARCH_HZ
+    bw_hz: Optional[float] = None
+    max_harm: Optional[int] = None
+    order: Optional[int] = None
+    notch_passes: Optional[int] = None
+    trend_win_sec: Optional[float] = None
+    resample_dt_sec: Optional[float] = None
+    eval_band_hz: Optional[float] = None
+
+
+@dataclass
+class ProfileConfig:
+    profile_xlim_deg: float = DEFAULT_PROFILE_XLIM_DEG
+
+
+@dataclass
+class TrimConfig:
+    enabled: bool = DEFAULT_TRIM_SCAN
+    vfrac: float = DEFAULT_TRIM_VFRAC
+    vmin: float = DEFAULT_TRIM_VMIN
+    gap_fill: int = DEFAULT_TRIM_GAP
+    min_samples: int = DEFAULT_TRIM_MIN_SAMPLES
+    dominant_axis: bool = DEFAULT_TRIM_DOMINANT_AXIS
+    ratio_min: float = DEFAULT_TRIM_AXIS_RATIO_MIN
+    vpercentile: float = DEFAULT_TRIM_VPERCENTILE
+    steady_scan: bool = DEFAULT_TRIM_STEADY_SCAN
+    use_on_only: bool = DEFAULT_TRIM_USE_ON_ONLY
+    xwin_factor: float = DEFAULT_TRIM_XWIN_FACTOR
+    cross_offset_max_deg: float = DEFAULT_TRIM_CROSS_OFFSET_MAX_DEG
+    speed_min_deg_s: float = DEFAULT_TRIM_SCAN_SPEED_MIN_ARCSEC_S / 3600.0
+    steady_cv_max: float = DEFAULT_TRIM_STEADY_CV_MAX
+
+
+@dataclass
+class EdgeFitConfig:
+    enabled: bool = DEFAULT_EDGE_FIT
+    strict_deriv: bool = DEFAULT_STRICT_DERIV
+    fit_win_deg: float = DEFAULT_EDGE_FIT_WIN_DEG
+    fit_threshold: float = DEFAULT_EDGE_FIT_THRESHOLD
+    hpbw_init_arcsec: float = DEFAULT_HPBW_INIT_ARCSEC
+
+
+@dataclass
+class ReportConfig:
+    outdir: Path = Path(DEFAULT_OUTDIR)
+    debug_plot: bool = DEFAULT_DEBUG_PLOT
+    edge_fit_plot_max_scans: int = DEFAULT_EDGE_FIT_PLOT_MAX_SCANS
+    tag: Optional[str] = None
+
+
+@dataclass
+class RuntimeConfig:
+    continue_on_error: bool = DEFAULT_CONTINUE_ON_ERROR
+
+
+@dataclass
+class BeamOverride:
+    stream_name: Optional[str] = None
+    beam_id: Optional[str] = None
+    restfreq_hz: Optional[float] = None
+    hpbw_init_arcsec: Optional[float] = None
+    polariza: Optional[str] = None
+    fdnum: Optional[int] = None
+    ifnum: Optional[int] = None
+    plnum: Optional[int] = None
+    sampler: Optional[str] = None
+
+
+@dataclass
+class SunScanAnalysisConfig:
+    input: InputConfig
+    calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    ripple: RippleConfig = field(default_factory=RippleConfig)
+    profile: ProfileConfig = field(default_factory=ProfileConfig)
+    trim: TrimConfig = field(default_factory=TrimConfig)
+    edge_fit: EdgeFitConfig = field(default_factory=EdgeFitConfig)
+    report: ReportConfig = field(default_factory=ReportConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
+    beam_override: BeamOverride = field(default_factory=BeamOverride)
+    dish_diameter_m: float = DEFAULT_DISH_DIAMETER_M
+    hpbw_factor: float = DEFAULT_HPBW_FACTOR
+
+    @classmethod
+    def default(cls, rawdata_path: Path, spectral_name: str = DEFAULT_SPECTRAL_NAME, outdir: Path | str = DEFAULT_OUTDIR) -> "SunScanAnalysisConfig":
+        rawdata_path = Path(rawdata_path)
+        outdir_path = Path(outdir)
+        return cls(
+            input=InputConfig(rawdata_path=rawdata_path, spectral_name=spectral_name),
+            report=ReportConfig(outdir=outdir_path),
+        )
+
+    def resolved_tag(self) -> str:
+        return str(self.report.tag) if self.report.tag else self.input.rawdata_path.name
+
+    def with_updates(self, **kwargs: Any) -> "SunScanAnalysisConfig":
+        return replace(self, **kwargs)
+
+    def with_stream_override(
+        self,
+        *,
+        spectral_name: Optional[str] = None,
+        stream_name: Optional[str] = None,
+        beam_id: Optional[str] = None,
+        restfreq_hz: Optional[float] = None,
+        hpbw_init_arcsec: Optional[float] = None,
+        polariza: Optional[str] = None,
+        fdnum: Optional[int] = None,
+        ifnum: Optional[int] = None,
+        plnum: Optional[int] = None,
+        sampler: Optional[str] = None,
+        outdir: Optional[Path] = None,
+        tag: Optional[str] = None,
+    ) -> "SunScanAnalysisConfig":
+        new_input = replace(self.input, spectral_name=spectral_name or self.input.spectral_name)
+        new_report = replace(self.report, outdir=Path(outdir) if outdir is not None else self.report.outdir, tag=tag if tag is not None else self.report.tag)
+        new_edge_fit = replace(self.edge_fit, hpbw_init_arcsec=float(hpbw_init_arcsec) if hpbw_init_arcsec is not None else self.edge_fit.hpbw_init_arcsec)
+        new_override = replace(
+            self.beam_override,
+            stream_name=stream_name if stream_name is not None else self.beam_override.stream_name,
+            beam_id=beam_id if beam_id is not None else self.beam_override.beam_id,
+            restfreq_hz=restfreq_hz if restfreq_hz is not None else self.beam_override.restfreq_hz,
+            hpbw_init_arcsec=hpbw_init_arcsec if hpbw_init_arcsec is not None else self.beam_override.hpbw_init_arcsec,
+            polariza=polariza if polariza is not None else self.beam_override.polariza,
+            fdnum=fdnum if fdnum is not None else self.beam_override.fdnum,
+            ifnum=ifnum if ifnum is not None else self.beam_override.ifnum,
+            plnum=plnum if plnum is not None else self.beam_override.plnum,
+            sampler=sampler if sampler is not None else self.beam_override.sampler,
+        )
+        return replace(self, input=new_input, report=new_report, edge_fit=new_edge_fit, beam_override=new_override)
+
+    def config_digest(self) -> str:
+        def _normalize(value: Any) -> Any:
+            if isinstance(value, Path):
+                return str(value)
+            if isinstance(value, dict):
+                return {str(k): _normalize(v) for k, v in value.items()}
+            if isinstance(value, (list, tuple)):
+                return [_normalize(v) for v in value]
+            return value
+
+        payload: Dict[str, Any] = _normalize(asdict(self))
+        blob = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()[:16]
