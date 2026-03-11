@@ -2,12 +2,9 @@
 requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.dynamic]
-version = {attr = "sd_radio_spectral_fits.__version__"} 
-
 [project]
 name = "sd-radio-spectral-fits"
-dynamic = ["version"] 
+version = "1.0.0" 
 description = "Single-dish radio spectral SDFITS writer"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -18,7 +15,7 @@ dependencies = [
   "astropy>=5.0",
   "pandas",
   "scipy",
-  "spectral_cube",
+  "spectral-cube",
 ]
 
 [project.optional-dependencies]

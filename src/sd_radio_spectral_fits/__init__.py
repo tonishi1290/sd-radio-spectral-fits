@@ -1,5 +1,4 @@
 # src/sd_radio_spectral_fits/__init__.py
-__version__ = "1.0.0"
 
 """sd_radio_spectral_fits
 
@@ -9,7 +8,15 @@ Public API is intentionally small. For advanced/low-level symbols,
 import from :mod:`sd_radio_spectral_fits.sdfits_writer`.
 """
 
-from .version import __version__, SWNAME
+from importlib.metadata import version, PackageNotFoundError
+
+try:
+    __version__ = version("sd-radio-spectral-fits") 
+except PackageNotFoundError:
+    __version__ = "1.0.0" # インストール前は手動の値をフォールバックにする
+
+SWNAME = "sd_radio_spectral_fits" # これを定義しておかないと __all__ で怒られます
+
 from .sdfits_writer import (
     Site,
     Efficiency,
