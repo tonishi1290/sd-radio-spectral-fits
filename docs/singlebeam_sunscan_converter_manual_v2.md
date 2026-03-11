@@ -62,6 +62,9 @@ single-beam の標準的な作業順は次のとおりです。
 
 ```bash
 sunscan_singlebeam RAWDATA \
+  --telescope OMU1P85M \
+  --tel-loaddata OMU1p85m \
+  --planet sun \
   --spectral-name xffts-board1 \
   --outdir out_single
 ```
@@ -78,12 +81,37 @@ sunscan_singlebeam RAWDATA \
 
 `<tag>` は通常、RawData ディレクトリ名をもとに決まります。
 
+### DB 名解決に必要な 3 つのパラメータ
+
+`sunscan_singlebeam` では、RawData 内の DB 名解決と天体位置計算のために、次の 3 つの値を内部で使います。
+
+- `--telescope`
+  - DB table 名の解決に使う望遠鏡名
+  - 例: `OMU1P85M`
+- `--tel-loaddata`
+  - `loaddb(...)` に渡す望遠鏡名
+  - 例: `OMU1p85m`
+- `--planet`
+  - `astropy` の `get_body(...)` に渡す天体名
+  - 例: `sun`
+
+現在の既定値は
+
+- `--telescope OMU1P85M`
+- `--tel-loaddata OMU1p85m`
+- `--planet sun`
+
+です。OMU 1.85 m の太陽スキャンでは通常この既定値のままで構いませんが、**望遠鏡名や対象天体が異なる場合はここを必ず合わせてください。**
+
 ---
 
 ## 4.2 実運用でよく使う例
 
 ```bash
 sunscan_singlebeam "$RAW" \
+  --telescope OMU1P85M \
+  --tel-loaddata OMU1p85m \
+  --planet sun \
   --spectral-name xffts-board1 \
   --outdir out_single \
   --azel-source encoder \
@@ -101,6 +129,15 @@ sunscan_singlebeam "$RAW" \
 
 ### 座標・時系列まわり
 
+- `--telescope`
+  - DB table 名の解決に使う望遠鏡名
+  - 例: `OMU1P85M`
+- `--tel-loaddata`
+  - `loaddb(...)` に渡す望遠鏡名
+  - 例: `OMU1p85m`
+- `--planet`
+  - 天体位置計算に使う対象名
+  - 例: `sun`
 - `--spectral-name`
   - 分光 stream 名
 - `--azel-source {encoder,altaz}`
@@ -594,6 +631,9 @@ single-beam では普通、beam 回転は不要です。迷ったら `rotation_m
 
 ```bash
 sunscan_singlebeam "$RAW" \
+  --telescope OMU1P85M \
+  --tel-loaddata OMU1p85m \
+  --planet sun \
   --spectral-name xffts-board1 \
   --outdir out_single \
   --azel-source encoder \
@@ -639,4 +679,15 @@ necst_v4_sdfits_converter "$RAW" \
 - `sun_scan_v4_v5.py` は legacy / 比較確認用として残す
 - converter は、できるだけ `--spectrometer-config` を使う
 - single-beam でも `beams.toml` を作っておくと、後の multi-beam 展開が容易になる
+
+---
+
+## 9. 次の段階
+
+single-beam の運用が安定したら、次は multi-beam 用説明書へ進みます。multi-beam 側では、同じく `pyproject.toml` の console_scripts を前提に、次のコマンド群で説明する予定です。
+
+- `sunscan_extract_multibeam`
+- `sunscan_fit_multibeam`
+- `sunscan_multibeam`
+- `check_spectrometer_config`
 
