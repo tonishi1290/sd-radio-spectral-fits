@@ -223,6 +223,9 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--spectrometer-config", required=True, help="converter-compatible spectrometer config TOML")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--run-id", default=None, help="Override run_id (default: rawdata directory name)")
+    ap.add_argument("--telescope", default="OMU1P85M", help="Telescope name used in NECST DB table names")
+    ap.add_argument("--tel-loaddata", default="OMU1p85m", help="Telescope name passed to nercst loaddb()")
+    ap.add_argument("--planet", default="sun", help="Target body name passed to astropy.get_body()")
     ap.add_argument("--stream-name", dest="stream_names", action="append", default=None, help="Select a specific stream name (repeatable)")
 
     ap.add_argument("--azel-source", choices=["encoder", "altaz"], default="encoder")
@@ -290,6 +293,9 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
 
 def config_from_args(args: argparse.Namespace) -> SunScanAnalysisConfig:
     cfg = SunScanAnalysisConfig.default(rawdata_path=Path(args.rawdata).expanduser().resolve(), spectral_name="__unused__", outdir=Path(args.outdir).expanduser().resolve())
+    cfg.input.telescope = str(args.telescope)
+    cfg.input.tel_loaddata = str(args.tel_loaddata)
+    cfg.input.planet = str(args.planet)
     cfg.input.azel_source = str(args.azel_source)
     cfg.input.altaz_apply = str(args.altaz_apply)
     cfg.input.encoder_shift_sec = float(args.encoder_shift_sec)

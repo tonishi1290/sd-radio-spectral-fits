@@ -11,6 +11,9 @@ def build_dataframe_from_config(config: SunScanAnalysisConfig):
     return compat.build_dataframe(
         config.input.rawdata_path,
         config.input.spectral_name,
+        telescope=str(config.input.telescope),
+        tel_loaddata=str(config.input.tel_loaddata),
+        planet=str(config.input.planet),
         azel_source=str(config.input.azel_source),
         altaz_apply=str(config.input.altaz_apply),
         encoder_shift_sec=float(config.input.encoder_shift_sec),

@@ -7,6 +7,9 @@ import hashlib
 import json
 
 
+DEFAULT_TELESCOPE = "OMU1P85M"
+DEFAULT_TEL_LOADDATA = "OMU1p85m"
+DEFAULT_PLANET = "sun"
 DEFAULT_SPECTRAL_NAME = "xffts-board1"
 DEFAULT_OUTDIR = "."
 DEFAULT_AZEL_SOURCE = "encoder"
@@ -59,6 +62,9 @@ DEFAULT_DISH_DIAMETER_M = 1.85
 @dataclass
 class InputConfig:
     rawdata_path: Path
+    telescope: str = DEFAULT_TELESCOPE
+    tel_loaddata: str = DEFAULT_TEL_LOADDATA
+    planet: str = DEFAULT_PLANET
     spectral_name: str = DEFAULT_SPECTRAL_NAME
     azel_source: str = DEFAULT_AZEL_SOURCE
     altaz_apply: str = DEFAULT_ALTAZ_APPLY

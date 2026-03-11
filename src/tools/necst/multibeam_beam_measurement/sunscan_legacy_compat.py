@@ -1237,8 +1237,8 @@ def integ_all_channels(spec2d: np.ndarray) -> np.ndarray:
     return np.sum(spec2d, axis=1)
 
 
-def load_spectral(rawdata_path: pathlib.Path, spectral_name: str):
-    data = nercst.core.io.loaddb(str(rawdata_path), str(pathlib.Path(spectral_name)), telescop=TEL_LOADDATA)
+def load_spectral(rawdata_path: pathlib.Path, spectral_name: str, *, tel_loaddata: str = TEL_LOADDATA):
+    data = nercst.core.io.loaddb(str(rawdata_path), str(pathlib.Path(spectral_name)), telescop=str(tel_loaddata))
     data = nercst.core.multidimensional_coordinates.convert_frame(data, "altaz")
     t_spec = np.asarray(getattr(data, "t"), dtype=float)
     spec = getattr(data, "data")  # (ndump, nchan)
@@ -1330,17 +1330,17 @@ def _normalize_obsmode(x) -> str:
     return s if s else "UNKNOWN"
 
 
-def _infer_obsmode_from_db(db, t_spec: np.ndarray) -> np.ndarray:
+def _infer_obsmode_from_db(db, t_spec: np.ndarray, *, telescope: str = TELESCOPE) -> np.ndarray:
     """Try to read observation mode (HOT/OFF/ON) from common necstdb tables.
 
     Returns an array aligned to t_spec (nearest-neighbor in time).
     """
     # candidate tables and columns (best-effort; varies by deployment)
     table_candidates = [
-        f"necst-{TELESCOPE}-ctrl-obsmode",
-        f"necst-{TELESCOPE}-ctrl-observation-mode",
-        f"necst-{TELESCOPE}-ctrl-antenna-obsmode",
-        f"necst-{TELESCOPE}-ctrl-antenna-observation-mode",
+        f"necst-{str(telescope)}-ctrl-obsmode",
+        f"necst-{str(telescope)}-ctrl-observation-mode",
+        f"necst-{str(telescope)}-ctrl-antenna-obsmode",
+        f"necst-{str(telescope)}-ctrl-antenna-observation-mode",
     ]
     time_cols = ["time", "t", "timestamp"]
     mode_cols = ["obsmode", "OBSMODE", "mode", "MODE", "obs_mode", "OBS_MODE", "observation_mode"]
@@ -1561,7 +1561,7 @@ def ensure_obs_and_config_files(rawdata_path: pathlib.Path) -> None:
 # -----------------------------
 # Sun ephemeris at t_spec (astropy)
 # -----------------------------
-def sun_altaz_deg(t_unix: np.ndarray, data_obj, rawdata_path: pathlib.Path) -> Tuple[np.ndarray, np.ndarray]:
+def sun_altaz_deg(t_unix: np.ndarray, data_obj, rawdata_path: pathlib.Path, *, planet: str = PLANET) -> Tuple[np.ndarray, np.ndarray]:
     os.environ["NECST_ROOT"] = str(rawdata_path)
     try:
         config.reload()
@@ -1589,7 +1589,7 @@ def sun_altaz_deg(t_unix: np.ndarray, data_obj, rawdata_path: pathlib.Path) -> T
     except Exception:
         obswl = const.c / (100.0 * u.GHz)
 
-    ref = get_body(PLANET, location=config.location, time=t)
+    ref = get_body(str(planet), location=config.location, time=t)
     altaz = AltAz(obstime=t, location=config.location, pressure=press, temperature=temp, relative_humidity=humid, obswl=obswl)
     r = ref.transform_to(altaz)
     return r.az.to_value(u.deg), r.alt.to_value(u.deg)
@@ -2297,6 +2297,9 @@ def build_dataframe(
     rawdata_path: pathlib.Path,
     spectral_name: str,
     *,
+    telescope: str = TELESCOPE,
+    tel_loaddata: str = TEL_LOADDATA,
+    planet: str = PLANET,
     azel_source: str,
     altaz_apply: str,
     encoder_shift_sec: float,
@@ -2308,11 +2311,11 @@ def build_dataframe(
 ) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
     ensure_obs_and_config_files(rawdata_path)
 
-    data, t_spec, tp1, order = load_spectral(rawdata_path, spectral_name)
+    data, t_spec, tp1, order = load_spectral(rawdata_path, spectral_name, tel_loaddata=tel_loaddata)
     db = necstdb.opendb(rawdata_path)
 
     # spectral id (for scan segmentation)
-    spec_table_name = f"necst-{TELESCOPE}-data-spectral-{spectral_name}"
+    spec_table_name = f"necst-{str(telescope)}-data-spectral-{spectral_name}"
     df_spec_tbl = _safe_read_table(db, spec_table_name)
     id_valid = False
     if df_spec_tbl is not None and "id" in df_spec_tbl.columns:
@@ -2354,7 +2357,7 @@ def build_dataframe(
 
 
     # altaz table (always needed for dlon/dlat and optional lon/lat)
-    alt_name = f"necst-{TELESCOPE}-ctrl-antenna-altaz"
+    alt_name = f"necst-{str(telescope)}-ctrl-antenna-altaz"
     df_alt = _safe_read_table(db, alt_name)
     if df_alt is None:
         raise RuntimeError(f"cannot read altaz table: {alt_name}")
@@ -2386,7 +2389,7 @@ def build_dataframe(
             el_true = lat_alt
     else:
         # encoder stream (analysis definition: minus)
-        enc_name = f"necst-{TELESCOPE}-ctrl-antenna-encoder"
+        enc_name = f"necst-{str(telescope)}-ctrl-antenna-encoder"
         df_enc = _safe_read_table(db, enc_name)
         if df_enc is None:
             raise RuntimeError(f"cannot read encoder table: {enc_name}")
@@ -2427,7 +2430,7 @@ def build_dataframe(
 
 
     # Sun ephemeris at t_spec
-    az_sun, el_sun = sun_altaz_deg(t_spec, data, rawdata_path)
+    az_sun, el_sun = sun_altaz_deg(t_spec, data, rawdata_path, planet=planet)
 
     # Sun-centered offsets
     off_az = _az_wrap_diff(az_true, az_sun)
