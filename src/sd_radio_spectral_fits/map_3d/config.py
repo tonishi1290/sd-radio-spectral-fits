@@ -2,7 +2,8 @@
 from __future__ import annotations
 import numpy as np
 from dataclasses import dataclass
-from typing import Optional, Literal, Union, Any
+from typing import Optional, Literal, Union
+
 
 @dataclass
 class MapConfig:
@@ -29,14 +30,14 @@ class MapConfig:
     support_radius_pix: Optional[float] = None
     chunk_ch: int = 256      # メモリ節約のためのチャンネル分割処理（デフォルト256）
     dtype: str = "float32"
-    
+
     # --- 3. 重み付け・品質管理 ---
     alpha_rms: float = 0.5
     beta_tint: float = 0.0
     weight_clip_quantile: Optional[float] = 0.95
     weight_clip_max: Optional[float] = None
     exclude_turnaround: bool = True
-    
+
     # --- 4. 推定器 / QC / 安全係数 ---
     estimator: Literal['avg', 'plane'] = 'avg'
     n_min_avg: int = 2
@@ -60,15 +61,15 @@ class MapConfig:
     # =========================================================
     generate_mask: bool = False      # 3DマスクとMoment0を自動生成するか
     mask_method: str = "smooth_mask" # 'simple', 'smooth_mask', 'derivative'
-    
+
     # 共通 / simple用
     mask_sigma: float = 3.0          # マスク生成のベース閾値
-    
+
     # smooth_mask用
     mask_high_snr: float = 3.0       # コア抽出の閾値
     mask_low_snr: float = 1.5        # 拡張マスクの閾値
     mask_min_vol: int = 27           # 許容する最小体積(ピクセル数)
-    
+
     # derivative用
     mask_sigma_v: float = 2.0        # 速度方向のフィルタ幅(チャンネル数)
     mask_deriv_snr: float = 3.0      # 2次微分の検出閾値
@@ -77,14 +78,21 @@ class MapConfig:
     # 運用・出力用
     mask_compression: Optional[str] = 'PLIO_1' # FITS保存時の圧縮形式 (互換性重視ならNoneも可)
     dv_kms: Optional[float] = None   # 速度リグリッドの分解能 [km/s]
-    output_prefix: str = "map"       # 出力ファイルの接頭辞
+    output_prefix: str = "map"      # 出力ファイルの接頭辞
 
     # --- 7. 実行バックエンド ---
     backend: str = 'numpy'           # 'numpy' or 'numba' (将来用)
 
+    # --- 8. 実行時オプション ---
+    verbose: bool = False
+    workers: int = -1                # cKDTree query_ball_point 用。旧挙動は -1。
+    sort_neighbors: bool = False     # 旧挙動維持のため既定は False。
+    reproducible_mode: bool = False  # True のとき float64 / workers=1 / sort固定。
+
 
 # 以前のコードとの互換性のためにエイリアスを残す
 GridConfig = MapConfig
+
 
 @dataclass
 class GridInput:
@@ -101,6 +109,7 @@ class GridInput:
     subscan_id: Optional[np.ndarray] = None
     scan_dir: Optional[np.ndarray] = None
     is_turnaround: Optional[np.ndarray] = None
+
 
 @dataclass
 class GridResult:

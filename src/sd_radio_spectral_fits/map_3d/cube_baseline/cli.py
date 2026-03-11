@@ -285,6 +285,17 @@ def build_v_axis_kms_from_header(header: fits.Header, nchan: int, *, spectral_fi
     )
 
 
+def _read_target_mask_2d(hdul: fits.HDUList, ext: Optional[Union[int, str]]) -> Optional[np.ndarray]:
+    if ext is None:
+        return None
+    hdu = hdul[ext]
+    arr = np.asarray(hdu.data)
+    arr = np.squeeze(arr)
+    if arr.ndim != 2:
+        raise ValueError(f"target mask HDU must be 2D after squeeze, got shape={arr.shape}")
+    return np.asarray(arr != 0, dtype=bool)
+
+
 def _append_linefree_hdu(hdul_out: fits.HDUList, name: str, data_1d: Sequence[bool], *, comment: str) -> None:
     hdr_lf = fits.Header()
     hdr_lf["BTYPE"] = "LineFreeMask"
@@ -357,12 +368,14 @@ def run_cli_pipeline(
     manual_v_windows: Optional[List[str]] = None,
     linefree_mode: str = "auto",
     linefree_scope: str = "global",
+    target_mask_ext: Optional[Union[int, str]] = None,
     enable_ripple: bool = True,
     ripple_cfg: RippleConfig = RippleConfig(),
     ripple_mode: str = "auto",
     ripple_scope: str = "global",
     robust: bool = False,
     chunk_pix: int = 65536,
+    reproducible_mode: bool = False,
     load_prior_from_input: bool = True,
     run_cube_analysis: bool = False,
     cube_analysis_method: str = "smooth_mask_lite",
@@ -378,11 +391,17 @@ def run_cli_pipeline(
         cube_raw, header, cube_idx = _get_cube_from_hdul(hdul, cube_ext=cube_ext)
         lf_prior = _read_linefree_prior(hdul) if load_prior_from_input else None
         rf_prior = _read_ripple_prior(hdul) if load_prior_from_input else None
+        target_mask_2d = _read_target_mask_2d(hdul, target_mask_ext)
 
     if cube_raw.ndim != 3:
         raise ValueError(f"Cube must be 3D, got shape={cube_raw.shape}")
 
     session, _v_axis = _try_make_session(cube_raw, header)
+
+    if target_mask_2d is not None and target_mask_2d.shape != (session.ny, session.nx):
+        raise ValueError(
+            f"target_mask_2d shape mismatch: {target_mask_2d.shape} vs {(session.ny, session.nx)}"
+        )
 
     if lf_prior is not None and np.asarray(lf_prior).shape != (session.nchan,):
         logging.warning(
@@ -404,6 +423,7 @@ def run_cli_pipeline(
         logging.info("--- Iteration %d / %d ---", it + 1, int(iterations))
         run_one_iteration(
             session=session,
+            target_mask_2d=target_mask_2d,
             auto_linefree=auto_linefree,
             linefree_cfg=linefree_cfg,
             manual_v_windows=manual_v_windows,
@@ -416,6 +436,7 @@ def run_cli_pipeline(
             poly_order=int(poly_order),
             robust=robust,
             chunk_pix=int(chunk_pix),
+            reproducible_mode=bool(reproducible_mode),
         )
         rms_map = session.fit_stats.get("rms_map", None)
         if rms_map is not None:
@@ -584,15 +605,19 @@ def _main() -> None:
     p.add_argument("--no-auto-linefree", action="store_true")
     p.add_argument("--manual-vwin", nargs="*", default=None)
     p.add_argument("--linefree-mode", default="auto", choices=["auto", "prior", "current", "or"])
-    p.add_argument("--linefree-scope", default="global", choices=["global", "target"])
+    p.add_argument("--linefree-scope", default="global", choices=["global", "target", "both"])
+    p.add_argument("--target-mask-ext", default=None, help="2D FITS HDU (name or index) used as target_mask_2d for target/both scopes.")
     p.add_argument("--no-ripple", action="store_true")
     p.add_argument("--ripple-mode", default="auto", choices=["auto", "prior", "current"])
-    p.add_argument("--ripple-scope", default="global", choices=["global", "target"])
+    p.add_argument("--ripple-scope", default="global", choices=["global", "target", "both"])
     p.add_argument("--no-load-prior", action="store_true")
     p.add_argument("--nfreq", type=int, default=2)
     p.add_argument("--period", nargs=2, type=float, default=(20.0, 400.0), metavar=("LO", "HI"))
+    p.add_argument("--linefree-conservative-q", type=float, default=None, help="Enable conservative line-candidate detection using an additional quantile spectrum, e.g. 0.9.")
+    p.add_argument("--linefree-one-tail", action="store_true", help="When using --linefree-conservative-q, inspect only the upper quantile (skip the symmetric lower quantile).")
     p.add_argument("--robust", action="store_true")
     p.add_argument("--chunk-pix", type=int, default=65536)
+    p.add_argument("--reproducible", action="store_true", help="Use deterministic baseline settings (float64, normalized polynomial basis, stride sampling, stable peak ranking).")
     p.add_argument("--run-analysis", action="store_true")
     p.add_argument("--no-provisional", action="store_true")
     p.add_argument(
@@ -609,8 +634,18 @@ def _main() -> None:
         except Exception:
             cube_ext = str(args.cube_ext)
 
-    lcfg = LineFreeConfig()
+    lcfg = LineFreeConfig(
+        conservative_quantile=(None if args.linefree_conservative_q is None else float(args.linefree_conservative_q)),
+        conservative_both_tails=(not bool(args.linefree_one_tail)),
+    )
     rcfg = RippleConfig(nfreq=int(args.nfreq), period_range_chan=(float(args.period[0]), float(args.period[1])))
+
+    target_mask_ext = None
+    if args.target_mask_ext is not None:
+        try:
+            target_mask_ext = int(args.target_mask_ext)
+        except Exception:
+            target_mask_ext = str(args.target_mask_ext)
 
     run_cli_pipeline(
         args.input,
@@ -623,12 +658,14 @@ def _main() -> None:
         manual_v_windows=args.manual_vwin if args.manual_vwin else None,
         linefree_mode=str(args.linefree_mode),
         linefree_scope=str(args.linefree_scope),
+        target_mask_ext=target_mask_ext,
         enable_ripple=not args.no_ripple,
         ripple_cfg=rcfg,
         ripple_mode=str(args.ripple_mode),
         ripple_scope=str(args.ripple_scope),
         robust=bool(args.robust),
         chunk_pix=int(args.chunk_pix),
+        reproducible_mode=bool(args.reproducible),
         load_prior_from_input=not args.no_load_prior,
         run_cube_analysis=bool(args.run_analysis),
         cube_analysis_method=str(args.analysis_method),

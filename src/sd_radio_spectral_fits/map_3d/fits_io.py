@@ -39,6 +39,12 @@ def save_map_fits(
         if "SPECSYS" in grid_res.meta:
             header["SPECSYS"] = (grid_res.meta["SPECSYS"], "Spectral reference frame")
         header["VELDEF"] = ("RADI-LSR", "Radio velocity definition")
+        if "reproducible_mode" in grid_res.meta:
+            header["REPRODUC"] = (bool(grid_res.meta["reproducible_mode"]), "Reproducible gridding mode")
+        if "gridding_workers" in grid_res.meta:
+            header["GRIDWORK"] = (int(grid_res.meta["gridding_workers"]), "KDTree query workers")
+        if "sorted_neighbors" in grid_res.meta:
+            header["SORTNBR"] = (bool(grid_res.meta["sorted_neighbors"]), "Neighbor order was fixed")
 
     cube_fits = np.transpose(grid_res.cube, (2, 0, 1))
     hdu_primary = fits.PrimaryHDU(data=cube_fits.astype(np.float32), header=header)
@@ -59,7 +65,6 @@ def _fill_header_metadata(header, coord_sys, lon0, lat0, out_scale, rep_beameff,
         header["OBSRA"] = (float(lon0), "Ref Right Ascension (deg)")
         header["OBSDEC"] = (float(lat0), "Ref Declination (deg)")
 
-    # FITS BUNIT is kept machine-readable; the temperature scale is split out.
     header["BUNIT"] = ("K", "Unit of data")
     header["TEMPSCAL"] = (str(out_scale), "Temperature scale of primary cube")
     header["BTYPE"] = ("BrightnessTemperature", "Physical type of primary cube")

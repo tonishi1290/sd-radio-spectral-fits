@@ -50,7 +50,9 @@ def fit_cube_baseline(
         ripple_freqs=ripple_freqs,
         return_qc=True,
     )
-    baseline_cube = data - out_cube
+    baseline_cube = np.zeros_like(data, dtype=np.float32)
+    finite_both = np.isfinite(data) & np.isfinite(out_cube)
+    baseline_cube[finite_both] = (data[finite_both] - out_cube[finite_both]).astype(np.float32, copy=False)
 
     rms_map = np.asarray(rms_map, dtype=np.float32)
     flag_map = np.asarray(flag_map, dtype=np.uint8)

@@ -8,6 +8,7 @@ One-iteration orchestration: line-free -> ripple freqs -> fit baseline -> update
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import replace
 
 import numpy as np
 
@@ -36,14 +37,25 @@ def create_manual_signal_mask_1d(
     return in_any_windows(v_axis, windows)
 
 
-def _aggregate_spectrum(cube: np.ndarray, *, max_pix: int = 200000, seed: int = 0) -> np.ndarray:
+def _aggregate_spectrum(
+    cube: np.ndarray,
+    *,
+    max_pix: int = 200000,
+    seed: int = 0,
+    sample_mode: str = "random",
+) -> np.ndarray:
     """Spatial median spectrum for ripple frequency estimation."""
     nchan, ny, nx = cube.shape
     flat = cube.reshape(nchan, ny * nx)
     npix = ny * nx
     if npix > int(max_pix):
-        rng = np.random.default_rng(int(seed))
-        idx = rng.choice(npix, size=int(max_pix), replace=False)
+        if str(sample_mode).lower() == "stride":
+            step = float(npix) / float(int(max_pix))
+            idx = np.floor(np.arange(int(max_pix), dtype=np.float64) * step).astype(np.int64)
+            idx = np.clip(idx, 0, npix - 1)
+        else:
+            rng = np.random.default_rng(int(seed))
+            idx = np.sort(rng.choice(npix, size=int(max_pix), replace=False).astype(np.int64, copy=False))
         flat = flat[:, idx]
     with np.errstate(all="ignore"):
         spec = np.nanmedian(flat, axis=1)
@@ -63,6 +75,49 @@ def _cube_for_scope(cube: np.ndarray, target_mask_2d: np.ndarray, scope: str) ->
     if npix <= 0:
         raise ValueError("target_mask_2d selects zero pixels")
     return cube[:, tm][:, np.newaxis, :]
+
+
+def _estimate_linefree_for_scope(
+    cube_work: np.ndarray,
+    target_mask_2d: np.ndarray,
+    scope: str,
+    linefree_cfg: LineFreeConfig,
+) -> np.ndarray:
+    scope = str(scope).lower()
+    if scope in {"global", "target"}:
+        cube_detect = _cube_for_scope(cube_work, target_mask_2d, scope)
+        return estimate_linefree_mask_from_cube(cube_detect, cfg=linefree_cfg, agg="median")
+    if scope in {"both", "global_and_target", "target_and_global"}:
+        lf_g = estimate_linefree_mask_from_cube(cube_work, cfg=linefree_cfg, agg="median")
+        cube_t = _cube_for_scope(cube_work, target_mask_2d, "target")
+        lf_t = estimate_linefree_mask_from_cube(cube_t, cfg=linefree_cfg, agg="median")
+        return np.asarray(lf_g, dtype=bool) & np.asarray(lf_t, dtype=bool)
+    raise ValueError(f"Unknown linefree_scope: {scope}")
+
+
+def _aggregate_spectrum_for_scope(
+    cube_work: np.ndarray,
+    target_mask_2d: np.ndarray,
+    scope: str,
+    ripple_cfg: RippleConfig,
+) -> np.ndarray:
+    scope = str(scope).lower()
+    kwargs = dict(
+        max_pix=200000,
+        seed=int(getattr(ripple_cfg, "sampling_seed", 0)),
+        sample_mode=str(getattr(ripple_cfg, "sampling_mode", "random")),
+    )
+    if scope in {"global", "target"}:
+        cube_detect = _cube_for_scope(cube_work, target_mask_2d, scope)
+        return _aggregate_spectrum(cube_detect, **kwargs)
+    if scope in {"both", "global_and_target", "target_and_global"}:
+        spec_g = _aggregate_spectrum(cube_work, **kwargs)
+        cube_t = _cube_for_scope(cube_work, target_mask_2d, "target")
+        spec_t = _aggregate_spectrum(cube_t, **kwargs)
+        with np.errstate(all="ignore"):
+            spec = np.nanmedian(np.vstack([spec_g, spec_t]), axis=0)
+        return np.asarray(spec, dtype=np.float32)
+    raise ValueError(f"Unknown ripple_scope: {scope}")
 
 
 def _resolve_linefree_mask(
@@ -85,8 +140,6 @@ def _resolve_linefree_mask(
       - 'current' : use current session state, fallback to prior, then auto
       - 'or'      : union(auto, prior/current) i.e. keep channels line-free if either source supports them
     """
-    cube_detect = _cube_for_scope(cube_work, target_mask_2d, linefree_scope)
-
     lf_ref: Optional[np.ndarray] = None
     if linefree_mode == "current":
         lf_ref = session.linefree_mask_1d_current
@@ -107,7 +160,7 @@ def _resolve_linefree_mask(
                 f"linefree_mode={linefree_mode!r} requires automatic line-free estimation, "
                 "but auto_linefree is disabled and no usable prior/current mask is available."
             )
-        lf_auto = estimate_linefree_mask_from_cube(cube_detect, cfg=linefree_cfg, agg="median")
+        lf_auto = _estimate_linefree_for_scope(cube_work, target_mask_2d, linefree_scope, linefree_cfg)
 
     if linefree_mode == "or":
         if lf_ref is None and lf_auto is None:
@@ -164,8 +217,7 @@ def _resolve_ripple_freqs(
     if ref is not None and len(ref) > 0:
         return list(np.asarray(ref, dtype=float))
 
-    cube_detect = _cube_for_scope(cube_work, target_mask_2d, ripple_scope)
-    spec = _aggregate_spectrum(cube_detect, max_pix=200000, seed=0)
+    spec = _aggregate_spectrum_for_scope(cube_work, target_mask_2d, ripple_scope, ripple_cfg)
     freqs = estimate_ripple_frequencies_fft(spec, lf, rcfg=ripple_cfg, poly_order_pre=poly_order)
     if not freqs:
         return None
@@ -192,6 +244,7 @@ def run_one_iteration(
     poly_order: int = 1,
     robust: bool = False,
     chunk_pix: int = 65536,
+    reproducible_mode: bool = False,
 ) -> None:
     """Execute one iteration and update `session` in-place."""
     if target_mask_2d is None:
@@ -200,6 +253,21 @@ def run_one_iteration(
         target_mask_2d = np.asarray(target_mask_2d, dtype=bool)
         if target_mask_2d.shape != (session.ny, session.nx):
             raise ValueError(f"target_mask_2d shape mismatch: {target_mask_2d.shape} vs {(session.ny, session.nx)}")
+
+    if reproducible_mode:
+        linefree_cfg = replace(
+            linefree_cfg,
+            sampling_mode="stride",
+            sampling_seed=int(getattr(linefree_cfg, "sampling_seed", 0)),
+            interpolate_nans=True,
+        )
+        ripple_cfg = replace(
+            ripple_cfg,
+            sampling_mode="stride",
+            sampling_seed=int(getattr(ripple_cfg, "sampling_seed", 0)),
+            interpolate_masked=True,
+            stable_sort=True,
+        )
 
     cube_work = session.get_full_cube_work()
 
@@ -227,7 +295,15 @@ def run_one_iteration(
         poly_order=poly_order,
     )
 
-    bcfg = BaselineConfig(poly_order=poly_order, ripple=enable_ripple, robust=robust, chunk_pix=int(chunk_pix))
+    bcfg = BaselineConfig(
+        poly_order=poly_order,
+        ripple=enable_ripple,
+        robust=robust,
+        chunk_pix=int(chunk_pix),
+        reproducible_mode=bool(reproducible_mode),
+        compute_dtype="float64" if reproducible_mode else "float32",
+        normalize_x=bool(reproducible_mode),
+    )
     baseline_cube, stats = fit_cube_baseline(
         session.cube_original,
         linefree_mask_1d=lf,
@@ -250,6 +326,7 @@ def run_one_iteration(
         ripple_mode=str(ripple_mode),
         ripple_scope=str(ripple_scope),
         ripple_freqs=list(freqs) if freqs else None,
+        reproducible_mode=bool(reproducible_mode),
     )
     session.update_baseline(
         baseline_cube,

@@ -40,7 +40,7 @@ from __future__ import annotations
 import logging
 import warnings
 from dataclasses import dataclass
-from typing import Any, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import scipy.ndimage as ndi
@@ -87,12 +87,31 @@ class LineFreeConfig:
         Dilate detected line channels along spectral axis by this many channels.
     min_linefree_frac : float
         If the resulting line-free fraction is below this, raise (or warn) because baseline fit becomes ill-posed.
+    sampling_mode : {'random', 'stride'}
+        Spatial subsampling mode when a cube is too large to aggregate fully.
+    sampling_seed : int
+        RNG seed used when sampling_mode='random'.
+    interpolate_nans : bool
+        If True, fill NaN gaps in the aggregated 1D spectrum by linear interpolation before line-free detection.
+    conservative_quantile : float or None
+        If set to a quantile between 0.5 and 1.0 (for example 0.9), estimate additional
+        line-candidate masks from upper-quantile and optionally lower-quantile aggregated spectra,
+        then combine them conservatively with the primary aggregated spectrum. This helps catch
+        spatially sparse emission / absorption lines that a global median can miss.
+    conservative_both_tails : bool
+        If True and conservative_quantile is enabled, also inspect the symmetric lower quantile
+        (1 - conservative_quantile) to catch absorption-like sparse features.
     """
     smooth_width: int = 51
     sigma: float = 4.0
     iters: int = 6
     pad_chan: int = 3
     min_linefree_frac: float = 0.35
+    sampling_mode: str = "random"
+    sampling_seed: int = 0
+    interpolate_nans: bool = True
+    conservative_quantile: Optional[float] = None
+    conservative_both_tails: bool = True
 
 
 @dataclass(frozen=True)
@@ -115,11 +134,23 @@ class RippleConfig:
         Minimum separation in frequency (cycles/channel) between selected peaks.
     window : str
         Window applied before FFT: 'hann' or 'none'.
+    interpolate_masked : bool
+        If True, fill non-linefree channels by linear interpolation before FFT instead of zero-filling.
+    stable_sort : bool
+        If True, use a stable sort when ranking FFT peaks.
+    sampling_mode : {'random', 'stride'}
+        Spatial subsampling mode used by higher-level orchestration when an aggregated spectrum is built.
+    sampling_seed : int
+        RNG seed used when sampling_mode='random'.
     """
     nfreq: int = 2
     period_range_chan: Tuple[float, float] = (20.0, 400.0)
     min_separation: float = 0.002
     window: str = "hann"
+    interpolate_masked: bool = False
+    stable_sort: bool = True
+    sampling_mode: str = "random"
+    sampling_seed: int = 0
 
 
 @dataclass(frozen=True)
@@ -136,20 +167,37 @@ class BaselineConfig:
     robust : bool
         If True, apply a lightweight robust reweighting per pixel (slower). Default False for huge cubes.
     rcond : float or None
-        rcond for numpy.linalg.lstsq.
+        rcond for numpy.linalg.lstsq. If None and reproducible_mode=True, an explicit dtype-based threshold is used.
     chunk_pix : int
         Pixel chunk size when processing large cubes in memory.
+    reproducible_mode : bool
+        If True, use deterministic / version-stable numerical settings where practical.
+    compute_dtype : {'float32', 'float64'}
+        Internal dtype for least-squares and matrix construction.
+    normalize_x : bool
+        If True, normalize the polynomial coordinate to [-1, 1] before building x^k columns.
+        Ripple sin/cos terms always use the native channel index so that frequencies remain cycles/channel.
+    strict_failures : bool
+        If True, re-raise fitting failures instead of silently flagging affected pixels.
+    fallback_to_pixelwise : bool
+        If True, fall back to pixel-wise fitting when a vectorized chunk solve fails.
     """
     poly_order: int = 1
     ripple: bool = True
     robust: bool = False
     rcond: Optional[float] = None
     chunk_pix: int = 65536
+    reproducible_mode: bool = False
+    compute_dtype: str = "float32"
+    normalize_x: bool = False
+    strict_failures: bool = False
+    fallback_to_pixelwise: bool = True
 
 
 # -----------------------------------------------------------------------------
 # Small helpers
 # -----------------------------------------------------------------------------
+
 
 def _robust_std(x: np.ndarray) -> float:
     """Robust std via MAD * 1.4826."""
@@ -185,6 +233,56 @@ def _as_float32(x: Any) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
 
 
+def _validate_sampling_mode(mode: str) -> str:
+    mode = str(mode).lower()
+    if mode not in {"random", "stride"}:
+        raise ValueError(f"Unknown sampling_mode={mode!r}; expected 'random' or 'stride'.")
+    return mode
+
+
+def _select_sample_indices(npix: int, max_pix: int, *, mode: str, seed: int) -> Optional[np.ndarray]:
+    max_pix = int(max_pix)
+    if max_pix <= 0:
+        raise ValueError(f"max_pix must be positive, got {max_pix}")
+    if npix <= max_pix:
+        return None
+
+    mode = _validate_sampling_mode(mode)
+    if mode == "random":
+        rng = np.random.default_rng(int(seed))
+        idx = np.sort(rng.choice(npix, size=max_pix, replace=False).astype(np.int64, copy=False))
+        return idx
+
+    # Deterministic evenly spaced subsampling.
+    step = float(npix) / float(max_pix)
+    idx = np.floor(np.arange(max_pix, dtype=np.float64) * step).astype(np.int64)
+    idx = np.clip(idx, 0, npix - 1)
+    # floor() with max_pix < npix is monotonic non-decreasing; enforce uniqueness just in case.
+    _, uniq = np.unique(idx, return_index=True)
+    idx = idx[np.sort(uniq)]
+    if idx.size < max_pix:
+        # pad deterministically from the tail if uniqueness removal dropped elements.
+        need = max_pix - idx.size
+        tail = np.setdiff1d(np.arange(npix - need, npix, dtype=np.int64), idx, assume_unique=False)
+        idx = np.concatenate([idx, tail[:need]])
+    return np.sort(idx[:max_pix])
+
+
+def _interp_nans_1d(y: np.ndarray, *, dtype: np.dtype = np.float64) -> np.ndarray:
+    arr = np.asarray(y, dtype=dtype)
+    if arr.ndim != 1:
+        raise ValueError(f"Expected 1D input, got shape={arr.shape}")
+    finite = np.isfinite(arr)
+    if finite.all():
+        return arr
+    if not finite.any():
+        return np.zeros_like(arr, dtype=dtype)
+    x = np.arange(arr.size, dtype=np.float64)
+    out = arr.copy()
+    out[~finite] = np.interp(x[~finite], x[finite], out[finite])
+    return out
+
+
 def _fill_nan_with_median_along_spec(data: np.ndarray) -> np.ndarray:
     """Fill NaNs in (nchan, npix) or (nchan, ny, nx) with per-pixel spectral median."""
     arr = np.asarray(data, dtype=np.float32)
@@ -201,9 +299,84 @@ def _fill_nan_with_median_along_spec(data: np.ndarray) -> np.ndarray:
     raise ValueError("data must be 2D or 3D")
 
 
+def _combine_linefree_masks_conservative(masks: Sequence[np.ndarray], nchan: int) -> np.ndarray:
+    """Combine line-free masks conservatively (intersection of line-free channels)."""
+    combined = np.ones(int(nchan), dtype=bool)
+    used = 0
+    for m in masks:
+        arr = np.asarray(m, dtype=bool)
+        if arr.shape != (int(nchan),):
+            raise ValueError(f"Line-free mask shape mismatch: {arr.shape} vs ({nchan},)")
+        combined &= arr
+        used += 1
+    if used == 0:
+        return np.ones(int(nchan), dtype=bool)
+    return combined
+
+
+def _parse_manual_windows(windows: Sequence[Union[str, Tuple[float, float]]]) -> List[Tuple[float, float]]:
+    parsed: List[Tuple[float, float]] = []
+    for w in windows:
+        if isinstance(w, str):
+            s = w.strip()
+            if ":" in s:
+                parts = s.split(":")
+            elif "," in s:
+                parts = s.split(",")
+            else:
+                parts = s.split()
+            if len(parts) != 2:
+                raise ValueError(f"Could not parse window {w!r}; expected 'lo:hi' or 'lo,hi'.")
+            lo, hi = float(parts[0]), float(parts[1])
+        else:
+            lo, hi = float(w[0]), float(w[1])
+        if lo > hi:
+            lo, hi = hi, lo
+        parsed.append((lo, hi))
+    return parsed
+
+
+def _manual_signal_mask_from_axis(
+    axis: np.ndarray,
+    windows: Sequence[Union[str, Tuple[float, float]]],
+) -> np.ndarray:
+    arr = np.asarray(axis, dtype=float)
+    mask = np.zeros(arr.shape, dtype=bool)
+    for lo, hi in _parse_manual_windows(windows):
+        mask |= (arr >= float(lo)) & (arr <= float(hi))
+    return mask
+
+
+def _resolve_compute_dtype(bcfg: BaselineConfig) -> np.dtype:
+    if bool(getattr(bcfg, "reproducible_mode", False)):
+        return np.dtype(np.float64)
+    dt = np.dtype(getattr(bcfg, "compute_dtype", "float32"))
+    if dt.kind != "f" or dt.itemsize not in (4, 8):
+        raise ValueError(f"compute_dtype must be float32 or float64, got {dt}")
+    return dt
+
+
+def _resolve_rcond(rcond: Optional[float], *, n_rows: int, n_cols: int, dtype: np.dtype, reproducible_mode: bool) -> Optional[float]:
+    if rcond is not None:
+        return float(rcond)
+    if not reproducible_mode:
+        return None
+    eps = np.finfo(dtype).eps
+    return float(eps * max(int(n_rows), int(n_cols)))
+
+
+def _poly_coordinate(nchan: int, *, dtype: np.dtype, normalize: bool) -> np.ndarray:
+    if not normalize:
+        return np.arange(nchan, dtype=dtype)
+    if nchan <= 1:
+        return np.zeros(nchan, dtype=dtype)
+    return np.linspace(-1.0, 1.0, nchan, dtype=dtype)
+
+
 # -----------------------------------------------------------------------------
 # 1) Line-free channel detection
 # -----------------------------------------------------------------------------
+
 
 def estimate_linefree_mask_1d(
     spectrum: np.ndarray,
@@ -225,15 +398,20 @@ def estimate_linefree_mask_1d(
     linefree : np.ndarray (bool), shape (nchan,)
         True means "line-free and usable for baseline fitting".
     """
-    y = np.asarray(spectrum, dtype=np.float32)
+    y = np.asarray(spectrum, dtype=np.float64)
     n = y.size
     if n < 8:
         return np.isfinite(y)
 
-    base = _median_filter_1d(np.nan_to_num(y, nan=0.0), cfg.smooth_width)
-    resid = y - base
+    if bool(getattr(cfg, "interpolate_nans", True)):
+        y_work = _interp_nans_1d(y, dtype=np.float64)
+    else:
+        y_work = np.nan_to_num(y, nan=0.0)
 
-    good = np.isfinite(resid).copy()
+    base = _median_filter_1d(y_work, cfg.smooth_width)
+    resid = y_work - base
+
+    good = np.isfinite(y).copy()
     line = np.zeros(n, dtype=bool)
 
     for _ in range(int(cfg.iters)):
@@ -267,7 +445,8 @@ def estimate_linefree_mask_from_cube(
     *,
     agg: str = "median",
     max_pix: int = 200000,
-    seed: int = 0,
+    seed: Optional[int] = None,
+    sample_mode: Optional[str] = None,
 ) -> np.ndarray:
     """
     Estimate a global line-free mask from a 3D cube by aggregating spectra spatially.
@@ -277,15 +456,24 @@ def estimate_linefree_mask_from_cube(
     cube_data : np.ndarray
         (nchan, ny, nx) cube.
     agg : {'median','mean'}
-        Spatial aggregation method.
+        Spatial aggregation method for the primary spectrum.
     max_pix : int
-        If ny*nx is huge, randomly sample up to max_pix pixels for aggregation.
-    seed : int
-        RNG seed for sampling.
+        If ny*nx is huge, sample up to max_pix pixels for aggregation.
+    seed : int or None
+        RNG seed for sampling when sample_mode='random'. If None, cfg.sampling_seed is used.
+    sample_mode : {'random','stride'} or None
+        Sampling mode for large cubes. If None, cfg.sampling_mode is used.
 
     Returns
     -------
     linefree : np.ndarray (bool), shape (nchan,)
+
+    Notes
+    -----
+    If cfg.conservative_quantile is enabled, additional masks are estimated from upper
+    (and optionally lower) quantile spectra and combined conservatively via intersection
+    of line-free channels. This is intentionally biased toward flagging more candidate line
+    channels so that spatially sparse features are less likely to leak into the baseline fit.
     """
     data = np.asarray(cube_data, dtype=np.float32)
     if data.ndim != 3:
@@ -295,12 +483,10 @@ def estimate_linefree_mask_from_cube(
     npix = ny * nx
     flat = data.reshape(nchan, npix)
 
-    if npix > int(max_pix):
-        rng = np.random.default_rng(int(seed))
-        idx = rng.choice(npix, size=int(max_pix), replace=False)
-        flat_s = flat[:, idx]
-    else:
-        flat_s = flat
+    mode = sample_mode if sample_mode is not None else getattr(cfg, "sampling_mode", "random")
+    seed_eff = getattr(cfg, "sampling_seed", 0) if seed is None else int(seed)
+    idx = _select_sample_indices(npix, int(max_pix), mode=mode, seed=seed_eff)
+    flat_s = flat if idx is None else flat[:, idx]
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
@@ -311,12 +497,36 @@ def estimate_linefree_mask_from_cube(
         else:
             raise ValueError(f"Unknown agg={agg!r}")
 
-    return estimate_linefree_mask_1d(spec, cfg=cfg)
+    masks: List[np.ndarray] = [estimate_linefree_mask_1d(spec, cfg=cfg)]
+
+    q = getattr(cfg, "conservative_quantile", None)
+    if q is not None:
+        q = float(q)
+        if not (0.5 < q < 1.0):
+            raise ValueError(f"conservative_quantile must satisfy 0.5 < q < 1.0, got {q}")
+        quantiles: List[Tuple[str, float]] = [("upper", q)]
+        if bool(getattr(cfg, "conservative_both_tails", True)):
+            quantiles.append(("lower", 1.0 - q))
+        for qname, qval in quantiles:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                spec_q = np.nanquantile(flat_s, qval, axis=1)
+            try:
+                masks.append(estimate_linefree_mask_1d(spec_q, cfg=cfg))
+            except ValueError as exc:
+                logging.warning(
+                    "Skipping conservative %s-quantile line-candidate spectrum (q=%.3f): %s",
+                    qname, qval, exc,
+                )
+
+    return _combine_linefree_masks_conservative(masks, nchan)
+
 
 
 # -----------------------------------------------------------------------------
 # 2) Ripple frequency estimation
 # -----------------------------------------------------------------------------
+
 
 def estimate_ripple_frequencies_fft(
     spectrum: np.ndarray,
@@ -331,7 +541,7 @@ def estimate_ripple_frequencies_fft(
     Steps
     -----
     - Fit and subtract a low-order polynomial on line-free channels (poly_order_pre)
-    - Zero-out line channels (non line-free)
+    - Fill or zero-out non line-free channels
     - Apply window (hann) to reduce leakage
     - FFT power spectrum
     - Pick top-N peaks within period_range_chan, enforcing min_separation
@@ -341,47 +551,64 @@ def estimate_ripple_frequencies_fft(
     freqs : list of float
         Frequencies in cycles/channel (0..0.5). Length <= rcfg.nfreq.
     """
-    y = np.asarray(spectrum, dtype=np.float32)
+    y = np.asarray(spectrum, dtype=np.float64)
     m = np.asarray(linefree_mask, dtype=bool)
     n = y.size
     if n < 16:
         return []
+    if m.shape != (n,):
+        raise ValueError(f"linefree_mask shape mismatch: {m.shape} vs ({n},)")
+    if m.sum() < max(8, poly_order_pre + 2):
+        return []
 
-    x = np.arange(n, dtype=np.float32)
-    # polynomial pre-fit on line-free
+    # Use a normalized coordinate for the polynomial pre-fit to improve conditioning,
+    # but keep ripple frequencies in cycles/channel.
+    x_poly = _poly_coordinate(n, dtype=np.float64, normalize=True)
     if poly_order_pre >= 0 and m.sum() >= (poly_order_pre + 2):
-        V = np.vstack([x[m] ** k for k in range(poly_order_pre + 1)]).T  # (nlf, p)
-        coeff, *_ = np.linalg.lstsq(V, y[m], rcond=None)
+        V = np.vstack([x_poly[m] ** k for k in range(poly_order_pre + 1)]).T
+        coeff, *_ = np.linalg.lstsq(V, y[m], rcond=float(np.finfo(np.float64).eps * max(V.shape)))
         base = np.zeros_like(y)
         for k in range(poly_order_pre + 1):
-            base += float(coeff[k]) * (x ** k)
+            base += float(coeff[k]) * (x_poly ** k)
         r = y - base
     else:
         r = y.copy()
 
-    r2 = np.zeros_like(r)
-    r2[m] = r[m]
+    if bool(getattr(rcfg, "interpolate_masked", False)):
+        r2 = np.full_like(r, np.nan)
+        r2[m] = r[m]
+        r2 = _interp_nans_1d(r2, dtype=np.float64)
+    else:
+        r2 = np.zeros_like(r)
+        r2[m] = r[m]
 
     if rcfg.window.lower() == "hann":
-        w = np.hanning(n).astype(np.float32)
+        w = np.hanning(n).astype(np.float64)
         r2 = r2 * w
+    elif rcfg.window.lower() != "none":
+        raise ValueError(f"Unknown ripple window={rcfg.window!r}")
 
-    # FFT
     spec = np.fft.rfft(r2)
-    pwr = (spec.real ** 2 + spec.imag ** 2).astype(np.float64)
-    freqs = np.fft.rfftfreq(n, d=1.0)  # cycles per channel
+    pwr = (spec.real ** 2 + spec.imag ** 2).astype(np.float64, copy=False)
+    freqs = np.fft.rfftfreq(n, d=1.0)
 
     per_lo, per_hi = rcfg.period_range_chan
+    if (per_lo <= 0) or (per_hi <= 0) or (per_lo > per_hi):
+        raise ValueError(f"Invalid period_range_chan={rcfg.period_range_chan}; expected positive (lo<=hi).")
     fmin = 1.0 / float(per_hi)
     fmax = 1.0 / float(per_lo)
     sel = (freqs >= fmin) & (freqs <= fmax)
-    sel[0] = False  # ignore DC
+    if sel.size > 0:
+        sel[0] = False
     if sel.sum() < 1:
         return []
 
     cand_idx = np.where(sel)[0]
-    # Sort by descending power
-    cand_idx = cand_idx[np.argsort(pwr[cand_idx])[::-1]]
+    if bool(getattr(rcfg, "stable_sort", True)):
+        order = np.argsort(-pwr[cand_idx], kind="stable")
+    else:
+        order = np.argsort(pwr[cand_idx])[::-1]
+    cand_idx = cand_idx[order]
 
     chosen: List[float] = []
     for i in cand_idx:
@@ -401,49 +628,81 @@ def estimate_ripple_frequencies_fft(
 # 3) Baseline subtraction core
 # -----------------------------------------------------------------------------
 
+
 def _design_matrix(
-    x: np.ndarray,
+    nchan: int,
     *,
     poly_order: int,
     ripple_freqs: Optional[Sequence[float]] = None,
+    dtype: np.dtype = np.float32,
+    normalize_poly_x: bool = False,
 ) -> np.ndarray:
     """
     Build design matrix A(x) for model:
       baseline(x) = sum_{k=0..poly_order} c_k x^k  +  sum_j (a_j sin(2π f_j x) + b_j cos(2π f_j x))
 
-    Returns A with shape (len(x), ncoef).
+    Polynomial columns may use a normalized coordinate in [-1,1] to improve conditioning.
+    Ripple terms always use the native channel index so that frequencies remain cycles/channel.
+
+    Returns A with shape (nchan, ncoef).
     """
-    x = np.asarray(x, dtype=np.float32)
+    x_poly = _poly_coordinate(int(nchan), dtype=dtype, normalize=bool(normalize_poly_x))
+    x_phase = np.arange(int(nchan), dtype=dtype)
     cols: List[np.ndarray] = []
     for k in range(int(poly_order) + 1):
-        cols.append(x ** k)
+        cols.append(x_poly ** k)
 
     if ripple_freqs:
         for f in ripple_freqs:
-            w = 2.0 * np.pi * float(f)
-            cols.append(np.sin(w * x))
-            cols.append(np.cos(w * x))
+            w = dtype.type(2.0 * np.pi * float(f))
+            cols.append(np.sin(w * x_phase, dtype=dtype))
+            cols.append(np.cos(w * x_phase, dtype=dtype))
 
-    return np.vstack(cols).T.astype(np.float32, copy=False)
+    return np.vstack(cols).T.astype(dtype, copy=False)
 
 
 def _robust_reweight(
     resid: np.ndarray,
     *,
     c: float = 1.345,
+    dtype: np.dtype = np.float32,
 ) -> np.ndarray:
-    """
-    Huber weights for residuals (vector).
-    """
-    r = np.asarray(resid, dtype=np.float32)
+    """Huber weights for residuals (vector)."""
+    r = np.asarray(resid, dtype=dtype)
     s = _robust_std(r)
     if s <= 0:
-        return np.ones_like(r, dtype=np.float32)
-    t = np.abs(r) / (c * s)
-    w = np.ones_like(r, dtype=np.float32)
+        return np.ones_like(r, dtype=dtype)
+    t = np.abs(r) / (dtype.type(c * s))
+    w = np.ones_like(r, dtype=dtype)
     m = t > 1
     w[m] = 1.0 / t[m]
     return w
+
+
+def _fit_single_spectrum(
+    y_full: np.ndarray,
+    A_full: np.ndarray,
+    A_lf: np.ndarray,
+    linefree_mask: np.ndarray,
+    *,
+    robust: bool,
+    rcond: Optional[float],
+    dtype: np.dtype,
+) -> np.ndarray:
+    yj = np.asarray(y_full, dtype=dtype)
+    ylf = yj[linefree_mask]
+    cj, *_ = np.linalg.lstsq(A_lf, ylf, rcond=rcond)
+    cj = np.asarray(cj, dtype=dtype)
+    if robust:
+        for _ in range(3):
+            rj = ylf - (A_lf @ cj)
+            w = _robust_reweight(rj, dtype=dtype)
+            Aw = A_lf * w[:, None]
+            bw = ylf * w
+            cj, *_ = np.linalg.lstsq(Aw, bw, rcond=rcond)
+            cj = np.asarray(cj, dtype=dtype)
+    base = A_full @ cj
+    return np.asarray(yj - base, dtype=np.float32)
 
 
 def subtract_baseline_cube(
@@ -477,7 +736,7 @@ def subtract_baseline_cube(
     resid_rms : np.ndarray or None
         2D RMS map on line-free channels (float32).
     flag : np.ndarray or None
-        2D uint8 flag map: 0=OK, 1=insufficient points, 2=lstsq failed.
+        2D uint8 flag map: 0=OK, 1=insufficient finite line-free points, 2=lstsq failed, 3=all-NaN spectrum.
     """
     data = np.asarray(cube_data, dtype=np.float32)
     if data.ndim != 3:
@@ -487,67 +746,125 @@ def subtract_baseline_cube(
     if m.shape != (nchan,):
         raise ValueError(f"linefree_mask shape mismatch: {m.shape} vs ({nchan},)")
 
-    # Fill NaNs (keeps global mask approach viable)
+    dtype_compute = _resolve_compute_dtype(bcfg)
+    normalize_x = bool(getattr(bcfg, "normalize_x", False) or getattr(bcfg, "reproducible_mode", False))
+
+    finite_orig = np.isfinite(data)
     data2 = _fill_nan_with_median_along_spec(data)
 
-    # Flatten spatial dims
     npix = ny * nx
-    Y = data2.reshape(nchan, npix)
+    Y_filled = data2.reshape(nchan, npix)
+    Y_orig = data.reshape(nchan, npix)
+    finite_flat = finite_orig.reshape(nchan, npix)
 
-    # Prepare design matrices
-    x = np.arange(nchan, dtype=np.float32)
     freqs = list(ripple_freqs) if (bcfg.ripple and ripple_freqs) else []
-    A_full = _design_matrix(x, poly_order=bcfg.poly_order, ripple_freqs=freqs)          # (nchan, ncoef)
-    A_lf = A_full[m, :]                                                                 # (nlf, ncoef)
-    nlf = int(m.sum())
-    ncoef = A_full.shape[1]
+    A_full = _design_matrix(
+        nchan,
+        poly_order=bcfg.poly_order,
+        ripple_freqs=freqs,
+        dtype=dtype_compute,
+        normalize_poly_x=normalize_x,
+    )
+    A_lf = A_full[m, :]
+    nlf_global = int(m.sum())
+    ncoef = int(A_full.shape[1])
+    min_points = max(ncoef + 2, 8)
 
-    if nlf < max(ncoef + 2, 8):
-        raise ValueError(f"Too few line-free points for model: nlf={nlf}, ncoef={ncoef}")
+    if nlf_global < min_points:
+        raise ValueError(f"Too few line-free points for model: nlf={nlf_global}, ncoef={ncoef}")
 
-    out = np.empty_like(Y, dtype=np.float32)
+    rcond_eff = _resolve_rcond(
+        bcfg.rcond,
+        n_rows=A_lf.shape[0],
+        n_cols=A_lf.shape[1],
+        dtype=dtype_compute,
+        reproducible_mode=bool(getattr(bcfg, "reproducible_mode", False)),
+    )
+
+    out = np.empty_like(Y_orig, dtype=np.float32)
     resid_rms = np.full(npix, np.nan, dtype=np.float32) if return_qc else None
     flag = np.zeros(npix, dtype=np.uint8) if return_qc else None
 
-    # Batch processing in chunks of pixels
     chunk = int(max(1, bcfg.chunk_pix))
     for p0 in range(0, npix, chunk):
         p1 = min(npix, p0 + chunk)
-        Yc = Y[:, p0:p1]            # (nchan, k)
-        Ylf = Yc[m, :]              # (nlf, k)
+        Yc_fill = Y_filled[:, p0:p1]
+        Yc_orig = Y_orig[:, p0:p1]
+        finite_c = finite_flat[:, p0:p1]
+        k = p1 - p0
 
-        try:
-            if not bcfg.robust:
-                # Multiple RHS least squares
-                coef, *_ = np.linalg.lstsq(A_lf, Ylf, rcond=bcfg.rcond)  # (ncoef, k)
-            else:
-                # Robust: per-pixel IRLS (slower but safer when line mask is imperfect)
-                k = p1 - p0
-                coef = np.zeros((ncoef, k), dtype=np.float32)
-                for j in range(k):
-                    yj = Ylf[:, j]
-                    # init
-                    cj, *_ = np.linalg.lstsq(A_lf, yj, rcond=bcfg.rcond)
-                    cj = cj.astype(np.float32, copy=False)
-                    for _ in range(3):
-                        rj = yj - (A_lf @ cj)
-                        w = _robust_reweight(rj)
-                        Aw = A_lf * w[:, None]
-                        bw = yj * w
-                        cj, *_ = np.linalg.lstsq(Aw, bw, rcond=bcfg.rcond)
-                        cj = cj.astype(np.float32, copy=False)
-                    coef[:, j] = cj
+        out_chunk = Yc_orig.copy()
+        flag_chunk = np.zeros(k, dtype=np.uint8)
 
-            base = A_full @ coef   # (nchan, k)
-            out[:, p0:p1] = Yc - base
+        finite_lf_counts = np.sum(finite_c[m, :], axis=0)
+        all_nan = np.sum(finite_c, axis=0) == 0
+        insufficient = (~all_nan) & (finite_lf_counts < min_points)
+        fit_mask = (~all_nan) & (~insufficient)
 
-            if return_qc:
-                r = out[m, p0:p1]
-                resid_rms[p0:p1] = np.sqrt(np.mean(r * r, axis=0)).astype(np.float32, copy=False)
-        except Exception:
-            out[:, p0:p1] = Yc
-            if return_qc:
-                flag[p0:p1] = 2
+        flag_chunk[insufficient] = 1
+        flag_chunk[all_nan] = 3
+
+        fit_cols = np.where(fit_mask)[0]
+        if fit_cols.size > 0:
+            Yc_fit = np.asarray(Yc_fill[:, fit_cols], dtype=dtype_compute)
+            Ylf = Yc_fit[m, :]
+            try:
+                if not bcfg.robust:
+                    coef, *_ = np.linalg.lstsq(A_lf, Ylf, rcond=rcond_eff)
+                    coef = np.asarray(coef, dtype=dtype_compute)
+                    base = A_full @ coef
+                    out_fit = np.asarray(Yc_fit - base, dtype=np.float32)
+                    out_chunk[:, fit_cols] = out_fit
+                else:
+                    for j_out, j in enumerate(fit_cols):
+                        out_chunk[:, j] = _fit_single_spectrum(
+                            Yc_fill[:, j],
+                            A_full,
+                            A_lf,
+                            m,
+                            robust=True,
+                            rcond=rcond_eff,
+                            dtype=dtype_compute,
+                        )
+            except Exception:
+                if bool(getattr(bcfg, "strict_failures", False)):
+                    raise
+                if not bool(getattr(bcfg, "fallback_to_pixelwise", True)):
+                    flag_chunk[fit_cols] = 2
+                else:
+                    for j in fit_cols:
+                        try:
+                            out_chunk[:, j] = _fit_single_spectrum(
+                                Yc_fill[:, j],
+                                A_full,
+                                A_lf,
+                                m,
+                                robust=bool(bcfg.robust),
+                                rcond=rcond_eff,
+                                dtype=dtype_compute,
+                            )
+                        except Exception:
+                            if bool(getattr(bcfg, "strict_failures", False)):
+                                raise
+                            flag_chunk[j] = 2
+
+        # Preserve original invalid channels rather than inventing data on NaN inputs.
+        out_chunk[~finite_c] = np.nan
+        out[:, p0:p1] = out_chunk
+
+        if return_qc:
+            ok = (flag_chunk == 0)
+            if np.any(ok):
+                lf_finite = finite_c[m, :] & ok[None, :]
+                r = out_chunk[m, :] ** 2
+                r[~lf_finite] = 0.0
+                cnt = np.sum(lf_finite, axis=0)
+                good = cnt > 0
+                rms_local = np.full(k, np.nan, dtype=np.float32)
+                if np.any(good):
+                    rms_local[good] = np.sqrt(np.sum(r[:, good], axis=0) / cnt[good]).astype(np.float32, copy=False)
+                resid_rms[p0:p1] = rms_local
+            flag[p0:p1] = flag_chunk
 
     out_cube = out.reshape(nchan, ny, nx)
     if return_qc:
@@ -717,6 +1034,7 @@ def subtract_baseline_from_fits(
     # line-free
     linefree_cfg: LineFreeConfig = LineFreeConfig(),
     linefree_mask: Optional[np.ndarray] = None,
+    manual_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]] = None,
     linefree_mode: str = "auto",
     load_prior_from_input: bool = True,
     # ripple
@@ -725,6 +1043,7 @@ def subtract_baseline_from_fits(
     ripple_mode: str = "auto",
     # baseline model
     baseline_cfg: BaselineConfig = BaselineConfig(),
+    reproducible_mode: Optional[bool] = None,
     # output
     add_qc_hdus: bool = True,
     overwrite: bool = True,
@@ -737,7 +1056,7 @@ def subtract_baseline_from_fits(
     - LINEFREE (ImageHDU): uint8 (nchan,)  1=line-free, 0=line
     - RIPFREQ  (BinTable): ripple frequencies and periods (if ripple used)
     - BASE_RMS (ImageHDU): 2D residual RMS on line-free channels
-    - BASE_FLG (ImageHDU): 2D flag map (0 ok, 2 fit failed)
+    - BASE_FLG (ImageHDU): 2D flag map (0 ok, 1 insufficient finite line-free points, 2 fit failed, 3 all-NaN spectrum)
 
     Notes
     -----
@@ -808,9 +1127,36 @@ def subtract_baseline_from_fits(
                 lf = np.asarray(lf_auto if lf_auto is not None else np.ones(nchan, dtype=bool), dtype=bool)
             else:
                 raise ValueError(f"Unknown linefree_mode: {linefree_mode}")
+        if manual_v_windows:
+            if SpectralCube is None:
+                raise ValueError("manual_v_windows requires spectral_cube to read the spectral axis in km/s.")
+            sc = SpectralCube.read(input_fits, hdu=(cube_ext if cube_ext is not None else idx))
+            try:
+                v_axis = np.asarray(sc.with_spectral_unit(u.km / u.s, velocity_convention="radio").spectral_axis.value, dtype=float)
+            except Exception:
+                v_axis = np.asarray(sc.spectral_axis.to(u.km / u.s).value, dtype=float)
+            if v_axis.shape != (nchan,):
+                raise ValueError(f"manual_v_windows spectral axis shape mismatch: {v_axis.shape} vs ({nchan},)")
+            manual_signal = _manual_signal_mask_from_axis(v_axis, manual_v_windows)
+            lf = np.asarray(lf, dtype=bool) & (~manual_signal)
+
         logging.info("Line-free fraction: %.3f", lf.mean())
 
         freqs: List[float] = []
+        if reproducible_mode is not None:
+            baseline_cfg = BaselineConfig(
+                poly_order=int(baseline_cfg.poly_order),
+                ripple=bool(baseline_cfg.ripple),
+                robust=bool(baseline_cfg.robust),
+                rcond=baseline_cfg.rcond,
+                chunk_pix=int(baseline_cfg.chunk_pix),
+                reproducible_mode=bool(reproducible_mode),
+                compute_dtype=("float64" if bool(reproducible_mode) else str(getattr(baseline_cfg, "compute_dtype", "float32"))),
+                normalize_x=(bool(reproducible_mode) or bool(getattr(baseline_cfg, "normalize_x", False))),
+                strict_failures=bool(getattr(baseline_cfg, "strict_failures", False)),
+                fallback_to_pixelwise=bool(getattr(baseline_cfg, "fallback_to_pixelwise", True)),
+            )
+
         if baseline_cfg.ripple:
             if ripple_freqs is not None:
                 freqs = [float(f) for f in ripple_freqs]
@@ -898,7 +1244,7 @@ def subtract_baseline_from_fits(
         if flag_map is not None:
             hdr = fits.Header()
             hdr["BTYPE"] = "BaselineFitFlag"
-            hdr["COMMENT"] = "0=OK, 2=lstsq failed in chunk (spectrum left unchanged)."
+            hdr["COMMENT"] = "0=OK, 1=insufficient finite line-free points, 2=lstsq failed (spectrum left unchanged), 3=all-NaN spectrum."
             _replace_or_append_hdu(hdul_out, fits.ImageHDU(data=np.asarray(flag_map, dtype=np.uint8), header=hdr, name="BASE_FLG"))
 
     hdul_out.writeto(output_fits, overwrite=overwrite)
