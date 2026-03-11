@@ -24,6 +24,7 @@ def fit_cube_baseline(
     baseline_cfg: BaselineConfig,
     ripple_freqs: Optional[Sequence[float]] = None,
     target_mask_2d: Optional[np.ndarray] = None,
+    mask_output_to_target: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
     """
     Fit baseline model and return baseline cube + QC stats.
@@ -33,8 +34,14 @@ def fit_cube_baseline(
     baseline_cube : (nchan, ny, nx) float32
     stats : dict
         rms_map (ny,nx), flag_map (ny,nx), fit_ok_map (ny,nx), n_linefree (scalar array)
+
+    Notes
+    -----
+    ``mask_output_to_target=False`` avoids allocating additional full-cube/maps
+    filled with zeros or NaNs when the caller is already going to apply
+    ``target_mask_2d`` during session update.
     """
-    data = np.asarray(cube_original, dtype=np.float32)
+    data = np.asarray(cube_original)
     if data.ndim != 3:
         raise ValueError(f"cube_original must be 3D (nchan,ny,nx), got shape={data.shape}")
     nchan, ny, nx = data.shape
@@ -43,16 +50,14 @@ def fit_cube_baseline(
     if lf.shape != (nchan,):
         raise ValueError(f"linefree_mask_1d shape mismatch: {lf.shape} vs ({nchan},)")
 
-    out_cube, rms_map, flag_map = subtract_baseline_cube(
-        data,
+    baseline_cube, rms_map, flag_map = subtract_baseline_cube(
+        cube_original,
         linefree_mask=lf,
         bcfg=baseline_cfg,
         ripple_freqs=ripple_freqs,
         return_qc=True,
+        output_kind="baseline",
     )
-    baseline_cube = np.zeros_like(data, dtype=np.float32)
-    finite_both = np.isfinite(data) & np.isfinite(out_cube)
-    baseline_cube[finite_both] = (data[finite_both] - out_cube[finite_both]).astype(np.float32, copy=False)
 
     rms_map = np.asarray(rms_map, dtype=np.float32)
     flag_map = np.asarray(flag_map, dtype=np.uint8)
@@ -62,23 +67,24 @@ def fit_cube_baseline(
         tm = np.asarray(target_mask_2d, dtype=bool)
         if tm.shape != (ny, nx):
             raise ValueError(f"target_mask_2d shape mismatch: {tm.shape} vs ({ny},{nx})")
-        keep = tm
+        if mask_output_to_target:
+            keep = tm
 
-        baseline_cube2 = np.zeros_like(baseline_cube)
-        baseline_cube2[:, keep] = baseline_cube[:, keep]
-        baseline_cube = baseline_cube2
+            baseline_cube2 = np.zeros_like(baseline_cube)
+            baseline_cube2[:, keep] = baseline_cube[:, keep]
+            baseline_cube = baseline_cube2
 
-        rms2 = np.full((ny, nx), np.nan, dtype=np.float32)
-        rms2[keep] = rms_map[keep]
-        rms_map = rms2
+            rms2 = np.full((ny, nx), np.nan, dtype=np.float32)
+            rms2[keep] = rms_map[keep]
+            rms_map = rms2
 
-        flg2 = np.zeros((ny, nx), dtype=np.uint8)
-        flg2[keep] = flag_map[keep]
-        flag_map = flg2
+            flg2 = np.zeros((ny, nx), dtype=np.uint8)
+            flg2[keep] = flag_map[keep]
+            flag_map = flg2
 
-        ok2 = np.zeros((ny, nx), dtype=bool)
-        ok2[keep] = fit_ok[keep]
-        fit_ok = ok2
+            ok2 = np.zeros((ny, nx), dtype=bool)
+            ok2[keep] = fit_ok[keep]
+            fit_ok = ok2
 
     stats: Dict[str, np.ndarray] = {
         "rms_map": rms_map,

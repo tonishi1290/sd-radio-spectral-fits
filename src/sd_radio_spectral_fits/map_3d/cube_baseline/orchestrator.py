@@ -269,7 +269,7 @@ def run_one_iteration(
             stable_sort=True,
         )
 
-    cube_work = session.get_full_cube_work()
+    cube_work = session.get_full_cube_work(cache=False)
 
     lf = _resolve_linefree_mask(
         session,
@@ -295,6 +295,9 @@ def run_one_iteration(
         poly_order=poly_order,
     )
 
+    del cube_work
+    session.clear_work_cache()
+
     bcfg = BaselineConfig(
         poly_order=poly_order,
         ripple=enable_ripple,
@@ -310,6 +313,7 @@ def run_one_iteration(
         baseline_cfg=bcfg,
         ripple_freqs=freqs,
         target_mask_2d=target_mask_2d,
+        mask_output_to_target=False,
     )
 
     params: Dict[str, Any] = dict(

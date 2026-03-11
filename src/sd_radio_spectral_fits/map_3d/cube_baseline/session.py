@@ -134,13 +134,25 @@ class BaselineSession:
     def nx(self) -> int:
         return int(self._shape[2])
 
-    def get_full_cube_work(self) -> np.ndarray:
+    def get_full_cube_work(self, *, cache: bool = True) -> np.ndarray:
         """
-        Return corrected cube (cube_original - baseline_cube), cached.
+        Return corrected cube (cube_original - baseline_cube).
+
+        Parameters
+        ----------
+        cache : bool, default True
+            If True, cache the corrected cube inside the session.
+            If False, compute and return a temporary cube without storing it.
         """
-        if self._cube_work_cache is None:
-            self._cube_work_cache = self.cube_original - self.baseline_cube
-        return self._cube_work_cache
+        if cache:
+            if self._cube_work_cache is None:
+                self._cube_work_cache = self.cube_original - self.baseline_cube
+            return self._cube_work_cache
+        return self.cube_original - self.baseline_cube
+
+    def clear_work_cache(self) -> None:
+        """Drop any cached corrected cube to release memory promptly."""
+        self._cube_work_cache = None
 
     def set_prior(
         self,

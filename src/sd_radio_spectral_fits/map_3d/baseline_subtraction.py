@@ -37,13 +37,22 @@ Dependencies
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
+import json
 import logging
+import os
+import platform
+import sys
 import warnings
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import scipy
 import scipy.ndimage as ndi
+import astropy
 from astropy.io import fits
 import astropy.units as u
 
@@ -62,6 +71,8 @@ __all__ = [
     "estimate_ripple_frequencies_fft",
     "subtract_baseline_cube",
     "subtract_baseline_from_fits",
+    "build_baseline_diagnostic_payload",
+    "write_baseline_diagnostic_files",
 ]
 
 
@@ -231,6 +242,176 @@ def _dilate_1d(mask: np.ndarray, pad: int) -> np.ndarray:
 
 def _as_float32(x: Any) -> np.ndarray:
     return np.asarray(x, dtype=np.float32)
+
+
+def _capture_stdout(fn: Any) -> str:
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        try:
+            fn()
+        except Exception as exc:
+            return f"<unavailable: {exc}>"
+    return buf.getvalue().strip()
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_array(arr: Any) -> str:
+    a = np.ascontiguousarray(np.asarray(arr))
+    return _sha256_bytes(a.tobytes())
+
+
+def _json_ready(obj: Any) -> Any:
+    if isinstance(obj, dict):
+        return {str(k): _json_ready(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_ready(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _json_ready(obj.tolist())
+    if isinstance(obj, (np.floating,)):
+        return None if not np.isfinite(obj) else float(obj)
+    if isinstance(obj, (np.integer,)):
+        return int(obj)
+    if isinstance(obj, (np.bool_,)):
+        return bool(obj)
+    return obj
+
+
+def build_baseline_diagnostic_payload(
+    *,
+    linefree_mask: np.ndarray,
+    ripple_freqs: Optional[Sequence[float]],
+    rms_map: Optional[np.ndarray],
+    flag_map: Optional[np.ndarray],
+    extra: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    lf = np.asarray(linefree_mask, dtype=bool)
+    rip = np.asarray([] if ripple_freqs is None else list(ripple_freqs), dtype=np.float64)
+
+    payload: dict[str, Any] = {
+        "environment": {
+            "python_version": sys.version.replace("\n", " "),
+            "platform": platform.platform(),
+            "numpy_version": np.__version__,
+            "scipy_version": getattr(scipy, "__version__", None),
+            "astropy_version": getattr(astropy, "__version__", None),
+            "numpy_show_runtime": _capture_stdout(getattr(np, "show_runtime", lambda: None)),
+            "numpy_show_config": _capture_stdout(getattr(np, "show_config", lambda: None)),
+        },
+        "linefree_used": {
+            "nchan": int(lf.size),
+            "n_true": int(lf.sum()),
+            "fraction_true": float(lf.mean()) if lf.size > 0 else None,
+            "sha256": _sha256_array(lf.astype(np.uint8, copy=False)),
+        },
+        "ripple_used": {
+            "nfreq": int(rip.size),
+            "freq_cyc_per_ch": [float(v) for v in rip.tolist()],
+            "period_ch": [float(np.inf if v == 0.0 else 1.0 / v) for v in rip.tolist()],
+            "sha256": _sha256_array(rip.astype(np.float64, copy=False)),
+        },
+    }
+
+    if rms_map is not None:
+        rms = np.asarray(rms_map, dtype=np.float32)
+        finite = np.isfinite(rms)
+        if finite.any():
+            with np.errstate(all="ignore"):
+                rms_min = float(np.nanmin(rms))
+                rms_med = float(np.nanmedian(rms))
+                rms_mean = float(np.nanmean(rms))
+                rms_max = float(np.nanmax(rms))
+        else:
+            rms_min = rms_med = rms_mean = rms_max = None
+        payload["base_rms"] = {
+            "shape": [int(v) for v in rms.shape],
+            "sha256": _sha256_array(rms),
+            "min": rms_min,
+            "median": rms_med,
+            "mean": rms_mean,
+            "max": rms_max,
+        }
+    else:
+        payload["base_rms"] = None
+
+    if flag_map is not None:
+        flg = np.asarray(flag_map, dtype=np.uint8)
+        vals, cnts = np.unique(flg, return_counts=True)
+        payload["base_flag"] = {
+            "shape": [int(v) for v in flg.shape],
+            "sha256": _sha256_array(flg),
+            "counts": {str(int(v)): int(c) for v, c in zip(vals.tolist(), cnts.tolist())},
+        }
+    else:
+        payload["base_flag"] = None
+
+    if extra:
+        payload["extra"] = _json_ready(extra)
+    return payload
+
+
+def _format_baseline_diagnostic_text(payload: dict[str, Any]) -> str:
+    env = payload.get("environment", {})
+    lf = payload.get("linefree_used", {})
+    rip = payload.get("ripple_used", {})
+    rms = payload.get("base_rms", {}) or {}
+    flg = payload.get("base_flag", {}) or {}
+    lines = [
+        "Baseline diagnostic summary",
+        "===========================",
+        f"Python : {env.get('python_version')}",
+        f"Platform: {env.get('platform')}",
+        f"NumPy  : {env.get('numpy_version')}",
+        f"SciPy  : {env.get('scipy_version')}",
+        f"Astropy: {env.get('astropy_version')}",
+        "",
+        "Line-free mask used",
+        "-------------------",
+        f"nchan        : {lf.get('nchan')}",
+        f"n_true       : {lf.get('n_true')}",
+        f"fraction_true: {lf.get('fraction_true')}",
+        f"sha256       : {lf.get('sha256')}",
+        "",
+        "Ripple frequencies used",
+        "-----------------------",
+        f"nfreq        : {rip.get('nfreq')}",
+        f"freq_cyc/ch  : {rip.get('freq_cyc_per_ch')}",
+        f"period_ch    : {rip.get('period_ch')}",
+        f"sha256       : {rip.get('sha256')}",
+        "",
+        "BASE_RMS summary",
+        "----------------",
+        f"min/median/mean/max: {rms.get('min')} / {rms.get('median')} / {rms.get('mean')} / {rms.get('max')}",
+        f"sha256            : {rms.get('sha256')}",
+        "",
+        "BASE_FLG summary",
+        "----------------",
+        f"counts       : {flg.get('counts')}",
+        f"sha256       : {flg.get('sha256')}",
+    ]
+    extra = payload.get("extra")
+    if extra is not None:
+        lines.extend(["", "Extra", "-----", json.dumps(extra, ensure_ascii=False, indent=2, sort_keys=True)])
+    runtime = env.get("numpy_show_runtime")
+    if runtime:
+        lines.extend(["", "NumPy runtime", "-------------", str(runtime)])
+    return "\n".join(lines) + "\n"
+
+
+def write_baseline_diagnostic_files(prefix: str, payload: dict[str, Any]) -> Tuple[str, str]:
+    base = str(prefix)
+    if base.lower().endswith('.fits'):
+        base = base[:-5]
+    json_path = base + '.baseline_diag.json'
+    txt_path = base + '.baseline_diag.txt'
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(_json_ready(payload), f, ensure_ascii=False, indent=2, sort_keys=True)
+        f.write('\n')
+    with open(txt_path, 'w', encoding='utf-8') as f:
+        f.write(_format_baseline_diagnostic_text(payload))
+    return json_path, txt_path
 
 
 def _validate_sampling_mode(mode: str) -> str:
@@ -1047,6 +1228,8 @@ def subtract_baseline_from_fits(
     # output
     add_qc_hdus: bool = True,
     overwrite: bool = True,
+    write_diagnostics: bool = False,
+    diagnostics_prefix: Optional[str] = None,
 ) -> None:
     """
     Read cube FITS, estimate/reuse line-free + ripple frequencies, subtract baseline, write new FITS.
@@ -1204,6 +1387,7 @@ def subtract_baseline_from_fits(
             "BASE_RMS",
             "BASE_FLG",
             "BASEFLAG",
+            "BASE_DIAG",
             "RMS",
             "MASK3D",
             "MOMENT0",
@@ -1221,7 +1405,10 @@ def subtract_baseline_from_fits(
         hdr_lf = fits.Header()
         hdr_lf["BTYPE"] = "LineFreeMask"
         hdr_lf["COMMENT"] = "1=line-free channel used for baseline fitting; 0=line/ignored."
-        _replace_or_append_hdu(hdul_out, fits.ImageHDU(data=lf.astype(np.uint8), header=hdr_lf, name="LINEFREE"))
+        lf_hdu = fits.ImageHDU(data=lf.astype(np.uint8), header=hdr_lf, name="LINEFREE")
+        _replace_or_append_hdu(hdul_out, lf_hdu)
+        lf_used_hdu = fits.ImageHDU(data=lf.astype(np.uint8), header=hdr_lf.copy(), name="LINEFREE_USED")
+        _replace_or_append_hdu(hdul_out, lf_used_hdu)
 
         if baseline_cfg.ripple and freqs:
             freq_arr = np.asarray(freqs, dtype=float)
@@ -1234,6 +1421,9 @@ def subtract_baseline_from_fits(
             tbhdu = fits.BinTableHDU.from_columns(cols, name="RIPFREQ")
             tbhdu.header["COMMENT"] = "Ripple frequencies used in baseline model."
             _replace_or_append_hdu(hdul_out, tbhdu)
+            tbhdu_used = fits.BinTableHDU.from_columns(cols, name="RIPFREQ_USED")
+            tbhdu_used.header["COMMENT"] = "Ripple frequencies used in baseline model."
+            _replace_or_append_hdu(hdul_out, tbhdu_used)
 
         if rms_map is not None:
             hdr = fits.Header()
@@ -1248,4 +1438,28 @@ def subtract_baseline_from_fits(
             _replace_or_append_hdu(hdul_out, fits.ImageHDU(data=np.asarray(flag_map, dtype=np.uint8), header=hdr, name="BASE_FLG"))
 
     hdul_out.writeto(output_fits, overwrite=overwrite)
+
+    if write_diagnostics:
+        payload = build_baseline_diagnostic_payload(
+            linefree_mask=lf,
+            ripple_freqs=freqs,
+            rms_map=rms_map,
+            flag_map=flag_map,
+            extra={
+                "input_fits": input_fits,
+                "output_fits": output_fits,
+                "cube_ext": cube_ext,
+                "linefree_mode": linefree_mode,
+                "ripple_mode": ripple_mode,
+                "manual_v_windows": list(manual_v_windows) if manual_v_windows is not None else None,
+                "baseline_cfg": baseline_cfg.__dict__,
+                "linefree_cfg": linefree_cfg.__dict__,
+                "ripple_cfg": ripple_cfg.__dict__,
+                "reproducible_mode": bool(getattr(baseline_cfg, "reproducible_mode", False)),
+            },
+        )
+        prefix = diagnostics_prefix if diagnostics_prefix else output_fits
+        json_path, txt_path = write_baseline_diagnostic_files(prefix, payload)
+        logging.info("Wrote baseline diagnostics: %s | %s", json_path, txt_path)
+
     logging.info("Wrote baselined cube FITS: %s", output_fits)

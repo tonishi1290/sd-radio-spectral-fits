@@ -15,7 +15,12 @@ import numpy as np
 from astropy.io import fits
 import astropy.units as u
 
-from sd_radio_spectral_fits.map_3d.baseline_subtraction import LineFreeConfig, RippleConfig
+from sd_radio_spectral_fits.map_3d.baseline_subtraction import (
+    LineFreeConfig,
+    RippleConfig,
+    build_baseline_diagnostic_payload,
+    write_baseline_diagnostic_files,
+)
 from .session import BaselineSession
 from .orchestrator import run_one_iteration
 
@@ -380,6 +385,8 @@ def run_cli_pipeline(
     run_cube_analysis: bool = False,
     cube_analysis_method: str = "smooth_mask_lite",
     cube_analysis_write_provisional: bool = True,
+    write_diagnostics: bool = False,
+    diagnostics_prefix: Optional[str] = None,
 ) -> None:
     """
     Pipeline:
@@ -443,13 +450,29 @@ def run_cli_pipeline(
             logging.info("  -> Median BASE_RMS: %.4f", float(np.nanmedian(rms_map)))
 
     logging.info("Writing baselined cube: %s", output_fits)
-    cube_out = session.get_full_cube_work().astype(np.float32, copy=False)
-    if session.axis_order_in == "y_x_v":
+    cube_out = session.get_full_cube_work(cache=False).astype(np.float32, copy=False)
+    axis_order_in = session.axis_order_in
+
+    linefree_mask_1d_prior = None if session.linefree_mask_1d_prior is None else np.asarray(session.linefree_mask_1d_prior, dtype=bool).copy()
+    linefree_mask_1d_current = None if session.linefree_mask_1d_current is None else np.asarray(session.linefree_mask_1d_current, dtype=bool).copy()
+    ripple_freqs_prior = None if session.ripple_freqs_prior is None else np.asarray(session.ripple_freqs_prior, dtype=float).copy()
+    ripple_freqs_current = None if session.ripple_freqs_current is None else np.asarray(session.ripple_freqs_current, dtype=float).copy()
+    rms_map = session.fit_stats.get("rms_map", None)
+    if rms_map is not None:
+        rms_map = np.asarray(rms_map, dtype=np.float32)
+    flag_map = session.fit_stats.get("flag_map", None)
+    if flag_map is not None:
+        flag_map = np.asarray(flag_map, dtype=np.uint8)
+
+    if axis_order_in == "y_x_v":
         cube_out_write = np.transpose(cube_out, (1, 2, 0))
-    elif session.axis_order_in == "y_v_x":
+    elif axis_order_in == "y_v_x":
         cube_out_write = np.transpose(cube_out, (1, 0, 2))
     else:
         cube_out_write = cube_out
+
+    session.clear_work_cache()
+    del session
 
     with fits.open(input_fits, memmap=True) as hdul_in:
         hdul_out = fits.HDUList([hdu.copy() for hdu in hdul_in])
@@ -472,6 +495,7 @@ def run_cli_pipeline(
             "BASE_RMS",
             "BASE_FLG",
             "BASEFLAG",
+            "BASE_DIAG",
             "RMS",
             "MASK3D",
             "MOMENT0",
@@ -512,25 +536,29 @@ def run_cli_pipeline(
 
     _strip_checksum_all_hdus(hdul_out)
 
-    if session.linefree_mask_1d_prior is not None:
+    if linefree_mask_1d_prior is not None:
         hdr = fits.Header()
         hdr["BTYPE"] = "LineFreeMask"
         hdr["COMMENT"] = "1=line-free prior loaded from input FITS; 0=non-prior/line candidate."
         _replace_or_append_hdu(
             hdul_out,
-            fits.ImageHDU(data=np.asarray(session.linefree_mask_1d_prior, dtype=np.uint8), header=hdr, name="LINEFREE_PRIOR"),
+            fits.ImageHDU(data=np.asarray(linefree_mask_1d_prior, dtype=np.uint8), header=hdr, name="LINEFREE_PRIOR"),
         )
-    if session.linefree_mask_1d_current is not None:
+    if linefree_mask_1d_current is not None:
         hdr = fits.Header()
         hdr["BTYPE"] = "LineFreeMask"
         hdr["COMMENT"] = "1=line-free channel used for baseline fitting; 0=line/ignored."
         _replace_or_append_hdu(
             hdul_out,
-            fits.ImageHDU(data=np.asarray(session.linefree_mask_1d_current, dtype=np.uint8), header=hdr, name="LINEFREE"),
+            fits.ImageHDU(data=np.asarray(linefree_mask_1d_current, dtype=np.uint8), header=hdr, name="LINEFREE"),
+        )
+        _replace_or_append_hdu(
+            hdul_out,
+            fits.ImageHDU(data=np.asarray(linefree_mask_1d_current, dtype=np.uint8), header=hdr.copy(), name="LINEFREE_USED"),
         )
 
-    if enable_ripple and session.ripple_freqs_prior is not None and len(session.ripple_freqs_prior) > 0:
-        arr = np.asarray(session.ripple_freqs_prior, dtype=float)
+    if enable_ripple and ripple_freqs_prior is not None and len(ripple_freqs_prior) > 0:
+        arr = np.asarray(ripple_freqs_prior, dtype=float)
         with np.errstate(divide="ignore", invalid="ignore"):
             period = np.where(arr != 0.0, 1.0 / arr, np.inf)
         cols = [
@@ -541,7 +569,7 @@ def run_cli_pipeline(
         tbhdu.header["COMMENT"] = "Ripple frequencies loaded from input FITS as priors."
         _replace_or_append_hdu(hdul_out, tbhdu)
 
-    freqs = session.ripple_freqs_current
+    freqs = ripple_freqs_current
     if enable_ripple and (freqs is not None) and (len(freqs) > 0):
         arr = np.asarray(freqs, dtype=float)
         with np.errstate(divide="ignore", invalid="ignore"):
@@ -553,8 +581,10 @@ def run_cli_pipeline(
         tbhdu = fits.BinTableHDU.from_columns(cols, name="RIPFREQ")
         tbhdu.header["COMMENT"] = "Ripple frequencies used in baseline model."
         _replace_or_append_hdu(hdul_out, tbhdu)
+        tbhdu_used = fits.BinTableHDU.from_columns(cols, name="RIPFREQ_USED")
+        tbhdu_used.header["COMMENT"] = "Ripple frequencies used in baseline model."
+        _replace_or_append_hdu(hdul_out, tbhdu_used)
 
-    rms_map = session.fit_stats.get("rms_map", None)
     if rms_map is not None:
         hdr = fits.Header()
         hdr["BTYPE"] = "BaselineResidRMS"
@@ -564,17 +594,51 @@ def run_cli_pipeline(
             fits.ImageHDU(data=np.asarray(rms_map, dtype=np.float32), header=hdr, name="BASE_RMS"),
         )
 
-    flag_map = session.fit_stats.get("flag_map", None)
     if flag_map is not None:
         hdr = fits.Header()
         hdr["BTYPE"] = "BaselineFitFlag"
-        hdr["COMMENT"] = "0=OK, 2=lstsq failed in chunk (spectrum left unchanged)."
+        hdr["COMMENT"] = "0=OK, 1=insufficient finite line-free points, 2=lstsq failed (spectrum left unchanged), 3=all-NaN spectrum."
         _replace_or_append_hdu(
             hdul_out,
             fits.ImageHDU(data=np.asarray(flag_map, dtype=np.uint8), header=hdr, name="BASE_FLG"),
         )
 
     hdul_out.writeto(output_fits, overwrite=True)
+    try:
+        hdul_out.close()
+    except Exception:
+        pass
+    del cube_out
+    del cube_out_write
+
+    if write_diagnostics:
+        payload = build_baseline_diagnostic_payload(
+            linefree_mask=(np.ones((0,), dtype=bool) if linefree_mask_1d_current is None else linefree_mask_1d_current),
+            ripple_freqs=ripple_freqs_current,
+            rms_map=rms_map,
+            flag_map=flag_map,
+            extra={
+                "input_fits": input_fits,
+                "output_fits": output_fits,
+                "cube_ext": cube_ext,
+                "iterations": int(iterations),
+                "poly_order": int(poly_order),
+                "linefree_mode": linefree_mode,
+                "linefree_scope": linefree_scope,
+                "manual_v_windows": manual_v_windows,
+                "ripple_mode": ripple_mode,
+                "ripple_scope": ripple_scope,
+                "enable_ripple": bool(enable_ripple),
+                "robust": bool(robust),
+                "chunk_pix": int(chunk_pix),
+                "reproducible_mode": bool(reproducible_mode),
+                "linefree_cfg": linefree_cfg.__dict__,
+                "ripple_cfg": ripple_cfg.__dict__,
+            },
+        )
+        prefix = diagnostics_prefix if diagnostics_prefix else output_fits
+        json_path, txt_path = write_baseline_diagnostic_files(prefix, payload)
+        logging.info("Wrote baseline diagnostics: %s | %s", json_path, txt_path)
 
     if run_cube_analysis:
         from sd_radio_spectral_fits.map.cube_analysis import make_3d_mask_for_existing_fits
@@ -620,6 +684,8 @@ def _main() -> None:
     p.add_argument("--reproducible", action="store_true", help="Use deterministic baseline settings (float64, normalized polynomial basis, stride sampling, stable peak ranking).")
     p.add_argument("--run-analysis", action="store_true")
     p.add_argument("--no-provisional", action="store_true")
+    p.add_argument("--write-diagnostics", action="store_true", help="Write <prefix>.baseline_diag.json/txt for cross-environment comparison.")
+    p.add_argument("--diagnostics-prefix", default=None, help="Prefix (or FITS path) for diagnostic sidecar files.")
     p.add_argument(
         "--analysis-method",
         default="smooth_mask_lite",
@@ -670,6 +736,8 @@ def _main() -> None:
         run_cube_analysis=bool(args.run_analysis),
         cube_analysis_method=str(args.analysis_method),
         cube_analysis_write_provisional=not args.no_provisional,
+        write_diagnostics=bool(args.write_diagnostics),
+        diagnostics_prefix=args.diagnostics_prefix,
     )
 
 
