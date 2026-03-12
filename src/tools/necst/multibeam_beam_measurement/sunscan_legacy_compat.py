@@ -14,7 +14,7 @@ This script lets you switch the Az/El source:
 
 Common (always)
 ---------------
-- t_spec from nercst loaddb() data.t (spectrometer time; TP-synchronized)
+- t_spec from necstdb spectral table (direct read; no nercst dependency)
 - tp1 is raw integrated total power (sum over channels)
 - Sun center from astropy AltAz using config.toml in RawData
 - Offsets:
@@ -58,6 +58,7 @@ import argparse
 import builtins
 import os
 import pathlib
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -69,7 +70,6 @@ import scipy.optimize
 from scipy import signal
 
 import necstdb
-import nercst
 
 from astropy.time import Time
 from astropy.coordinates import get_body, AltAz
@@ -79,9 +79,137 @@ from astropy import constants as const
 from neclib import config
 
 
+
+def _decode_timestamp_text(v):
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            s = v.decode(errors="ignore")
+        except Exception:
+            s = str(v)
+    else:
+        s = str(v)
+    return s.strip().strip("\x00")
+
+
+def _find_first_nonempty_timestamp_text(values):
+    arr = np.asarray(values, dtype=object)
+    for v in arr:
+        s = _decode_timestamp_text(v)
+        if s and s.lower() != "nan":
+            return s
+    return None
+
+
+def _extract_timestamp_suffix(text):
+    s = _decode_timestamp_text(text)
+    if (not s) or (s.lower() == "nan"):
+        return None
+    s_up = s.upper()
+    if s_up.endswith("UTC"):
+        return "UTC"
+    if s_up.endswith("GPS"):
+        return "GPS"
+    if s_up.endswith("TAI"):
+        return "TAI"
+    if s_up.endswith("PC"):
+        return "PC"
+    return None
+
+
+def _gps_timestamp_texts_to_unix(values):
+    arr = np.asarray(values, dtype=object)
+    epoch = datetime(1980, 1, 6, 0, 0, 0)
+    gps_seconds = []
+    for v in arr:
+        s = _decode_timestamp_text(v)
+        if (not s) or (s.lower() == "nan") or (len(s) < 3):
+            raise ValueError(f"invalid GPS timestamp: {v!r}")
+        body = s[:-3]
+        dt = datetime.strptime(body, "%Y-%m-%dT%H:%M:%S.%f")
+        gps_seconds.append((dt - epoch).total_seconds())
+    return np.asarray(Time(np.asarray(gps_seconds, dtype=float), format="gps").utc.unix, dtype=float)
+
+
+def _timestamp_texts_to_unix(values, suffix):
+    arr = np.asarray(values, dtype=object)
+    suf = str(suffix).strip().upper()
+    texts = [_decode_timestamp_text(v) for v in arr]
+    if suf == "UTC":
+        bodies = [s[:-3] for s in texts]
+        return np.asarray(Time(bodies, format="isot", scale="utc").unix, dtype=float)
+    if suf == "TAI":
+        bodies = [s[:-3] for s in texts]
+        return np.asarray(Time(bodies, format="isot", scale="tai").utc.unix, dtype=float)
+    if suf == "GPS":
+        return _gps_timestamp_texts_to_unix(texts)
+    raise ValueError(f"unsupported timestamp suffix: {suffix!r}")
+
+
+def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("time", "t", "unix_time", "unixtime")):
+    names = list(arr.dtype.names or [])
+    timestamp_field = None
+    for k in ("timestamp", "time_spectrometer"):
+        if k in names:
+            timestamp_field = k
+            break
+
+    fallback_field = None
+    for k in numeric_fallback_candidates:
+        if k in names:
+            fallback_field = k
+            break
+
+    time_meta = {
+        "applied": None,
+        "timestamp_field": timestamp_field,
+        "fallback_field": fallback_field,
+        "suffix": None,
+        "first_timestamp_text": None,
+        "reason": None,
+    }
+
+    if timestamp_field is not None:
+        first_text = _find_first_nonempty_timestamp_text(arr[timestamp_field])
+        time_meta["first_timestamp_text"] = first_text
+        suffix = _extract_timestamp_suffix(first_text)
+        time_meta["suffix"] = suffix
+        if suffix in ("UTC", "GPS", "TAI"):
+            try:
+                t_spec = _timestamp_texts_to_unix(arr[timestamp_field], suffix)
+                if np.all(np.isfinite(t_spec)):
+                    time_meta["applied"] = f"{timestamp_field}:{suffix}->unix"
+                    time_meta["reason"] = "timestamp suffix accepted"
+                    return np.asarray(t_spec, dtype=float), time_meta
+                time_meta["reason"] = f"non-finite values after {suffix} conversion"
+            except Exception as e:
+                time_meta["reason"] = f"{suffix} conversion failed: {e}"
+        elif suffix == "PC":
+            time_meta["reason"] = "timestamp suffix is PC; falling back to numeric time"
+        elif first_text is None:
+            time_meta["reason"] = "timestamp field is empty/NaN; falling back to numeric time"
+        else:
+            time_meta["reason"] = f"unknown timestamp suffix in {first_text!r}; falling back to numeric time"
+
+    if fallback_field is not None:
+        t_spec = np.asarray(arr[fallback_field], dtype=float)
+        time_meta["applied"] = fallback_field
+        if time_meta["reason"] is None:
+            time_meta["reason"] = "timestamp field unavailable; using numeric time"
+        return t_spec, time_meta
+
+    if timestamp_field is not None:
+        raise RuntimeError(
+            "timestamp-like field exists but no usable numeric fallback field is available; "
+            f"timestamp_field={timestamp_field} available={names} reason={time_meta['reason']}"
+        )
+
+    raise RuntimeError("no usable spectral time field. available={}".format(names))
+
+
 TELESCOPE = "OMU1P85M"
 TEL_LOADDATA = "OMU1p85m"
 DEFAULT_SPECTRAL_NAME = "xffts-board1"
+DEFAULT_DB_NAMESPACE = "necst"
 PLANET = "sun"
 
 
@@ -231,6 +359,250 @@ def _safe_read_table(db, table_name: str) -> Optional[pd.DataFrame]:
     return None
 
 
+def _norm_name(x) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+
+def _pick_field_name(names, preferred, candidates):
+    if preferred:
+        p = _norm_name(preferred)
+        for n in names:
+            if _norm_name(n) == p:
+                return n
+        for n in names:
+            if _norm_name(n).lower() == p.lower():
+                return n
+
+    for c in candidates:
+        cc = _norm_name(c)
+        for n in names:
+            if _norm_name(n) == cc:
+                return n
+        for n in names:
+            if _norm_name(n).lower() == cc.lower():
+                return n
+
+    low = [(_norm_name(n), _norm_name(n).lower()) for n in names]
+    for c in candidates:
+        cl = _norm_name(c).lower()
+        for (n0, nl) in low:
+            if cl and cl in nl:
+                return n0
+    return None
+
+
+def _get_field(arr, name, dtype=float):
+    return np.asarray(arr[name], dtype=dtype)
+
+
+def _normalize_time_units(t_ref, t_other, label):
+    tr = np.asarray(t_ref, dtype=float)
+    to = np.asarray(t_other, dtype=float)
+
+    mr = float(np.nanmedian(tr)) if tr.size else np.nan
+    mo = float(np.nanmedian(to)) if to.size else np.nan
+    if (not np.isfinite(mr)) or (not np.isfinite(mo)) or mr <= 0 or mo <= 0:
+        return to, 1.0
+
+    ratio = mo / mr
+
+    if 5e2 < ratio < 2e3:
+        return to / 1e3, 1e-3
+    if 5e5 < ratio < 2e6:
+        return to / 1e6, 1e-6
+    if 5e8 < ratio < 2e9:
+        return to / 1e9, 1e-9
+
+    if 5e2 < (1.0 / ratio) < 2e3:
+        return to * 1e3, 1e3
+    if 5e5 < (1.0 / ratio) < 2e6:
+        return to * 1e6, 1e6
+    if 5e8 < (1.0 / ratio) < 2e9:
+        return to * 1e9, 1e9
+
+    return to, 1.0
+
+
+def _read_table_raw_bytes(table):
+    for k in ("raw", "buffer"):
+        try:
+            b = table.read(astype=k)
+            if isinstance(b, (bytes, bytearray)):
+                return bytes(b)
+        except Exception:
+            pass
+    raise RuntimeError("cannot read raw/buffer from table")
+
+
+def _get_table_dtype(table):
+    for attr in ("dtype", "_dtype", "data_dtype", "_data_dtype"):
+        try:
+            dt = getattr(table, attr)
+            if dt is not None:
+                return dt
+        except Exception:
+            pass
+    try:
+        arr = table.read(num=1, astype="array")
+        return arr.dtype
+    except Exception:
+        return None
+
+
+def _read_structured_array_tolerant(db, table_name: str):
+    tbl = db.open_table(table_name)
+    try:
+        return tbl.read(astype="array")
+    except Exception as e:
+        msg = str(e)
+        raw = _read_table_raw_bytes(tbl)
+        dt = _get_table_dtype(tbl)
+        if dt is None:
+            raise RuntimeError(f"cannot determine dtype for table {table_name} (original error: {msg})")
+        item = int(dt.itemsize)
+        if item <= 0:
+            raise RuntimeError(f"invalid dtype itemsize for table {table_name}: {item}")
+        nrec = len(raw) // item
+        if nrec <= 0:
+            raise RuntimeError(f"raw buffer too small for table {table_name}: len={len(raw)} itemsize={item}")
+        raw2 = raw[: nrec * item]
+        try:
+            return np.frombuffer(raw2, dtype=dt)
+        except Exception as e2:
+            raise RuntimeError(f"tolerant frombuffer failed for table {table_name}: {e2} (orig: {msg})")
+
+
+def _extract_spectral_from_structured(arr):
+    names = list(arr.dtype.names or [])
+    s_field = None
+    for k in ("data", "spectrum", "spec"):
+        if k in names:
+            s_field = k
+            break
+    if s_field is None:
+        raise RuntimeError(f"no spectrum-like field in spectral table. available={names}")
+
+    t_spec, time_meta = _select_spectral_time_from_structured(arr)
+    spec = np.asarray(arr[s_field])
+    if spec.ndim == 1 and spec.dtype == object:
+        spec2d = np.stack(spec, axis=0).astype(np.float32, copy=False)
+    else:
+        spec2d = spec.astype(np.float32, copy=False)
+
+    if spec2d.ndim != 2:
+        raise RuntimeError(f"spectrum array must be 2D. got {spec2d.shape}")
+
+    return np.asarray(t_spec, dtype=float), spec2d, time_meta, s_field
+
+
+def _to_degC_guess(temp_arr):
+    x = np.asarray(temp_arr, dtype=float)
+    if x.size == 0:
+        return np.full_like(x, np.nan, dtype=float)
+    med = float(np.nanmedian(x))
+    if np.isfinite(med) and med > 120.0:
+        return x - 273.15
+    return x
+
+
+def _to_hpa_guess(press_arr):
+    x = np.asarray(press_arr, dtype=float)
+    if x.size == 0:
+        return np.full_like(x, np.nan, dtype=float)
+    med = float(np.nanmedian(x))
+    if np.isfinite(med) and med > 2000.0:
+        return x / 100.0
+    return x
+
+
+def _to_rh01_guess(humid_arr):
+    x = np.asarray(humid_arr, dtype=float)
+    if x.size == 0:
+        return np.full_like(x, np.nan, dtype=float)
+    med = float(np.nanmedian(x))
+    if np.isfinite(med) and med <= 1.5:
+        rh = x
+    else:
+        rh = x / 100.0
+    return np.clip(rh, 0.0, 1.0)
+
+
+def _load_weather_meteo_for_tspec(
+    db,
+    telescope: str,
+    t_spec: np.ndarray,
+    *,
+    db_namespace: str = DEFAULT_DB_NAMESPACE,
+    preferred_time_col: str = "time",
+):
+    table_name = f"{str(db_namespace)}-{str(telescope)}-weather-ambient"
+    try:
+        arr = _read_structured_array_tolerant(db, table_name)
+    except Exception as e:
+        print(f"[warn] cannot read weather table {table_name}: {e}")
+        return None
+
+    names = list(arr.dtype.names or [])
+    pref = str(preferred_time_col).strip()
+    if pref.lower() == "recorded_time":
+        print("[warn] weather_time_col=recorded_time is not supported; forcing to 'time'")
+        pref = "time"
+
+    t_name = _pick_field_name(names, pref, ["time", "timestamp"])
+    if (t_name is None) or (str(t_name).strip().lower() == "recorded_time"):
+        print(f"[warn] weather table has no usable time column (time/timestamp). recorded_time is ignored. available={names}")
+        return None
+
+    t_w = _get_field(arr, t_name, float)
+    t_w, s_w = _normalize_time_units(t_spec, t_w, "weather")
+    if s_w != 1.0:
+        print(f"[info] weather time scaled by {s_w} to match unix seconds")
+
+    out = {"table": table_name, "time_col": str(t_name)}
+
+    if "pressure" in names:
+        try:
+            out["press_hpa"] = _to_hpa_guess(_interp_edge_hold(t_w, _get_field(arr, "pressure", float), t_spec))
+        except Exception:
+            out["press_hpa"] = None
+    else:
+        out["press_hpa"] = None
+
+    if "temperature" in names:
+        try:
+            out["temp_c"] = _to_degC_guess(_interp_edge_hold(t_w, _get_field(arr, "temperature", float), t_spec))
+        except Exception:
+            out["temp_c"] = None
+    else:
+        out["temp_c"] = None
+
+    if "humidity" in names:
+        try:
+            humid_raw = _interp_edge_hold(t_w, _get_field(arr, "humidity", float), t_spec)
+            out["humid_pct"] = np.asarray(_to_rh01_guess(humid_raw) * 100.0, dtype=float)
+            out["humid_rh"] = np.asarray(_to_rh01_guess(humid_raw), dtype=float)
+        except Exception:
+            out["humid_pct"] = None
+            out["humid_rh"] = None
+    else:
+        out["humid_pct"] = None
+        out["humid_rh"] = None
+
+    ok_any = False
+    for k in ("press_hpa", "temp_c", "humid_pct"):
+        v = out.get(k)
+        if v is not None and np.any(np.isfinite(np.asarray(v, dtype=float))):
+            ok_any = True
+            break
+    if not ok_any:
+        print("[warn] weather table fields exist but all are NaN after interpolation; ignoring weather meteo")
+        return None
+    return out
+
+
 # -----------------------------
 # Helpers
 # -----------------------------
@@ -298,27 +670,40 @@ def _decode_position(v) -> str:
         return ""
 
 
-def _estimate_tamb_k(data_obj, *, fallback_k: float = 300.0) -> float:
-    """Estimate ambient load temperature Tamb [K] from nercst data object.
-
-    Spec (user-provided): search attributes in order: temperature, temp_k, Tamb.
-    Take nanmedian; if 50..400 K -> adopt; else fallback.
-    """
-    cand_attrs = ["temperature", "temp_k", "Tamb"]
-    for a in cand_attrs:
+def _estimate_tamb_k(
+    *,
+    weather_meteo=None,
+    structured_arr=None,
+    fallback_k: float = 300.0,
+) -> float:
+    """Estimate ambient load temperature Tamb [K] from necstdb-side information."""
+    if weather_meteo is not None:
         try:
-            if not hasattr(data_obj, a):
-                continue
-            v = getattr(data_obj, a)
-            if hasattr(v, "values"):
-                arr = np.asarray(v.values, dtype=float)
-            else:
-                arr = np.asarray(v, dtype=float)
-            med = float(np.nanmedian(arr))
-            if np.isfinite(med) and (50.0 <= med <= 400.0):
-                return med
+            temp_c = weather_meteo.get("temp_c")
+            if temp_c is not None:
+                med_c = float(np.nanmedian(np.asarray(temp_c, dtype=float)))
+                med_k = med_c + 273.15
+                if np.isfinite(med_k) and (50.0 <= med_k <= 400.0):
+                    return med_k
         except Exception:
-            continue
+            pass
+
+    if structured_arr is not None:
+        names = list(structured_arr.dtype.names or [])
+        for field in ("Tamb", "temp_k", "temperature"):
+            name = _pick_field_name(names, field, [field])
+            if name is None:
+                continue
+            try:
+                arr = np.asarray(structured_arr[name], dtype=float)
+                med = float(np.nanmedian(arr))
+                if field == "temperature" and np.isfinite(med) and med < 120.0:
+                    med = med + 273.15
+                if np.isfinite(med) and (50.0 <= med <= 400.0):
+                    return med
+            except Exception:
+                continue
+
     return float(fallback_k)
 
 
@@ -1237,54 +1622,71 @@ def integ_all_channels(spec2d: np.ndarray) -> np.ndarray:
     return np.sum(spec2d, axis=1)
 
 
-def load_spectral(rawdata_path: pathlib.Path, spectral_name: str, *, tel_loaddata: str = TEL_LOADDATA):
-    data = nercst.core.io.loaddb(str(rawdata_path), str(pathlib.Path(spectral_name)), telescop=str(tel_loaddata))
-    data = nercst.core.multidimensional_coordinates.convert_frame(data, "altaz")
-    t_spec = np.asarray(getattr(data, "t"), dtype=float)
-    spec = getattr(data, "data")  # (ndump, nchan)
-    tp1 = integ_all_channels(spec)
-    o = np.argsort(t_spec)
-    return data, t_spec[o], tp1[o], o
-
-
-def _get_position_tags_hybrid(
+def load_spectral(
+    db,
+    spectral_name: str,
     *,
-    df_spec_tbl: Optional[pd.DataFrame],
-    data_obj,
+    telescope: str = TELESCOPE,
+    db_namespace: str = DEFAULT_DB_NAMESPACE,
+):
+    spec_table_name = f"{str(db_namespace)}-{str(telescope)}-data-spectral-{spectral_name}"
+    arr_spec = _read_structured_array_tolerant(db, spec_table_name)
+    t_spec, spec2d, time_meta, _s_field = _extract_spectral_from_structured(arr_spec)
+    tp1 = integ_all_channels(spec2d)
+    o = np.argsort(t_spec)
+    return arr_spec, t_spec[o], tp1[o], o, time_meta
+
+
+def _get_position_tags_from_structured(
+    *,
+    arr_spec,
     order: np.ndarray,
 ) -> np.ndarray:
-    """Get position tags (HOT/OFF/ON) using the hybrid priority.
+    """Get position tags (HOT/OFF/ON) directly from necstdb spectral rows."""
+    names = list(arr_spec.dtype.names or [])
+    pos_name = _pick_field_name(names, "position", ["position", "pos", "obsmode", "mode"])
+    if pos_name is None:
+        raise RuntimeError(f"Cannot find position tags in spectral table. available={names}")
 
-    Priority:
-      1) necstdb spectral table column 'position'
-      2) nercst data_obj.position
-
-    Then reorder by 'order' and strictly decode each element to UPPER().strip().
-    """
-    pos_vals = None
-    if df_spec_tbl is not None and "position" in df_spec_tbl.columns:
-        try:
-            pos_vals = df_spec_tbl["position"].to_numpy()
-        except Exception:
-            pos_vals = None
-    if pos_vals is None:
-        try:
-            if hasattr(data_obj, "position"):
-                pos_vals = getattr(data_obj, "position")
-                if hasattr(pos_vals, "values"):
-                    pos_vals = pos_vals.values
-                pos_vals = np.asarray(pos_vals)
-        except Exception:
-            pos_vals = None
-
-    if pos_vals is None:
-        raise RuntimeError("Cannot find position tags: neither necstdb spectral.position nor nercst data.position is available.")
-
-    pos_vals = np.asarray(pos_vals)
+    pos_vals = np.asarray(arr_spec[pos_name])
     if pos_vals.shape[0] != order.shape[0]:
         raise RuntimeError(f"position length mismatch: {pos_vals.shape[0]} vs {order.shape[0]}")
     pos_vals = pos_vals[order]
     pos_str = np.array([_decode_position(v) for v in pos_vals], dtype=object)
+    return pos_str
+
+
+def _get_position_tags_with_fallback(
+    db,
+    *,
+    arr_spec,
+    order: np.ndarray,
+    t_spec: np.ndarray,
+    telescope: str = TELESCOPE,
+    db_namespace: str = DEFAULT_DB_NAMESPACE,
+) -> np.ndarray:
+    """Get HOT/OFF/ON tags from spectral rows, with DB-table fallback.
+
+    Preferred source is the necstdb spectral table itself. If the spectral rows do
+    not contain usable position labels, fall back to common obsmode tables in the
+    same DB namespace and align them to spectral timestamps.
+    """
+    try:
+        pos_str = _get_position_tags_from_structured(arr_spec=arr_spec, order=order)
+        good = np.array([_normalize_obsmode(v) for v in pos_str], dtype=object)
+        if np.any(good == "HOT") or np.any(good == "OFF") or np.any(good == "ON"):
+            return good
+        print("[warn] spectral position tags exist but do not contain HOT/OFF/ON; trying DB obsmode fallback.")
+    except Exception as e:
+        print(f"[warn] cannot read position tags from spectral rows: {e}; trying DB obsmode fallback.")
+
+    pos_db = _infer_obsmode_from_db(
+        db,
+        t_spec,
+        telescope=telescope,
+        db_namespace=db_namespace,
+    )
+    pos_str = np.array([_normalize_obsmode(v) for v in pos_db], dtype=object)
     return pos_str
 
 # -----------------------------
@@ -1330,17 +1732,23 @@ def _normalize_obsmode(x) -> str:
     return s if s else "UNKNOWN"
 
 
-def _infer_obsmode_from_db(db, t_spec: np.ndarray, *, telescope: str = TELESCOPE) -> np.ndarray:
+def _infer_obsmode_from_db(
+    db,
+    t_spec: np.ndarray,
+    *,
+    telescope: str = TELESCOPE,
+    db_namespace: str = DEFAULT_DB_NAMESPACE,
+) -> np.ndarray:
     """Try to read observation mode (HOT/OFF/ON) from common necstdb tables.
 
     Returns an array aligned to t_spec (nearest-neighbor in time).
     """
     # candidate tables and columns (best-effort; varies by deployment)
     table_candidates = [
-        f"necst-{str(telescope)}-ctrl-obsmode",
-        f"necst-{str(telescope)}-ctrl-observation-mode",
-        f"necst-{str(telescope)}-ctrl-antenna-obsmode",
-        f"necst-{str(telescope)}-ctrl-antenna-observation-mode",
+        f"{str(db_namespace)}-{str(telescope)}-ctrl-obsmode",
+        f"{str(db_namespace)}-{str(telescope)}-ctrl-observation-mode",
+        f"{str(db_namespace)}-{str(telescope)}-ctrl-antenna-obsmode",
+        f"{str(db_namespace)}-{str(telescope)}-ctrl-antenna-observation-mode",
     ]
     time_cols = ["time", "t", "timestamp"]
     mode_cols = ["obsmode", "OBSMODE", "mode", "MODE", "obs_mode", "OBS_MODE", "observation_mode"]
@@ -1372,6 +1780,9 @@ def _infer_obsmode_from_db(db, t_spec: np.ndarray, *, telescope: str = TELESCOPE
         mm = mm[good]
         if tt.size < 2:
             continue
+        tt, s_mode = _normalize_time_units(t_spec, tt, "obsmode")
+        if s_mode != 1.0:
+            print(f"[info] obsmode time scaled by {s_mode} to match unix seconds")
         return _nearest_by_time(tt, mm, np.asarray(t_spec, dtype=float))
 
     raise RuntimeError(
@@ -1561,7 +1972,13 @@ def ensure_obs_and_config_files(rawdata_path: pathlib.Path) -> None:
 # -----------------------------
 # Sun ephemeris at t_spec (astropy)
 # -----------------------------
-def sun_altaz_deg(t_unix: np.ndarray, data_obj, rawdata_path: pathlib.Path, *, planet: str = PLANET) -> Tuple[np.ndarray, np.ndarray]:
+def sun_altaz_deg(
+    t_unix: np.ndarray,
+    rawdata_path: pathlib.Path,
+    *,
+    planet: str = PLANET,
+    weather_meteo=None,
+) -> Tuple[np.ndarray, np.ndarray]:
     os.environ["NECST_ROOT"] = str(rawdata_path)
     try:
         config.reload()
@@ -1570,18 +1987,28 @@ def sun_altaz_deg(t_unix: np.ndarray, data_obj, rawdata_path: pathlib.Path, *, p
 
     t = Time(t_unix, format="unix")
 
-    # Environmental terms (optional)
-    try:
-        press = getattr(data_obj, "pressure").values * u.hPa
-    except Exception:
+    if weather_meteo is not None and weather_meteo.get("press_hpa") is not None:
+        try:
+            press = np.asarray(weather_meteo.get("press_hpa"), dtype=float) * u.hPa
+        except Exception:
+            press = np.zeros_like(t_unix) * u.hPa
+    else:
         press = np.zeros_like(t_unix) * u.hPa
-    try:
-        temp = (getattr(data_obj, "temperature").values * u.K).to(u.deg_C, equivalencies=u.temperature())
-    except Exception:
+
+    if weather_meteo is not None and weather_meteo.get("temp_c") is not None:
+        try:
+            temp = np.asarray(weather_meteo.get("temp_c"), dtype=float) * u.deg_C
+        except Exception:
+            temp = np.zeros_like(t_unix) * u.deg_C
+    else:
         temp = np.zeros_like(t_unix) * u.deg_C
-    try:
-        humid = getattr(data_obj, "humidity").values
-    except Exception:
+
+    if weather_meteo is not None and weather_meteo.get("humid_rh") is not None:
+        try:
+            humid = np.asarray(weather_meteo.get("humid_rh"), dtype=float)
+        except Exception:
+            humid = np.zeros_like(t_unix)
+    else:
         humid = np.zeros_like(t_unix)
 
     try:
@@ -2298,6 +2725,7 @@ def build_dataframe(
     spectral_name: str,
     *,
     telescope: str = TELESCOPE,
+    db_namespace: str = DEFAULT_DB_NAMESPACE,
     tel_loaddata: str = TEL_LOADDATA,
     planet: str = PLANET,
     azel_source: str,
@@ -2311,15 +2739,19 @@ def build_dataframe(
 ) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
     ensure_obs_and_config_files(rawdata_path)
 
-    data, t_spec, tp1, order = load_spectral(rawdata_path, spectral_name, tel_loaddata=tel_loaddata)
     db = necstdb.opendb(rawdata_path)
+    arr_spec, t_spec, tp1, order, spec_time_meta = load_spectral(
+        db,
+        spectral_name,
+        telescope=telescope,
+        db_namespace=db_namespace,
+    )
 
-    # spectral id (for scan segmentation)
-    spec_table_name = f"necst-{str(telescope)}-data-spectral-{spectral_name}"
-    df_spec_tbl = _safe_read_table(db, spec_table_name)
+    names_spec = list(arr_spec.dtype.names or [])
     id_valid = False
-    if df_spec_tbl is not None and "id" in df_spec_tbl.columns:
-        id_vals = df_spec_tbl["id"].to_numpy()
+    id_name = _pick_field_name(names_spec, "id", ["id", "scan_id"])
+    if id_name is not None:
+        id_vals = np.asarray(arr_spec[id_name])
         if id_vals.shape[0] == order.shape[0]:
             id_vals = id_vals[order]
             id_valid = bool(np.any([_decode_label(v) != "" for v in id_vals]))
@@ -2331,13 +2763,19 @@ def build_dataframe(
     else:
         id_vals = np.array([b""] * len(t_spec), dtype=object)
 
+    position_str = _get_position_tags_with_fallback(
+        db,
+        arr_spec=arr_spec,
+        order=order,
+        t_spec=t_spec,
+        telescope=telescope,
+        db_namespace=db_namespace,
+    )
+    weather_meteo = _load_weather_meteo_for_tspec(db, telescope, t_spec, db_namespace=db_namespace)
 
-    # Position tags (HOT/OFF/ON): hybrid (necstdb spectral.position -> nercst data.position)
-    position_str = _get_position_tags_hybrid(df_spec_tbl=df_spec_tbl, data_obj=data, order=order)
-
-    # Tamb: user provided OR estimate from nercst (temperature/temp_k/Tamb) else fallback 300 K
+    # Tamb: user provided OR estimate from weather/spectral necstdb fields else fallback 300 K
     if tamb_k is None or (isinstance(tamb_k, float) and (not np.isfinite(tamb_k))):
-        tamb_use = _estimate_tamb_k(data, fallback_k=300.0)
+        tamb_use = _estimate_tamb_k(weather_meteo=weather_meteo, structured_arr=arr_spec, fallback_k=300.0)
     else:
         tamb_use = float(tamb_k)
     if (not np.isfinite(tamb_use)) or (tamb_use <= 0):
@@ -2357,7 +2795,7 @@ def build_dataframe(
 
 
     # altaz table (always needed for dlon/dlat and optional lon/lat)
-    alt_name = f"necst-{str(telescope)}-ctrl-antenna-altaz"
+    alt_name = f"{str(db_namespace)}-{str(telescope)}-ctrl-antenna-altaz"
     df_alt = _safe_read_table(db, alt_name)
     if df_alt is None:
         raise RuntimeError(f"cannot read altaz table: {alt_name}")
@@ -2365,6 +2803,9 @@ def build_dataframe(
         if k not in df_alt.columns:
             raise RuntimeError(f"altaz table '{alt_name}' missing column '{k}'")
     t_alt, alt = _dedup_mean(df_alt, "time", ["lon", "lat", "dlon", "dlat"])
+    t_alt, s_alt = _normalize_time_units(t_spec, t_alt, "altaz")
+    if s_alt != 1.0:
+        print(f"[info] altaz   time scaled by {s_alt} to match unix seconds")
     lon_alt = _interp_az_deg(t_alt, alt["lon"].to_numpy(float), t_spec)
     lat_alt = _interp_lin(t_alt, alt["lat"].to_numpy(float), t_spec)
     dlon = _interp_lin(t_alt, alt["dlon"].to_numpy(float), t_spec)
@@ -2389,7 +2830,7 @@ def build_dataframe(
             el_true = lat_alt
     else:
         # encoder stream (analysis definition: minus)
-        enc_name = f"necst-{str(telescope)}-ctrl-antenna-encoder"
+        enc_name = f"{str(db_namespace)}-{str(telescope)}-ctrl-antenna-encoder"
         df_enc = _safe_read_table(db, enc_name)
         if df_enc is None:
             raise RuntimeError(f"cannot read encoder table: {enc_name}")
@@ -2397,6 +2838,9 @@ def build_dataframe(
             if k not in df_enc.columns:
                 raise RuntimeError(f"encoder table '{enc_name}' missing column '{k}'")
         t_enc, enc = _dedup_mean(df_enc, "time", ["lon", "lat"])
+        t_enc, s_enc = _normalize_time_units(t_spec, t_enc, "encoder")
+        if s_enc != 1.0:
+            print(f"[info] encoder time scaled by {s_enc} to match unix seconds")
         t_enc = t_enc + float(encoder_shift_sec)
 
         lon_enc = enc["lon"].to_numpy(float)
@@ -2430,7 +2874,7 @@ def build_dataframe(
 
 
     # Sun ephemeris at t_spec
-    az_sun, el_sun = sun_altaz_deg(t_spec, data, rawdata_path, planet=planet)
+    az_sun, el_sun = sun_altaz_deg(t_spec, rawdata_path, planet=planet, weather_meteo=weather_meteo)
 
     # Sun-centered offsets
     off_az = _az_wrap_diff(az_true, az_sun)
@@ -2474,12 +2918,24 @@ def build_dataframe(
         df.attrs["Tamb_k"] = float(tamb_use)
     except Exception:
         pass
+    try:
+        df.attrs["spec_time_basis"] = str(spec_time_meta.get("applied"))
+        df.attrs["spec_time_suffix"] = spec_time_meta.get("suffix")
+        df.attrs["spec_time_fallback_field"] = spec_time_meta.get("fallback_field")
+        df.attrs["spec_time_example"] = spec_time_meta.get("first_timestamp_text")
+    except Exception:
+        pass
 
     az_scans, el_scans = build_scans_from_id(df, id_vals)
     print(
         f"[info] built df: N={len(df)} scans: az={len(az_scans)} el={len(el_scans)}  "
         f"azel_source={src} altaz_apply={altaz_apply} encoder_vavg_sec={encoder_vavg_sec} "
         f"chopper_wheel={chopper_wheel} Tamb={float(tamb_use):.3g}K"
+    )
+    print(
+        f"[info] spectral time basis: applied={spec_time_meta.get('applied')} "
+        f"suffix={spec_time_meta.get('suffix')} fallback={spec_time_meta.get('fallback_field')} "
+        f"example={spec_time_meta.get('first_timestamp_text')}"
     )
     return df, az_scans, el_scans
 
@@ -3294,6 +3750,7 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("rawdata", help="RawData directory")
     ap.add_argument("--spectral", default=DEFAULT_SPECTRAL_NAME, help=f"Spectral name (default: {DEFAULT_SPECTRAL_NAME})")
+    ap.add_argument("--db-namespace", default=DEFAULT_DB_NAMESPACE, help=f"Database namespace/prefix for NECST tables (default: {DEFAULT_DB_NAMESPACE})")
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="Output directory for PNGs (default: current dir)")
 
     ap.add_argument("--debug-plot", action="store_true", default=DEFAULT_DEBUG_PLOT,
@@ -3309,6 +3766,9 @@ def main() -> None:
     ap.add_argument("--encoder-shift-sec", type=float, default=DEFAULT_ENCODER_SHIFT_SEC,
                     help="Time shift (sec) added to encoder.time before interpolation (try if encoder timestamp has bias).")
 
+    ap.add_argument("--tel-loaddata", default=TEL_LOADDATA,
+                    help="Deprecated compatibility option from the old nercst path. It is now ignored because spectral data are read directly from necstdb.")
+
     ap.add_argument("--encoder-vavg-sec", type=float, default=DEFAULT_ENCODER_VAVG_SEC,
                     help="Only for --azel-source encoder: time-window (sec) for safe local smoothing of interpolated encoder az/el within each contiguous id block. No differentiation/integration. 0 disables.")
 
@@ -3320,7 +3780,7 @@ def main() -> None:
         type=float,
         default=None,
         help=(
-            "Ambient load temperature Tamb [K]. If omitted, estimate from nercst data "
+            "Ambient load temperature Tamb [K]. If omitted, estimate from necstdb weather/spectral data "
             "(temperature/temp_k/Tamb) and use it if within 50..400 K; otherwise fallback to 300 K."
         ),
     )
@@ -3447,6 +3907,7 @@ def main() -> None:
     df, az_scans, el_scans = build_dataframe(
         rawdata_path,
         args.spectral,
+        db_namespace=args.db_namespace,
         azel_source=args.azel_source,
         altaz_apply=args.altaz_apply,
         encoder_shift_sec=args.encoder_shift_sec,
@@ -3611,6 +4072,13 @@ def main() -> None:
     print("[done]")
     print(f"  outputs in: {outdir}")
     print(f"  df rows: {len(df)}  az_scans: {len(az_scans)}  el_scans: {len(el_scans)}")
+    print(
+        "  spectral time basis: "
+        f"applied={df.attrs.get('spec_time_basis')} "
+        f"suffix={df.attrs.get('spec_time_suffix')} "
+        f"fallback={df.attrs.get('spec_time_fallback_field')} "
+        f"example={df.attrs.get('spec_time_example')}"
+    )
 
 
 if __name__ == "__main__":

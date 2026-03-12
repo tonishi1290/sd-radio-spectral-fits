@@ -42,6 +42,7 @@ import pathlib
 import sys
 import re
 import math
+from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -77,6 +78,133 @@ def _decode_label(v):
     else:
         s = str(v)
     return s.strip().upper()
+
+
+def _decode_timestamp_text(v):
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            s = v.decode(errors="ignore")
+        except Exception:
+            s = str(v)
+    else:
+        s = str(v)
+    return s.strip().strip("\x00")
+
+
+def _find_first_nonempty_timestamp_text(values):
+    arr = np.asarray(values, dtype=object)
+    for v in arr:
+        s = _decode_timestamp_text(v)
+        if s and s.lower() != "nan":
+            return s
+    return None
+
+
+def _extract_timestamp_suffix(text):
+    s = _decode_timestamp_text(text)
+    if (not s) or (s.lower() == "nan"):
+        return None
+    s_up = s.upper()
+    if s_up.endswith("UTC"):
+        return "UTC"
+    if s_up.endswith("GPS"):
+        return "GPS"
+    if s_up.endswith("TAI"):
+        return "TAI"
+    if s_up.endswith("PC"):
+        return "PC"
+    return None
+
+
+def _gps_timestamp_texts_to_unix(values):
+    arr = np.asarray(values, dtype=object)
+    epoch = datetime(1980, 1, 6, 0, 0, 0)
+    gps_seconds = []
+    for v in arr:
+        s = _decode_timestamp_text(v)
+        if (not s) or (s.lower() == "nan") or (len(s) < 3):
+            raise ValueError(f"invalid GPS timestamp: {v!r}")
+        body = s[:-3]
+        dt = datetime.strptime(body, "%Y-%m-%dT%H:%M:%S.%f")
+        gps_seconds.append((dt - epoch).total_seconds())
+    return np.asarray(Time(np.asarray(gps_seconds, dtype=float), format="gps").utc.unix, dtype=float)
+
+
+def _timestamp_texts_to_unix(values, suffix):
+    arr = np.asarray(values, dtype=object)
+    suf = str(suffix).strip().upper()
+    texts = [_decode_timestamp_text(v) for v in arr]
+    if suf == "UTC":
+        bodies = [s[:-3] for s in texts]
+        return np.asarray(Time(bodies, format="isot", scale="utc").unix, dtype=float)
+    if suf == "TAI":
+        bodies = [s[:-3] for s in texts]
+        return np.asarray(Time(bodies, format="isot", scale="tai").utc.unix, dtype=float)
+    if suf == "GPS":
+        return _gps_timestamp_texts_to_unix(texts)
+    raise ValueError(f"unsupported timestamp suffix: {suffix!r}")
+
+
+def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("time", "t", "unix_time", "unixtime")):
+    names = list(arr.dtype.names or [])
+    timestamp_field = None
+    for k in ("timestamp", "time_spectrometer"):
+        if k in names:
+            timestamp_field = k
+            break
+
+    fallback_field = None
+    for k in numeric_fallback_candidates:
+        if k in names:
+            fallback_field = k
+            break
+
+    time_meta = {
+        "applied": None,
+        "timestamp_field": timestamp_field,
+        "fallback_field": fallback_field,
+        "suffix": None,
+        "first_timestamp_text": None,
+        "reason": None,
+    }
+
+    if timestamp_field is not None:
+        first_text = _find_first_nonempty_timestamp_text(arr[timestamp_field])
+        time_meta["first_timestamp_text"] = first_text
+        suffix = _extract_timestamp_suffix(first_text)
+        time_meta["suffix"] = suffix
+        if suffix in ("UTC", "GPS", "TAI"):
+            try:
+                t_spec = _timestamp_texts_to_unix(arr[timestamp_field], suffix)
+                if np.all(np.isfinite(t_spec)):
+                    time_meta["applied"] = f"{timestamp_field}:{suffix}->unix"
+                    time_meta["reason"] = "timestamp suffix accepted"
+                    return np.asarray(t_spec, dtype=float), time_meta
+                time_meta["reason"] = f"non-finite values after {suffix} conversion"
+            except Exception as e:
+                time_meta["reason"] = f"{suffix} conversion failed: {e}"
+        elif suffix == "PC":
+            time_meta["reason"] = "timestamp suffix is PC; falling back to numeric time"
+        elif first_text is None:
+            time_meta["reason"] = "timestamp field is empty/NaN; falling back to numeric time"
+        else:
+            time_meta["reason"] = f"unknown timestamp suffix in {first_text!r}; falling back to numeric time"
+
+    if fallback_field is not None:
+        t_spec = np.asarray(arr[fallback_field], dtype=float)
+        time_meta["applied"] = fallback_field
+        if time_meta["reason"] is None:
+            time_meta["reason"] = "timestamp field unavailable; using numeric time"
+        return t_spec, time_meta
+
+    if timestamp_field is not None:
+        raise RuntimeError(
+            "timestamp-like field exists but no usable numeric fallback field is available; "
+            f"timestamp_field={timestamp_field} available={names} reason={time_meta['reason']}"
+        )
+
+    raise RuntimeError("no usable spectral time field. available={}".format(names))
+
 
 def _sanitize_for_filename(s, maxlen=80):
     """
@@ -250,18 +378,12 @@ def _structured_to_dataframe(arr):
 def _extract_spectral_from_structured(arr, nchan):
     """
     spectral structured array から t_spec と spec2d を取り出す。
-    - time field: prefer timestamp > time > t
+    - time basis is decided once from the first spectral timestamp row
+    - accepted timestamp suffixes: UTC / GPS / TAI
+    - PC / unknown / NaN timestamp falls back to numeric time field
     - spec field: prefer data > spectrum > spec
     """
     names = list(arr.dtype.names or [])
-    t_field = None
-    for k in ("timestamp", "time", "t", "unix_time", "unixtime"):
-        if k in names:
-            t_field = k
-            break
-    if t_field is None:
-        raise RuntimeError("no time-like field in spectral table. available={}".format(names))
-
     s_field = None
     for k in ("data", "spectrum", "spec"):
         if k in names:
@@ -270,7 +392,7 @@ def _extract_spectral_from_structured(arr, nchan):
     if s_field is None:
         raise RuntimeError("no spectrum-like field in spectral table. available={}".format(names))
 
-    t_spec = np.asarray(arr[t_field], dtype=float)
+    t_spec, time_meta = _select_spectral_time_from_structured(arr)
 
     spec = np.asarray(arr[s_field])
     if spec.ndim == 1 and spec.dtype == object:
@@ -283,7 +405,7 @@ def _extract_spectral_from_structured(arr, nchan):
     if int(spec2d.shape[1]) != int(nchan):
         raise RuntimeError("NCHAN mismatch in spectral table: got {}, expected {}".format(spec2d.shape[1], nchan))
 
-    return t_spec, spec2d, t_field, s_field
+    return np.asarray(t_spec, dtype=float), spec2d, time_meta, s_field
 
 
 def _interp_lin(t_src, y_src, t_dst, extrap="nan"):
@@ -636,6 +758,10 @@ class StreamData:
     humid_pct_spectral: Optional[np.ndarray]
     spec_table_name: str
     spec_time_field: str
+    spec_time_basis: str
+    spec_time_suffix: Optional[str]
+    spec_time_fallback_field: Optional[str]
+    spec_time_example: Optional[str]
     spec_data_field: str
 
 
@@ -1217,7 +1343,7 @@ def build_legacy_single_stream_config(args):
         "schema_version": 1,
         "config_name": "legacy_single_stream",
         "config_description": "Auto-generated from legacy CLI arguments",
-        "global": {"output_layout": "merged", "time_sort": True, "db_namespace": "necst", "telescope": str(args.telescope)},
+        "global": {"output_layout": "merged", "time_sort": True, "db_namespace": "necst", "telescope": str(args.telescope), "encoder_shift_sec": float(args.encoder_shift_sec)},
         "provenance": {},
         "streams": [stream],
     }
@@ -1252,7 +1378,7 @@ def extract_spectral_stream(common, db_namespace, telescope, stream):
         spec_table_name = _table_name(db_namespace, telescope, "data", "spectral", spec_stream_name)
     arr_spec = _read_structured_array_tolerant(common.db, spec_table_name)
     raw_nchan = int(stream.wcs_full.nchan if stream.wcs_full is not None else stream.wcs.nchan)
-    t_spec, spec2d, t_field, s_field = _extract_spectral_from_structured(arr_spec, nchan=raw_nchan)
+    t_spec, spec2d, time_meta, s_field = _extract_spectral_from_structured(arr_spec, nchan=raw_nchan)
     spec2d = _apply_channel_slice_to_spec2d(spec2d, stream.channel_slice_bounds, raw_nchan)
     if int(spec2d.shape[1]) != int(stream.wcs.nchan):
         raise RuntimeError(
@@ -1305,7 +1431,11 @@ def extract_spectral_stream(common, db_namespace, telescope, stream):
         press_hpa_spectral=(press_hpa[order] if press_hpa is not None else None),
         humid_pct_spectral=(humid_pct[order] if humid_pct is not None else None),
         spec_table_name=spec_table_name,
-        spec_time_field=t_field,
+        spec_time_field=(time_meta.get("timestamp_field") if str(time_meta.get("applied", "")).startswith(("timestamp", "time_spectrometer")) else str(time_meta.get("applied"))),
+        spec_time_basis=str(time_meta.get("applied")),
+        spec_time_suffix=time_meta.get("suffix"),
+        spec_time_fallback_field=time_meta.get("fallback_field"),
+        spec_time_example=time_meta.get("first_timestamp_text"),
         spec_data_field=s_field,
     )
 
@@ -1365,7 +1495,7 @@ def resolve_stream_meteorology(common, stream_data, met_source, interp_extrap):
 # -----------------------------------------------------------------------------
 # 3) Normalize
 # -----------------------------------------------------------------------------
-def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_col, extrap):
+def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_col, extrap, encoder_shift_sec=0.0):
     enc_names = list(arr_enc.dtype.names or [])
     alt_names = list(arr_alt.dtype.names or [])
 
@@ -1390,6 +1520,11 @@ def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_co
 
     t_enc = _get_field(arr_enc, enc_t_name, float)
     t_enc, s_enc = _normalize_time_units(t_spec, t_enc, "encoder")
+    # Keep the sign convention identical to sunscan: shift encoder timestamps,
+    # then interpolate encoder Az/El onto spectral timestamps t_spec.
+    # Positive encoder_shift_sec means the encoder stream itself is moved later
+    # in time (t_enc <- t_enc + shift).
+    t_enc = t_enc + float(encoder_shift_sec)
     az_enc = _get_field(arr_enc, enc_lon_name, float)
     el_enc = _get_field(arr_enc, enc_lat_name, float)
 
@@ -2038,6 +2173,7 @@ def parse_args(argv):
     p.add_argument("--channel-slice", default=None, help="Optional channel slice applied at conversion time, e.g. '[1024,8192)' or '[1024,8191]'")
 
     p.add_argument("--encoder-time-col", default="time", help="encoder time column (recommended: time)")
+    p.add_argument("--encoder-shift-sec", type=float, default=0.0, help="Shift applied to encoder timestamps before interpolation to spectral time: t_enc <- t_enc + shift [s]. Use the same sign convention as sunscan --encoder-shift-sec.")
     p.add_argument("--altaz-time-col", default="time", help="altaz time column (recommended: time)")
     p.add_argument("--interp-extrap", default="hold", choices=["nan", "hold"], help="Extrapolation policy for interpolation")
     p.add_argument("--use-modes", default="ON,HOT,OFF", help="Comma-separated OBSMODE list to include")
@@ -2106,12 +2242,20 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     encoder_table = _nonempty_str(global_cfg.get("encoder_table"), default=None)
     altaz_table = _nonempty_str(global_cfg.get("altaz_table"), default=None)
     weather_table_cfg = _nonempty_str(global_cfg.get("weather_table"), default=None)
+
+    encoder_shift_sec_cfg = global_cfg.get("encoder_shift_sec", None)
+    if (not args.spectrometer_config) or _argv_has_option(argv, "--encoder-shift-sec") or (encoder_shift_sec_cfg is None):
+        encoder_shift_sec = float(getattr(args, "encoder_shift_sec", 0.0))
+    else:
+        encoder_shift_sec = float(encoder_shift_sec_cfg)
+
     return {
         "db_namespace": db_namespace,
         "telescope": telescope,
         "encoder_table": encoder_table,
         "altaz_table": altaz_table,
         "weather_table_cfg": weather_table_cfg,
+        "encoder_shift_sec": encoder_shift_sec,
     }
 
 
@@ -2143,6 +2287,9 @@ def main(argv=None):
     runtime_naming = _resolve_runtime_naming(args, config_dict, argv=argv)
     db_namespace = runtime_naming["db_namespace"]
     telescope_name = runtime_naming["telescope"]
+    args.encoder_shift_sec = float(runtime_naming.get("encoder_shift_sec", getattr(args, "encoder_shift_sec", 0.0)))
+    if float(args.encoder_shift_sec) != 0.0:
+        print("[info] encoder_shift_sec = {} s (applied as t_enc <- t_enc + shift before interpolation to spectral time)".format(float(args.encoder_shift_sec)))
     apply_channel_slice_config(config_dict["streams"], global_cfg, cli_channel_slice=getattr(args, "channel_slice", None))
     layout = str(global_cfg.get("output_layout", "merged")).strip().lower()
     if layout not in ("merged", "merged_time"):
@@ -2193,6 +2340,7 @@ def main(argv=None):
         writer.add_history("channel_slice_global", str(global_cfg.get("channel_slice")))
     writer.add_history("azimuth_meaning", "AZIMUTH/ELEVATIO=beam-center Az/El")
     writer.add_history("az_enc_meaning", "AZ_ENC/EL_ENC=measured encoder Az/El interpolated to t_spec")
+    writer.add_history("encoder_shift_sec", float(getattr(args, "encoder_shift_sec", 0.0)))
     writer.add_history("bore_meaning", "BORE_AZ/BORE_EL=boresight Az/El = encoder - correction")
     writer.add_history("az_cmd_meaning", "AZ_CMD/EL_CMD=commanded altaz interpolated to t_spec")
     writer.add_history("corr_meaning", "CORR_AZ/CORR_EL=dlon/dlat")
@@ -2205,10 +2353,20 @@ def main(argv=None):
     writer.add_history("scan_block", "omitted unless true scan offsets become available")
 
     all_rows = []
+    spectral_time_summaries = []
 
     for stream in streams:
         print("[info] processing stream '{}'".format(stream.name))
         stream_data = extract_spectral_stream(common, str(db_namespace), str(telescope_name), stream)
+        spectral_time_summaries.append({
+            "stream": stream.name,
+            "applied": stream_data.spec_time_basis,
+            "suffix": stream_data.spec_time_suffix,
+            "fallback": stream_data.spec_time_fallback_field,
+            "example": stream_data.spec_time_example,
+            "field": stream_data.spec_time_field,
+            "table": stream_data.spec_table_name,
+        })
         pointing = normalize_pointing(
             stream_data.t_spec,
             common.arr_enc,
@@ -2216,6 +2374,7 @@ def main(argv=None):
             str(args.encoder_time_col),
             str(args.altaz_time_col),
             str(args.interp_extrap),
+            float(args.encoder_shift_sec),
         )
         beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
         pointing.update(beam_applied)
@@ -2287,7 +2446,7 @@ def main(argv=None):
 
         writer.add_history(
             "stream_{}".format(stream.stream_index),
-            "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={}".format(
+            "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={}".format(
                 stream.name,
                 stream.fdnum,
                 stream.ifnum,
@@ -2300,6 +2459,9 @@ def main(argv=None):
                 (int(stream.wcs_full.nchan) if stream.wcs_full is not None else int(stream.wcs.nchan)),
                 int(stream.wcs.nchan),
                 ("RESTFREQ->OBSFREQ" if (_is_meaningful_scalar(stream.wcs.obsfreq_hz) and not _is_meaningful_scalar(stream.local_oscillators.get("obsfreq_hz", None))) else "explicit_or_none"),
+                stream_data.spec_time_basis,
+                (stream_data.spec_time_suffix or ""),
+                (stream_data.spec_time_fallback_field or ""),
             ),
         )
 
@@ -2320,6 +2482,19 @@ def main(argv=None):
     write_sdfits(str(out_fits), writer, all_rows)
     _global_pe_summary(all_rows)
     print("Saved: {}".format(out_fits))
+    if spectral_time_summaries:
+        print("[info] spectral time basis summary:")
+        for ent in spectral_time_summaries:
+            print(
+                "  stream='{stream}' applied={applied} suffix={suffix} fallback={fallback} field={field} example={example}".format(
+                    stream=ent.get("stream"),
+                    applied=ent.get("applied"),
+                    suffix=ent.get("suffix"),
+                    fallback=ent.get("fallback"),
+                    field=ent.get("field"),
+                    example=ent.get("example"),
+                )
+            )
 
 
 if __name__ == "__main__":

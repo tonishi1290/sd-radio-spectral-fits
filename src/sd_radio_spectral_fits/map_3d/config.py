@@ -88,6 +88,8 @@ class MapConfig:
     workers: int = -1                # cKDTree query_ball_point 用。旧挙動は -1。
     sort_neighbors: bool = False     # 旧挙動維持のため既定は False。
     reproducible_mode: bool = False  # True のとき float64 / workers=1 / sort固定。
+    write_diagnostics: bool = False  # True のとき OTF 診断 sidecar を出力。
+    diagnostics_prefix: Optional[str] = None  # 診断ファイルの接頭辞。
 
 
 # 以前のコードとの互換性のためにエイリアスを残す

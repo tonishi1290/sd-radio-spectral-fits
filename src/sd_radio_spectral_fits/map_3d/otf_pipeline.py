@@ -22,6 +22,8 @@ def run_otf_full_pipeline(
     config,
     output_fits: str,
     do_basket_weave: bool = True,
+    write_diagnostics: bool = False,
+    diagnostics_prefix: str | None = None,
     **kwargs
 ):
     basket_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _BASKET_KW_NAMES}
@@ -49,6 +51,8 @@ def run_otf_full_pipeline(
         scantable=scantable,
         config=config,
         output_fits=output_fits,
+        write_diagnostics=write_diagnostics,
+        diagnostics_prefix=diagnostics_prefix,
         **runtime_kwargs,
         **kwargs,
     )

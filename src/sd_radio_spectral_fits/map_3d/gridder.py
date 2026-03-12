@@ -1,6 +1,14 @@
 # src/sd_radio_spectral_fits/map/gridder.py
 import builtins
+import contextlib
+import hashlib
+import io
+import json
+import os
+import platform
+import sys
 import warnings
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
@@ -47,6 +55,302 @@ def _effective_config(config, reproducible_mode=None, workers=None, sort_neighbo
     if not overrides:
         return config
     return _ConfigView(config, **overrides)
+
+
+def _sha256_file(path: str, chunk_size: int = 1024 * 1024) -> str | None:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(chunk_size)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _hash_ndarray(arr: np.ndarray, *, chunk_bytes: int = 1024 * 1024) -> str:
+    a = np.ascontiguousarray(np.asarray(arr))
+    h = hashlib.sha256()
+    h.update(str(a.shape).encode("utf-8"))
+    h.update(str(a.dtype).encode("utf-8"))
+    view = memoryview(a).cast("B")
+    for off in range(0, len(view), chunk_bytes):
+        h.update(view[off:off + chunk_bytes])
+    return h.hexdigest()
+
+
+def _nan_stats(arr: np.ndarray) -> dict:
+    a = np.asarray(arr, dtype=float)
+    finite = np.isfinite(a)
+    out = {
+        "shape": list(a.shape),
+        "dtype": str(a.dtype),
+        "finite_count": int(np.count_nonzero(finite)),
+        "nan_count": int(np.count_nonzero(~finite)),
+    }
+    if np.any(finite):
+        af = a[finite]
+        out.update({
+            "min": float(np.nanmin(af)),
+            "max": float(np.nanmax(af)),
+            "mean": float(np.nanmean(af)),
+            "median": float(np.nanmedian(af)),
+            "std": float(np.nanstd(af)),
+        })
+    return out
+
+
+def _first_last_values(arr: np.ndarray, n: int = 5) -> dict:
+    a = np.asarray(arr)
+    if a.ndim != 1:
+        a = a.ravel()
+    return {
+        "first": [float(x) if np.isfinite(x) else None for x in a[:n]],
+        "last": [float(x) if np.isfinite(x) else None for x in a[-n:]],
+    }
+
+
+def _capture_numpy_runtime() -> str:
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            np.show_runtime()
+    except Exception:
+        try:
+            with contextlib.redirect_stdout(buf):
+                np.show_config()
+        except Exception:
+            pass
+    return buf.getvalue()
+
+
+def _safe_meta_value(meta: dict, key: str):
+    try:
+        v = meta.get(key)
+        if isinstance(v, (np.generic,)):
+            return v.item()
+        return v
+    except Exception:
+        return None
+
+
+def _collect_otf_diagnostics(
+    *,
+    scantable,
+    table,
+    config,
+    coord_sys,
+    projection,
+    out_scale_norm,
+    ref_lon,
+    ref_lat,
+    full_matrix,
+    v_tgt,
+    grid_input,
+    grid_res,
+    output_fits,
+) -> dict:
+    try:
+        import scipy
+        scipy_version = scipy.__version__
+    except Exception:
+        scipy_version = None
+    try:
+        import astropy
+        astropy_version = astropy.__version__
+    except Exception:
+        astropy_version = None
+
+    meta = getattr(scantable, "meta", {}) or {}
+    spec_in = np.asarray(scantable.data)
+    agg_in = np.nanmean(np.asarray(full_matrix, dtype=np.float64), axis=0)
+    agg_out = np.nanmean(np.asarray(grid_res.cube, dtype=np.float64), axis=(0, 1))
+
+    diag = {
+        "schema": "otf_diag_v1",
+        "runtime": {
+            "python": sys.version,
+            "platform": platform.platform(),
+            "machine": platform.machine(),
+            "numpy": np.__version__,
+            "pandas": pd.__version__,
+            "scipy": scipy_version,
+            "astropy": astropy_version,
+            "numpy_runtime": _capture_numpy_runtime(),
+        },
+        "pipeline": {
+            "coord_sys": str(coord_sys),
+            "projection": str(projection),
+            "out_scale": str(out_scale_norm),
+            "output_fits": str(output_fits),
+        },
+        "config": {
+            "nx": int(config.nx),
+            "ny": int(config.ny),
+            "cell_arcsec": float(config.cell_arcsec),
+            "beam_fwhm_arcsec": float(config.beam_fwhm_arcsec),
+            "kernel": str(config.kernel),
+            "dtype": str(config.dtype),
+            "backend": str(config.backend),
+            "chunk_ch": int(config.chunk_ch),
+            "exclude_turnaround": bool(config.exclude_turnaround),
+            "alpha_rms": float(config.alpha_rms),
+            "beta_tint": float(config.beta_tint),
+            "dv_kms": None if getattr(config, "dv_kms", None) is None else float(config.dv_kms),
+        },
+        "scantable_input": {
+            "nrow": int(len(table)),
+            "table_ncol": int(len(getattr(table, "columns", []))),
+            "table_columns": [str(c) for c in getattr(table, "columns", [])],
+            "data_shape": list(spec_in.shape),
+            "data_dtype": str(spec_in.dtype),
+            "meta": {
+                "CTYPE1": _safe_meta_value(meta, "CTYPE1"),
+                "CUNIT1": _safe_meta_value(meta, "CUNIT1"),
+                "CRVAL1": _safe_meta_value(meta, "CRVAL1"),
+                "CDELT1": _safe_meta_value(meta, "CDELT1"),
+                "CRPIX1": _safe_meta_value(meta, "CRPIX1"),
+                "RESTFREQ": _safe_meta_value(meta, "RESTFREQ"),
+                "RESTFRQ": _safe_meta_value(meta, "RESTFRQ"),
+                "SPECSYS": _safe_meta_value(meta, "SPECSYS"),
+            },
+        },
+        "standardizer": {
+            "full_matrix_shape": list(full_matrix.shape),
+            "full_matrix_dtype": str(np.asarray(full_matrix).dtype),
+            "full_matrix_hash": _hash_ndarray(np.asarray(full_matrix, dtype=np.float32)),
+            "agg_spec_hash": _hash_ndarray(np.asarray(agg_in, dtype=np.float64)),
+            "agg_spec_stats": _nan_stats(agg_in),
+            "v_tgt_nchan": int(len(v_tgt)),
+            "v_tgt_hash": _hash_ndarray(np.asarray(v_tgt, dtype=np.float64)),
+            "v_tgt_stats": _nan_stats(v_tgt),
+            "v_tgt_edges": _first_last_values(v_tgt, n=5),
+            "v_tgt_diff_stats": _nan_stats(np.diff(v_tgt) if len(v_tgt) > 1 else np.array([], dtype=float)),
+        },
+        "projection": {
+            "ref_lon_deg": float(ref_lon),
+            "ref_lat_deg": float(ref_lat),
+            "x_stats": _nan_stats(grid_input.x),
+            "y_stats": _nan_stats(grid_input.y),
+        },
+        "grid_input": {
+            "flag_on_count": int(np.count_nonzero(np.asarray(grid_input.flag) > 0)),
+            "time_stats": _nan_stats(grid_input.time),
+            "rms_stats": None if grid_input.rms is None else _nan_stats(grid_input.rms),
+            "tint_stats": None if grid_input.tint is None else _nan_stats(grid_input.tint),
+            "tsys_stats": None if grid_input.tsys is None else _nan_stats(grid_input.tsys),
+            "scan_id_stats": None if grid_input.scan_id is None else _nan_stats(pd.to_numeric(np.asarray(grid_input.scan_id), errors="coerce")),
+            "is_turnaround_count": None if grid_input.is_turnaround is None else int(np.count_nonzero(np.asarray(grid_input.is_turnaround, dtype=bool))),
+        },
+        "grid_output": {
+            "cube_shape": list(np.asarray(grid_res.cube).shape),
+            "cube_dtype": str(np.asarray(grid_res.cube).dtype),
+            "cube_hash": _hash_ndarray(np.asarray(grid_res.cube, dtype=np.float32)),
+            "agg_spec_hash": _hash_ndarray(np.asarray(agg_out, dtype=np.float64)),
+            "agg_spec_stats": _nan_stats(agg_out),
+            "weight_stats": _nan_stats(grid_res.weight_map),
+            "hit_stats": _nan_stats(grid_res.hit_map),
+            "mask_true": int(np.count_nonzero(np.asarray(grid_res.mask_map, dtype=bool))),
+            "time_map_stats": None if getattr(grid_res, "time_map", None) is None else _nan_stats(grid_res.time_map),
+            "rms_map_stats": None if getattr(grid_res, "rms_map", None) is None else _nan_stats(grid_res.rms_map),
+            "tint_map_stats": None if getattr(grid_res, "tint_map", None) is None else _nan_stats(grid_res.tint_map),
+            "tsys_map_stats": None if getattr(grid_res, "tsys_map", None) is None else _nan_stats(grid_res.tsys_map),
+            "meta": getattr(grid_res, "meta", None),
+        },
+        "output_file": {
+            "path": str(output_fits),
+            "exists": os.path.exists(output_fits),
+            "size_bytes": int(os.path.getsize(output_fits)) if os.path.exists(output_fits) else None,
+            "sha256": _sha256_file(output_fits) if os.path.exists(output_fits) else None,
+        },
+    }
+    if os.path.exists(output_fits):
+        try:
+            from astropy.io import fits
+            with fits.open(output_fits, memmap=True) as hdul:
+                hdr = hdul[0].header
+                data = hdul[0].data
+                diag["output_fits_header"] = {
+                    "NAXIS": hdr.get("NAXIS"),
+                    "NAXIS1": hdr.get("NAXIS1"),
+                    "NAXIS2": hdr.get("NAXIS2"),
+                    "NAXIS3": hdr.get("NAXIS3"),
+                    "CTYPE1": hdr.get("CTYPE1"),
+                    "CTYPE2": hdr.get("CTYPE2"),
+                    "CTYPE3": hdr.get("CTYPE3"),
+                    "CUNIT1": hdr.get("CUNIT1"),
+                    "CUNIT2": hdr.get("CUNIT2"),
+                    "CUNIT3": hdr.get("CUNIT3"),
+                    "CRPIX1": hdr.get("CRPIX1"),
+                    "CRPIX2": hdr.get("CRPIX2"),
+                    "CRPIX3": hdr.get("CRPIX3"),
+                    "CRVAL1": hdr.get("CRVAL1"),
+                    "CRVAL2": hdr.get("CRVAL2"),
+                    "CRVAL3": hdr.get("CRVAL3"),
+                    "CDELT1": hdr.get("CDELT1"),
+                    "CDELT2": hdr.get("CDELT2"),
+                    "CDELT3": hdr.get("CDELT3"),
+                    "RESTFRQ": hdr.get("RESTFRQ"),
+                    "SPECSYS": hdr.get("SPECSYS"),
+                    "data_shape": list(data.shape) if data is not None else None,
+                    "data_dtype": str(data.dtype) if data is not None else None,
+                }
+        except Exception as e:
+            diag["output_fits_header_error"] = repr(e)
+    return diag
+
+
+def _format_otf_diag_text(diag: dict) -> str:
+    lines = []
+    lines.append(f"schema: {diag.get('schema')}")
+    rt = diag.get("runtime", {})
+    lines.append(f"python: {rt.get('python')}")
+    lines.append(f"platform: {rt.get('platform')}")
+    lines.append(f"machine: {rt.get('machine')}")
+    lines.append(f"numpy: {rt.get('numpy')}  pandas: {rt.get('pandas')}  scipy: {rt.get('scipy')}  astropy: {rt.get('astropy')}")
+    pipe = diag.get("pipeline", {})
+    lines.append(f"coord_sys: {pipe.get('coord_sys')}  projection: {pipe.get('projection')}  out_scale: {pipe.get('out_scale')}")
+    cfg = diag.get("config", {})
+    lines.append(f"config: nx={cfg.get('nx')} ny={cfg.get('ny')} cell={cfg.get('cell_arcsec')} beam={cfg.get('beam_fwhm_arcsec')} kernel={cfg.get('kernel')} dtype={cfg.get('dtype')} backend={cfg.get('backend')} chunk_ch={cfg.get('chunk_ch')}")
+    std = diag.get("standardizer", {})
+    lines.append(f"full_matrix_shape: {std.get('full_matrix_shape')} dtype={std.get('full_matrix_dtype')} hash={std.get('full_matrix_hash')}")
+    lines.append(f"v_tgt_nchan: {std.get('v_tgt_nchan')}  v_tgt_hash: {std.get('v_tgt_hash')}")
+    edges = std.get("v_tgt_edges", {})
+    lines.append(f"v_tgt_first5: {edges.get('first')}")
+    lines.append(f"v_tgt_last5 : {edges.get('last')}")
+    gout = diag.get("grid_output", {})
+    lines.append(f"cube_shape: {gout.get('cube_shape')} dtype={gout.get('cube_dtype')} cube_hash={gout.get('cube_hash')}")
+    lines.append(f"output agg_spec_hash: {gout.get('agg_spec_hash')}")
+    lines.append(f"mask_true: {gout.get('mask_true')}")
+    of = diag.get("output_file", {})
+    lines.append(f"output_file: {of.get('path')}")
+    lines.append(f"output_size_bytes: {of.get('size_bytes')}  sha256: {of.get('sha256')}")
+    oh = diag.get("output_fits_header", {})
+    if oh:
+        lines.append(
+            f"output_header: NAXIS=({oh.get('NAXIS1')}, {oh.get('NAXIS2')}, {oh.get('NAXIS3')}) "
+            f"CTYPE3={oh.get('CTYPE3')} CUNIT3={oh.get('CUNIT3')} "
+            f"CRVAL3={oh.get('CRVAL3')} CDELT3={oh.get('CDELT3')} CRPIX3={oh.get('CRPIX3')}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _write_otf_diagnostics(diag: dict, output_fits: str, diagnostics_prefix: str | None = None) -> tuple[str, str]:
+    out_path = Path(output_fits)
+    if diagnostics_prefix:
+        prefix = Path(diagnostics_prefix)
+    else:
+        prefix = out_path.with_suffix(out_path.suffix + ".otf_diag")
+    json_path = str(prefix) + ".json"
+    txt_path = str(prefix) + ".txt"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(diag, f, ensure_ascii=False, indent=2)
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write(_format_otf_diag_text(diag))
+    return json_path, txt_path
 
 
 def _time_series_to_mjd_utc(series: pd.Series) -> np.ndarray:
@@ -175,6 +479,8 @@ def run_mapping_pipeline(
     reproducible_mode: bool | None = None,
     workers: int | None = None,
     sort_neighbors: bool | None = None,
+    write_diagnostics: bool = False,
+    diagnostics_prefix: str | None = None,
 ):
     """
     Scantable から 3D FITS キューブを生成する汎用統合パイプライン。
@@ -292,6 +598,30 @@ def run_mapping_pipeline(
         out_scale=out_scale_norm,
         rep_beameff=rep_beameff,
     )
+
+    if write_diagnostics or getattr(runtime_config, "write_diagnostics", False):
+        diag = _collect_otf_diagnostics(
+            scantable=scantable,
+            table=table,
+            config=runtime_config,
+            coord_sys=coord_sys,
+            projection=projection,
+            out_scale_norm=out_scale_norm,
+            ref_lon=lon0,
+            ref_lat=lat0,
+            full_matrix=full_matrix,
+            v_tgt=v_tgt,
+            grid_input=grid_input,
+            grid_res=res,
+            output_fits=output_fits,
+        )
+        json_path, txt_path = _write_otf_diagnostics(
+            diag,
+            output_fits=output_fits,
+            diagnostics_prefix=diagnostics_prefix or getattr(runtime_config, "diagnostics_prefix", None),
+        )
+        print(f"OTF diagnostics written to {json_path} and {txt_path}")
+
     print(f"Done! Saved to {output_fits}")
     return res
 
