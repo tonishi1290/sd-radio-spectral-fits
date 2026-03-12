@@ -215,9 +215,33 @@ def _coerce_velocity_array_to_ms(values: np.ndarray, *, source_name: str) -> np.
     return arr
 
 
-def _extract_existing_velocity_ms(mapping_on: pd.DataFrame) -> tuple[np.ndarray | None, str | None]:
+def _normalize_vcorr_column_name(value: Any, *, default: str = "VFRAME") -> str:
+    if _is_missing_value(value):
+        value = default
+    s = str(value).strip().upper()
+    aliases = {
+        "VFRAME": "VFRAME",
+        "VELOSYS": "VELOSYS",
+        "V_CORR_KMS": "V_CORR_KMS",
+        "VCORR": "V_CORR_KMS",
+        "VCORRKMS": "V_CORR_KMS",
+    }
+    return aliases.get(s, s)
+
+
+def _extract_existing_velocity_ms(
+    mapping_on: pd.DataFrame,
+    *,
+    preferred_key: str = "VFRAME",
+) -> tuple[np.ndarray | None, str | None]:
+    preferred = _normalize_vcorr_column_name(preferred_key, default="VFRAME")
+    order: list[str] = []
+    for key in (preferred, "VFRAME", "V_CORR_KMS", "VELOSYS"):
+        if key not in order:
+            order.append(key)
+
     found: list[tuple[str, np.ndarray]] = []
-    for key in ("VELOSYS", "VFRAME", "V_CORR_KMS"):
+    for key in order:
         if key not in mapping_on.columns:
             continue
         col = mapping_on[key]
@@ -369,7 +393,7 @@ def make_tastar_dumps(
     
     ch_range: Optional[Tuple[int, int]] = None,
     vlsrk_range_kms: Optional[Tuple[float, float]] = None,
-    v_corr_col: str = "VELOSYS",
+    v_corr_col: str = "VFRAME",
     coord_frame: str | None = None,
     vcorr_chunk_sec: Optional[float] = None,
     dtype: Optional[Union[type, str]] = None, 
@@ -397,6 +421,7 @@ def make_tastar_dumps(
         apply_restfreq_override(meta, mapping_all, float(rest_freq), require_wcs_for_vrad=True)
 
     meta = _canonicalize_frequency_axis_meta(meta, mapping_all)
+    v_corr_col = _normalize_vcorr_column_name(v_corr_col, default="VFRAME")
 
     # タイムスタンプの取得
     ts_all = _resolve_table_timestamps(mapping_all)
@@ -456,8 +481,8 @@ def make_tastar_dumps(
     mapping_on.index = t_on
 
     # Canonicalize coordinate columns when available.
-    # TOPOCENT inputs require coordinates to compute VELOSYS unless a valid row-wise
-    # VELOSYS/VFRAME column is already present. LSRK inputs do not require coordinates.
+    # TOPOCENT inputs require coordinates to compute the per-row velocity correction
+    # unless a valid row-wise VFRAME/VELOSYS column is already present. LSRK inputs do not require coordinates.
     effective_coord_frame = _choose_effective_coord_frame(mapping_on, coord_frame, meta)
     lon_col0, lat_col0 = _resolve_lonlat_columns(mapping_on, effective_coord_frame)
     have_coords = (lon_col0 is not None and lat_col0 is not None)
@@ -476,7 +501,7 @@ def make_tastar_dumps(
                 mapping_on["DEC"] = pd.to_numeric(mapping_on[lat_col0], errors="coerce")
 
         _maybe_validate_mapping_frame(meta, mapping_on)
-    elif need_coords and _extract_existing_velocity_ms(mapping_on)[0] is None:
+    elif need_coords and _extract_existing_velocity_ms(mapping_on, preferred_key=v_corr_col)[0] is None:
         if effective_coord_frame == "galactic":
             raise ValueError("coord_frame=galactic but mapping lacks GLON/GLAT (or aliases).")
         raise ValueError("coord_frame=icrs but mapping lacks RA/DEC (or aliases).")
@@ -494,7 +519,7 @@ def make_tastar_dumps(
         # Prefer an existing per-row standard/legacy velocity column when present.
         # This avoids silently changing already-computed corrections and reduces
         # dependence on coordinate-frame inference for backward-compatible inputs.
-        velosys_ms, vel_source = _extract_existing_velocity_ms(mapping_on)
+        velosys_ms, vel_source = _extract_existing_velocity_ms(mapping_on, preferred_key=v_corr_col)
 
         if velosys_ms is None:
             lon_col, lat_col = _resolve_lonlat_columns(mapping_on, effective_coord_frame)
@@ -536,6 +561,7 @@ def make_tastar_dumps(
         v_corr_kms = np.asarray(velosys_ms, dtype=float) / 1000.0
         mapping_on["VELOSYS"] = np.asarray(velosys_ms, dtype=float)
         mapping_on["VFRAME"] = np.asarray(velosys_ms, dtype=float)
+        vel_source = str(vel_source or "COMPUTED").upper()
     else:
         v_corr_kms = np.zeros(len(t_on), dtype=float)
 
@@ -786,6 +812,7 @@ def tastar_from_rawspec(
     ch_range: tuple[int, int] | None = None,
     vlsrk_range_kms: tuple[float, float] | None = None,
     vcorr_chunk_sec: float | None = None,
+    v_corr_col: str = "VFRAME",
     dtype: type | str | None = None,
     rest_freq: float | None = None,
     coord_frame: str | None = None,
@@ -808,6 +835,7 @@ def tastar_from_rawspec(
         ch_range=ch_range,
         vlsrk_range_kms=vlsrk_range_kms,
         vcorr_chunk_sec=vcorr_chunk_sec,
+        v_corr_col=v_corr_col,
         dtype=dtype,
         rest_freq=rest_freq,
         coord_frame=(None if coord_frame in (None, "", "auto") else str(coord_frame)),
@@ -834,6 +862,7 @@ def run_tastar_calibration(
     overwrite: bool = False,
     store_freq_column: bool = False,
     vcorr_chunk_sec: Optional[float] = None,
+    v_corr_col: str = "VFRAME",
     dtype: Optional[Union[type, str]] = None,
     rest_freq: Optional[float] = None,
     rows: Union[str, slice, Sequence[int], int, None] = None,
@@ -878,6 +907,7 @@ def run_tastar_calibration(
         vlsrk_range_kms=vlsrk_range_kms,
         coord_frame=(None if coord_frame in (None, "", "auto") else str(coord_frame)),
         vcorr_chunk_sec=vcorr_chunk_sec, 
+        v_corr_col=v_corr_col,
         dtype=dtype,
         rest_freq=rest_freq, 
         rows=rows,
@@ -904,7 +934,7 @@ def run_tastar_calibration(
         'notes': 'Ta* calibration.',
         'ch_range': str(ch_range) if ch_range else "all",
         'vlsrk_range': str(vlsrk_range_kms) if vlsrk_range_kms else "none",
-        'vcorr_chunk_sec': str(vcorr_chunk_sec), 'dtype': str(dtype),
+        'vcorr_chunk_sec': str(vcorr_chunk_sec), 'v_corr_col': str(v_corr_col), 'dtype': str(dtype),
         'rest_freq': str(rest_freq), 'rows': str(rows), 'exclude_rows': str(exclude_rows),
     }
     res.history = history
