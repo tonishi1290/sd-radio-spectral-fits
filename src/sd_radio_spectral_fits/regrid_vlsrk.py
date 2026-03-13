@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union, List, Dict, Any
 
@@ -156,7 +157,80 @@ class Standardizer:
         self.auto_grid_tol_frac = float(auto_grid_tol_frac)
         # キャッシュ: signature -> base_axis_array (Hz or km/s)
         self._base_axis_cache = {}
-        
+        # 行単位の前計算キャッシュ（1回の public call の中だけで共有）
+        self._row_nchan_cache = None
+        self._row_signature_cache = None
+        self._row_vcorr_cache = None
+        self._group_cache = None
+        self._cache_session_depth = 0
+
+    def clear_caches(self, clear_target_grid: bool = False) -> None:
+        """
+        内部キャッシュを破棄する。通常利用では呼び出し不要。
+        """
+        self._base_axis_cache = {}
+        self._invalidate_runtime_caches()
+        if clear_target_grid:
+            self.target_grid = None
+
+    def _invalidate_runtime_caches(self) -> None:
+        self._row_nchan_cache = None
+        self._row_signature_cache = None
+        self._row_vcorr_cache = None
+        self._group_cache = None
+
+    @contextmanager
+    def _cache_session(self):
+        outermost = (self._cache_session_depth == 0)
+        if outermost:
+            self._invalidate_runtime_caches()
+        self._cache_session_depth += 1
+        try:
+            yield
+        finally:
+            self._cache_session_depth -= 1
+            if outermost:
+                self._invalidate_runtime_caches()
+
+    def _ensure_row_cache(self) -> None:
+        if self._group_cache is not None:
+            return
+
+        df = self.st.table
+        meta = self.st.meta
+        n_rows = len(df)
+        is_list_data = isinstance(self.st.data, list)
+
+        if is_list_data:
+            nchan_cache = np.fromiter((len(self.st.data[i]) for i in range(n_rows)), dtype=int, count=n_rows)
+        else:
+            nchan_fixed = self.st.data.shape[1]
+            nchan_cache = np.full(n_rows, nchan_fixed, dtype=int)
+
+        signature_cache: List[tuple] = [()] * n_rows
+        vcorr_cache = np.zeros(n_rows, dtype=float)
+        groups: Dict[tuple, List[int]] = {}
+
+        for i in range(n_rows):
+            row = df.iloc[i]
+            sig = get_axis_signature(row, meta, int(nchan_cache[i]))
+            signature_cache[i] = sig
+            # 元実装では v_corr は TOPO 系グループでのみ参照される。
+            # 非 TOPO 行まで前計算すると、従来は無視されていた不正な
+            # VFRAME/VELOSYS 値で失敗し得るため、ここでも同じ条件に揃える。
+            if "TOPO" in str(sig[-1]).upper():
+                vcorr_cache[i] = _get_vcorr_kms(row, meta, self.v_corr_col)
+            else:
+                vcorr_cache[i] = 0.0
+            if sig not in groups:
+                groups[sig] = []
+            groups[sig].append(i)
+
+        self._row_nchan_cache = nchan_cache
+        self._row_signature_cache = tuple(signature_cache)
+        self._row_vcorr_cache = np.nan_to_num(vcorr_cache, nan=0.0)
+        self._group_cache = groups
+
     def _get_base_axis(self, sig: tuple) -> np.ndarray:
         """
         Signatureに対応するベース軸を作成（キャッシュ対応）。
@@ -193,22 +267,8 @@ class Standardizer:
 
     def _group_by_signature(self) -> Dict[tuple, List[int]]:
         """Scantableの全行をAxisSignatureでグルーピングする"""
-        df = self.st.table
-        meta = self.st.meta
-        is_list_data = isinstance(self.st.data, list)
-        
-        groups = {}
-        for i in range(len(df)):
-            if is_list_data:
-                nc = len(self.st.data[i])
-            else:
-                nc = self.st.data.shape[1]
-                
-            sig = get_axis_signature(df.iloc[i], meta, nc)
-            if sig not in groups:
-                groups[sig] = []
-            groups[sig].append(i)
-        return groups
+        self._ensure_row_cache()
+        return self._group_cache if self._group_cache is not None else {}
 
     def _quantize_to_anchor(self, value_kms: float, dv_kms: float) -> float:
         dv = abs(float(dv_kms))
@@ -229,10 +289,8 @@ class Standardizer:
         dv_est = C_KMS * df_obs / restfreq
 
         if "TOPO" in str(specsys).upper():
-            v_corrs = np.asarray([
-                _get_vcorr_kms(self.st.table.iloc[j], self.st.meta, self.v_corr_col) for j in idxs
-            ], dtype=float)
-            v_corrs = np.nan_to_num(v_corrs, nan=0.0)
+            self._ensure_row_cache()
+            v_corrs = self._row_vcorr_cache[np.asarray(idxs, dtype=int)]
         else:
             v_corrs = np.zeros(len(idxs), dtype=float)
 
@@ -299,64 +357,65 @@ class Standardizer:
         比較実験で端点の微差が 1--2 ch へ増幅されるのを抑えるため、
         legacy の global min/max envelope は明示モード時のみ使う。
         """
-        if dv is not None and vmin is not None and vmax is not None:
-            return make_vgrid(vmin, vmax, dv)
+        with self._cache_session():
+            if dv is not None and vmin is not None and vmax is not None:
+                return make_vgrid(vmin, vmax, dv)
 
-        groups = self._group_by_signature()
-        if len(groups) == 0:
-            return make_vgrid(-100.0, 100.0, 0.1 if dv is None else dv)
+            groups = self._group_by_signature()
+            if len(groups) == 0:
+                return make_vgrid(-100.0, 100.0, 0.1 if dv is None else dv)
 
-        dv_candidates: List[float] = []
-        all_centers: List[np.ndarray] = []
-        all_half_widths: List[np.ndarray] = []
-        all_native_nchan: List[int] = []
-        global_vmin = float("inf")
-        global_vmax = float("-inf")
+            dv_candidates: List[float] = []
+            all_centers: List[np.ndarray] = []
+            all_half_widths: List[np.ndarray] = []
+            all_native_nchan: List[int] = []
+            global_vmin = float("inf")
+            global_vmax = float("-inf")
 
-        for sig, idxs in groups.items():
-            try:
-                dv_est, centers, half_widths, nchan_arr = self._compute_axis_stats(sig, idxs)
-            except Exception:
-                continue
-            dv_candidates.append(float(dv_est))
-            all_centers.append(centers)
-            all_half_widths.append(half_widths)
-            all_native_nchan.extend([int(x) for x in nchan_arr])
-            global_vmin = builtins.min(global_vmin, float(np.min(centers - half_widths)))
-            global_vmax = builtins.max(global_vmax, float(np.max(centers + half_widths)))
+            for sig, idxs in groups.items():
+                try:
+                    dv_est, centers, half_widths, nchan_arr = self._compute_axis_stats(sig, idxs)
+                except Exception:
+                    continue
+                dv_candidates.append(float(dv_est))
+                all_centers.append(centers)
+                all_half_widths.append(half_widths)
+                all_native_nchan.extend([int(x) for x in nchan_arr])
+                global_vmin = builtins.min(global_vmin, float(np.min(centers - half_widths)))
+                global_vmax = builtins.max(global_vmax, float(np.max(centers + half_widths)))
 
-        if len(dv_candidates) == 0 or len(all_centers) == 0:
-            return make_vgrid(-100.0, 100.0, 0.1 if dv is None else dv)
+            if len(dv_candidates) == 0 or len(all_centers) == 0:
+                return make_vgrid(-100.0, 100.0, 0.1 if dv is None else dv)
 
-        target_dv = abs(float(dv)) if dv is not None else float(np.min(dv_candidates))
-        centers_all = np.concatenate(all_centers).astype(float)
-        half_widths_all = np.concatenate(all_half_widths).astype(float)
+            target_dv = abs(float(dv)) if dv is not None else float(np.min(dv_candidates))
+            centers_all = np.concatenate(all_centers).astype(float)
+            half_widths_all = np.concatenate(all_half_widths).astype(float)
 
-        if vmin is not None or vmax is not None:
-            target_vmin = float(vmin) if vmin is not None else float(global_vmin - margin)
-            target_vmax = float(vmax) if vmax is not None else float(global_vmax + margin)
-            return make_vgrid(target_vmin, target_vmax, target_dv)
+            if vmin is not None or vmax is not None:
+                target_vmin = float(vmin) if vmin is not None else float(global_vmin - margin)
+                target_vmax = float(vmax) if vmax is not None else float(global_vmax + margin)
+                return make_vgrid(target_vmin, target_vmax, target_dv)
 
-        mode = self.auto_grid_mode
-        if mode == "legacy_envelope":
-            return make_vgrid(float(global_vmin - margin), float(global_vmax + margin), target_dv)
+            mode = self.auto_grid_mode
+            if mode == "legacy_envelope":
+                return make_vgrid(float(global_vmin - margin), float(global_vmax + margin), target_dv)
 
-        homogeneous_nchan = (len(set(all_native_nchan)) == 1)
-        homogeneous_dv = bool(np.allclose(np.asarray(dv_candidates, dtype=float), target_dv, rtol=1.0e-6, atol=builtins.max(1.0e-9, abs(target_dv) * builtins.max(self.auto_grid_tol_frac, 0.0))))
-        if mode == "stable_native" and homogeneous_nchan and homogeneous_dv:
-            native_nchan = int(all_native_nchan[0])
-            return self._stable_native_grid(target_dv, centers_all, half_widths_all, native_nchan, margin_kms=margin)
+            homogeneous_nchan = (len(set(all_native_nchan)) == 1)
+            homogeneous_dv = bool(np.allclose(np.asarray(dv_candidates, dtype=float), target_dv, rtol=1.0e-6, atol=builtins.max(1.0e-9, abs(target_dv) * builtins.max(self.auto_grid_tol_frac, 0.0))))
+            if mode == "stable_native" and homogeneous_nchan and homogeneous_dv:
+                native_nchan = int(all_native_nchan[0])
+                return self._stable_native_grid(target_dv, centers_all, half_widths_all, native_nchan, margin_kms=margin)
 
-        # Fallback: anchor-quantized envelope. More stable than raw global min/max.
-        left = float(np.min(centers_all - half_widths_all) - margin)
-        right = float(np.max(centers_all + half_widths_all) + margin)
-        left_q = self._quantize_to_anchor(left, target_dv)
-        right_q = self._quantize_to_anchor(right, target_dv)
-        if right_q < right:
-            right_q += target_dv
-        if left_q > left:
-            left_q -= target_dv
-        return make_vgrid(left_q, right_q, target_dv)
+            # Fallback: anchor-quantized envelope. More stable than raw global min/max.
+            left = float(np.min(centers_all - half_widths_all) - margin)
+            right = float(np.max(centers_all + half_widths_all) + margin)
+            left_q = self._quantize_to_anchor(left, target_dv)
+            right_q = self._quantize_to_anchor(right, target_dv)
+            if right_q < right:
+                right_q += target_dv
+            if left_q > left:
+                left_q -= target_dv
+            return make_vgrid(left_q, right_q, target_dv)
 
     def get_matrix(
         self, 
@@ -376,80 +435,81 @@ class Standardizer:
             target_grid が指定されていない場合に、自動決定ロジックへ渡すパラメータ。
             指定された値は優先的に使用される。
         """
-        # 1. ターゲットグリッドの確定
-        if target_grid is None:
-            # ユーザー指定パラメータがある場合は、それを使って新規作成
-            if dv is not None or vmin is not None or vmax is not None:
-                target_grid = self.auto_determine_grid(dv=dv, vmin=vmin, vmax=vmax)
-            # 指定がなく、キャッシュがあれば使う
-            elif self.target_grid is not None:
-                target_grid = self.target_grid
-            # キャッシュもなければフルオートで作成
-            else:
-                self.target_grid = self.auto_determine_grid()
-                target_grid = self.target_grid
-            
-        v_tgt = target_grid.axis()
-        n_tgt = len(v_tgt)
-        n_rows = len(self.st.table)
-        
-        # 2. 結果格納用行列 (NaNで初期化)
-        out_matrix = np.full((n_rows, n_tgt), np.nan, dtype=np.float32)
-        
-        # 3. グルーピング
-        groups = self._group_by_signature()
-        
-        # 4. グループごとに一括処理
-        rest_freq_global = float(self.st.meta.get("RESTFRQ", self.st.meta.get("RESTFREQ", 0)))
-        is_list_data = isinstance(self.st.data, list)
-        
-        for sig, idxs in groups.items():
-            (_, _, _, _, _, _, sig_rest, sig_specsys) = sig
-            rest_freq = sig_rest if sig_rest > 0 else rest_freq_global
-            if rest_freq <= 0: continue
-
-            f_obs_axis = self._get_base_axis(sig)
-            
-            if is_list_data:
-                raw_spectra = [self.st.data[i] for i in idxs]
-                raw_block = np.vstack(raw_spectra)
-            else:
-                raw_block = self.st.data[idxs]
-            
-            specsys = str(sig_specsys).upper()
-
-            if "TOPO" in specsys:
-                v_corrs = np.asarray([_get_vcorr_kms(self.st.table.iloc[j], self.st.meta, self.v_corr_col) for j in idxs], dtype=float)
-                v_corrs = np.nan_to_num(v_corrs, nan=0.0)
-            else:
-                v_corrs = np.zeros(len(idxs), dtype=float)
-                
-            k_factors = get_doppler_factor(v_corrs)
-            k_inv_arr = 1.0 / k_factors
-            term_b = (C_KMS * f_obs_axis) / rest_freq
-
-
-            if len(term_b) > 1:
-                # 速度軸の向き（昇順か降順か）はグループ内で不変のため、最初に1度だけ判定する
-                # np.interp は x が昇順である必要がある
-                is_reversed = (C_KMS - term_b[0] * k_inv_arr[0]) > (C_KMS - term_b[-1] * k_inv_arr[0])
-                
-                if is_reversed:
-                    term_b_rev = term_b[::-1]
-                    for local_i, global_i in enumerate(idxs):
-                        v_axis_row = C_KMS - term_b_rev * k_inv_arr[local_i]
-                        out_matrix[global_i] = np.interp(v_tgt, v_axis_row, raw_block[local_i, ::-1], left=np.nan, right=np.nan)
+        with self._cache_session():
+            # 1. ターゲットグリッドの確定
+            if target_grid is None:
+                # ユーザー指定パラメータがある場合は、それを使って新規作成
+                if dv is not None or vmin is not None or vmax is not None:
+                    target_grid = self.auto_determine_grid(dv=dv, vmin=vmin, vmax=vmax)
+                # 指定がなく、キャッシュがあれば使う
+                elif self.target_grid is not None:
+                    target_grid = self.target_grid
+                # キャッシュもなければフルオートで作成
                 else:
+                    self.target_grid = self.auto_determine_grid()
+                    target_grid = self.target_grid
+                
+            v_tgt = target_grid.axis()
+            n_tgt = len(v_tgt)
+            n_rows = len(self.st.table)
+            
+            # 2. 結果格納用行列 (NaNで初期化)
+            out_matrix = np.full((n_rows, n_tgt), np.nan, dtype=np.float32)
+            
+            # 3. グルーピング
+            self._ensure_row_cache()
+            groups = self._group_by_signature()
+            
+            # 4. グループごとに一括処理
+            rest_freq_global = float(self.st.meta.get("RESTFRQ", self.st.meta.get("RESTFREQ", 0)))
+            is_list_data = isinstance(self.st.data, list)
+            
+            for sig, idxs in groups.items():
+                (_, _, _, _, _, _, sig_rest, sig_specsys) = sig
+                rest_freq = sig_rest if sig_rest > 0 else rest_freq_global
+                if rest_freq <= 0: continue
+
+                f_obs_axis = self._get_base_axis(sig)
+                
+                if is_list_data:
+                    raw_spectra = [self.st.data[i] for i in idxs]
+                    raw_block = np.vstack(raw_spectra)
+                else:
+                    raw_block = self.st.data[idxs]
+                
+                specsys = str(sig_specsys).upper()
+
+                if "TOPO" in specsys:
+                    v_corrs = self._row_vcorr_cache[np.asarray(idxs, dtype=int)]
+                else:
+                    v_corrs = np.zeros(len(idxs), dtype=float)
+                    
+                k_factors = get_doppler_factor(v_corrs)
+                k_inv_arr = 1.0 / k_factors
+                term_b = (C_KMS * f_obs_axis) / rest_freq
+
+
+                if len(term_b) > 1:
+                    # 速度軸の向き（昇順か降順か）はグループ内で不変のため、最初に1度だけ判定する
+                    # np.interp は x が昇順である必要がある
+                    is_reversed = (C_KMS - term_b[0] * k_inv_arr[0]) > (C_KMS - term_b[-1] * k_inv_arr[0])
+                    
+                    if is_reversed:
+                        term_b_rev = term_b[::-1]
+                        for local_i, global_i in enumerate(idxs):
+                            v_axis_row = C_KMS - term_b_rev * k_inv_arr[local_i]
+                            out_matrix[global_i] = np.interp(v_tgt, v_axis_row, raw_block[local_i, ::-1], left=np.nan, right=np.nan)
+                    else:
+                        for local_i, global_i in enumerate(idxs):
+                            v_axis_row = C_KMS - term_b * k_inv_arr[local_i]
+                            out_matrix[global_i] = np.interp(v_tgt, v_axis_row, raw_block[local_i], left=np.nan, right=np.nan)
+                else:
+                    # チャンネル数が1以下の場合の安全なフォールバック
                     for local_i, global_i in enumerate(idxs):
                         v_axis_row = C_KMS - term_b * k_inv_arr[local_i]
-                        out_matrix[global_i] = np.interp(v_tgt, v_axis_row, raw_block[local_i], left=np.nan, right=np.nan)
-            else:
-                # チャンネル数が1以下の場合の安全なフォールバック
-                for local_i, global_i in enumerate(idxs):
-                    v_axis_row = C_KMS - term_b * k_inv_arr[local_i]
-                    out_matrix[global_i] = interp_to_vgrid(v_axis_row, raw_block[local_i], v_tgt)
-                
-        return out_matrix, v_tgt
+                        out_matrix[global_i] = interp_to_vgrid(v_axis_row, raw_block[local_i], v_tgt)
+                    
+            return out_matrix, v_tgt
 
 
 # =========================================================
