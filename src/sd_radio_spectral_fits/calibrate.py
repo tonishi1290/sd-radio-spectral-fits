@@ -215,33 +215,19 @@ def _coerce_velocity_array_to_ms(values: np.ndarray, *, source_name: str) -> np.
     return arr
 
 
-def _normalize_vcorr_column_name(value: Any, *, default: str = "VFRAME") -> str:
-    if _is_missing_value(value):
-        value = default
-    s = str(value).strip().upper()
-    aliases = {
-        "VFRAME": "VFRAME",
-        "VELOSYS": "VELOSYS",
-        "V_CORR_KMS": "V_CORR_KMS",
-        "VCORR": "V_CORR_KMS",
-        "VCORRKMS": "V_CORR_KMS",
-    }
-    return aliases.get(s, s)
-
-
 def _extract_existing_velocity_ms(
     mapping_on: pd.DataFrame,
     *,
     preferred_key: str = "VFRAME",
 ) -> tuple[np.ndarray | None, str | None]:
-    preferred = _normalize_vcorr_column_name(preferred_key, default="VFRAME")
-    order: list[str] = []
+    preferred = str(preferred_key or "").strip().upper()
+    candidate_keys: list[str] = []
     for key in (preferred, "VFRAME", "V_CORR_KMS", "VELOSYS"):
-        if key not in order:
-            order.append(key)
+        if key and key not in candidate_keys:
+            candidate_keys.append(key)
 
     found: list[tuple[str, np.ndarray]] = []
-    for key in order:
+    for key in candidate_keys:
         if key not in mapping_on.columns:
             continue
         col = mapping_on[key]
@@ -273,16 +259,33 @@ def _fast_to_datetime(series: pd.Series) -> pd.DatetimeIndex:
         return pd.DatetimeIndex([])
     dtype = series.dtype
     if pd.api.types.is_datetime64_any_dtype(dtype):
-        return pd.DatetimeIndex(series)
+        return pd.DatetimeIndex(pd.to_datetime(series, utc=True, errors="coerce"))
     vals = series.values
     if pd.api.types.is_numeric_dtype(dtype):
         arr = pd.to_numeric(series, errors="coerce").to_numpy(dtype=float)
         finite = arr[np.isfinite(arr)]
         if finite.size > 0 and float(np.nanmedian(finite)) < 1.0e6:
             # Likely MJD days (SDFITS TIME)
-            return pd.to_datetime(arr, unit="D", origin=pd.Timestamp("1858-11-17"), utc=True, errors="coerce")
-        return pd.to_datetime(arr, unit="s", utc=True, errors="coerce")
-    return pd.to_datetime(vals, utc=True, errors="coerce")
+            return pd.DatetimeIndex(pd.to_datetime(arr, unit="D", origin=pd.Timestamp("1858-11-17"), utc=True, errors="coerce"))
+        return pd.DatetimeIndex(pd.to_datetime(arr, unit="s", utc=True, errors="coerce"))
+    return pd.DatetimeIndex(pd.to_datetime(vals, utc=True, errors="coerce"))
+
+
+def _datetime_index_to_unix_seconds(index: pd.DatetimeIndex) -> np.ndarray:
+    idx = pd.DatetimeIndex(pd.to_datetime(index, utc=True, errors="coerce"))
+    if len(idx) == 0:
+        return np.empty(0, dtype=float)
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    secs = (idx - epoch) / pd.Timedelta(seconds=1)
+    return np.asarray(secs, dtype=float)
+
+
+def _mean_datetime_index(index: pd.DatetimeIndex) -> pd.Timestamp:
+    secs = _datetime_index_to_unix_seconds(index)
+    finite = secs[np.isfinite(secs)]
+    if finite.size == 0:
+        return pd.Timestamp("NaT", tz="UTC")
+    return pd.Timestamp(pd.to_datetime(float(np.mean(finite)), unit="s", utc=True))
 
 
 def _interp_spectra_in_time(
@@ -290,8 +293,8 @@ def _interp_spectra_in_time(
     ref_times: pd.DatetimeIndex,
     ref_data: np.ndarray
 ) -> np.ndarray:
-    t_tgt = target_times.values.astype(float)
-    t_ref = ref_times.values.astype(float)
+    t_tgt = _datetime_index_to_unix_seconds(target_times)
+    t_ref = _datetime_index_to_unix_seconds(ref_times)
     
     if np.any(np.diff(t_ref) < 0):
         sort_idx = np.argsort(t_ref)
@@ -351,9 +354,8 @@ def _average_mode_by_scan(
         idx_array = np.array(list(group_idxs), dtype=int)
         if len(idx_array) == 0: continue
         
-        # 時刻の平均値算出（一度floatのns単位にしてから平均）
-        t_vals = times[idx_array].values.astype(float)
-        mean_time = pd.to_datetime(np.mean(t_vals))
+        # 時刻の平均値算出（datetime内部単位に依存しない秒基準）
+        mean_time = _mean_datetime_index(times[idx_array])
         
         # データの積分（平均）
         with warnings.catch_warnings():
@@ -367,7 +369,7 @@ def _average_mode_by_scan(
         return times, data
         
     # 時系列順を保証して返す
-    sort_idx = np.argsort(pd.DatetimeIndex(t_out).values.astype(float))
+    sort_idx = np.argsort(_datetime_index_to_unix_seconds(pd.DatetimeIndex(t_out)))
     t_out_sorted = pd.DatetimeIndex([t_out[i] for i in sort_idx])
     d_out_sorted = np.stack([d_out[i] for i in sort_idx])
     
@@ -416,12 +418,13 @@ def make_tastar_dumps(
         )
 
 
+    v_corr_col_norm = str(v_corr_col or "VFRAME").strip().upper()
+
     # 静止周波数の上書き処理
     if rest_freq is not None:
         apply_restfreq_override(meta, mapping_all, float(rest_freq), require_wcs_for_vrad=True)
 
     meta = _canonicalize_frequency_axis_meta(meta, mapping_all)
-    v_corr_col = _normalize_vcorr_column_name(v_corr_col, default="VFRAME")
 
     # タイムスタンプの取得
     ts_all = _resolve_table_timestamps(mapping_all)
@@ -481,8 +484,8 @@ def make_tastar_dumps(
     mapping_on.index = t_on
 
     # Canonicalize coordinate columns when available.
-    # TOPOCENT inputs require coordinates to compute the per-row velocity correction
-    # unless a valid row-wise VFRAME/VELOSYS column is already present. LSRK inputs do not require coordinates.
+    # TOPOCENT inputs require coordinates to compute VELOSYS unless a valid row-wise
+    # VELOSYS/VFRAME column is already present. LSRK inputs do not require coordinates.
     effective_coord_frame = _choose_effective_coord_frame(mapping_on, coord_frame, meta)
     lon_col0, lat_col0 = _resolve_lonlat_columns(mapping_on, effective_coord_frame)
     have_coords = (lon_col0 is not None and lat_col0 is not None)
@@ -501,7 +504,7 @@ def make_tastar_dumps(
                 mapping_on["DEC"] = pd.to_numeric(mapping_on[lat_col0], errors="coerce")
 
         _maybe_validate_mapping_frame(meta, mapping_on)
-    elif need_coords and _extract_existing_velocity_ms(mapping_on, preferred_key=v_corr_col)[0] is None:
+    elif need_coords and _extract_existing_velocity_ms(mapping_on, preferred_key=v_corr_col_norm)[0] is None:
         if effective_coord_frame == "galactic":
             raise ValueError("coord_frame=galactic but mapping lacks GLON/GLAT (or aliases).")
         raise ValueError("coord_frame=icrs but mapping lacks RA/DEC (or aliases).")
@@ -519,7 +522,7 @@ def make_tastar_dumps(
         # Prefer an existing per-row standard/legacy velocity column when present.
         # This avoids silently changing already-computed corrections and reduces
         # dependence on coordinate-frame inference for backward-compatible inputs.
-        velosys_ms, vel_source = _extract_existing_velocity_ms(mapping_on, preferred_key=v_corr_col)
+        velosys_ms, vel_source = _extract_existing_velocity_ms(mapping_on, preferred_key=v_corr_col_norm)
 
         if velosys_ms is None:
             lon_col, lat_col = _resolve_lonlat_columns(mapping_on, effective_coord_frame)
@@ -532,7 +535,7 @@ def make_tastar_dumps(
                     should_decimate = (vcorr_chunk_sec is not None and vcorr_chunk_sec > 0 and len(t_on) > 2)
 
                     if should_decimate:
-                        t_vals = t_on.values.astype(float) / 1e9
+                        t_vals = _datetime_index_to_unix_seconds(t_on)
                         t_start, t_end = t_vals[0], t_vals[-1]
                         duration = t_end - t_start
 
@@ -561,7 +564,6 @@ def make_tastar_dumps(
         v_corr_kms = np.asarray(velosys_ms, dtype=float) / 1000.0
         mapping_on["VELOSYS"] = np.asarray(velosys_ms, dtype=float)
         mapping_on["VFRAME"] = np.asarray(velosys_ms, dtype=float)
-        vel_source = str(vel_source or "COMPUTED").upper()
     else:
         v_corr_kms = np.zeros(len(t_on), dtype=float)
 
@@ -812,9 +814,9 @@ def tastar_from_rawspec(
     ch_range: tuple[int, int] | None = None,
     vlsrk_range_kms: tuple[float, float] | None = None,
     vcorr_chunk_sec: float | None = None,
-    v_corr_col: str = "VFRAME",
     dtype: type | str | None = None,
     rest_freq: float | None = None,
+    v_corr_col: str = "VFRAME",
     coord_frame: str | None = None,
     rows: Union[str, slice, Sequence[int], int, None] = None,
     exclude_rows: Union[str, slice, Sequence[int], int, None] = None,
@@ -835,9 +837,9 @@ def tastar_from_rawspec(
         ch_range=ch_range,
         vlsrk_range_kms=vlsrk_range_kms,
         vcorr_chunk_sec=vcorr_chunk_sec,
-        v_corr_col=v_corr_col,
         dtype=dtype,
         rest_freq=rest_freq,
+        v_corr_col=v_corr_col,
         coord_frame=(None if coord_frame in (None, "", "auto") else str(coord_frame)),
         rows=rows,
         exclude_rows=exclude_rows,
@@ -862,9 +864,9 @@ def run_tastar_calibration(
     overwrite: bool = False,
     store_freq_column: bool = False,
     vcorr_chunk_sec: Optional[float] = None,
-    v_corr_col: str = "VFRAME",
     dtype: Optional[Union[type, str]] = None,
     rest_freq: Optional[float] = None,
+    v_corr_col: str = "VFRAME",
     rows: Union[str, slice, Sequence[int], int, None] = None,
     exclude_rows: Union[str, slice, Sequence[int], int, None] = None,
     
@@ -907,9 +909,9 @@ def run_tastar_calibration(
         vlsrk_range_kms=vlsrk_range_kms,
         coord_frame=(None if coord_frame in (None, "", "auto") else str(coord_frame)),
         vcorr_chunk_sec=vcorr_chunk_sec, 
-        v_corr_col=v_corr_col,
         dtype=dtype,
         rest_freq=rest_freq, 
+        v_corr_col=v_corr_col,
         rows=rows,
         exclude_rows=exclude_rows,
         tau_zenith=tau_zenith,
@@ -934,8 +936,8 @@ def run_tastar_calibration(
         'notes': 'Ta* calibration.',
         'ch_range': str(ch_range) if ch_range else "all",
         'vlsrk_range': str(vlsrk_range_kms) if vlsrk_range_kms else "none",
-        'vcorr_chunk_sec': str(vcorr_chunk_sec), 'v_corr_col': str(v_corr_col), 'dtype': str(dtype),
-        'rest_freq': str(rest_freq), 'rows': str(rows), 'exclude_rows': str(exclude_rows),
+        'vcorr_chunk_sec': str(vcorr_chunk_sec), 'dtype': str(dtype),
+        'rest_freq': str(rest_freq), 'v_corr_col': str(v_corr_col), 'rows': str(rows), 'exclude_rows': str(exclude_rows),
     }
     res.history = history
 

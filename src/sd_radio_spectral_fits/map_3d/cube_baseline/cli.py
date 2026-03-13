@@ -8,12 +8,20 @@ CLI-like pipeline function for iterative baseline subtraction.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
-from typing import List, Optional, Sequence, Tuple, Union
+import os
+import time
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 from astropy.io import fits
 import astropy.units as u
+
+try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
 
 from sd_radio_spectral_fits.map_3d.baseline_subtraction import (
     LineFreeConfig,
@@ -25,6 +33,41 @@ from .session import BaselineSession
 from .orchestrator import run_one_iteration
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+
+
+def _profile_rss_gb() -> Optional[float]:
+    if psutil is None:
+        return None
+    try:
+        return float(psutil.Process(os.getpid()).memory_info().rss) / 1.0e9
+    except Exception:
+        return None
+
+
+def _profile_record(store: List[Dict[str, Any]], stage: str, t_prev: float, t0: float, **extra: Any) -> float:
+    now = time.perf_counter()
+    rec: Dict[str, Any] = {"stage": str(stage), "dt_stage_sec": float(now - t_prev), "dt_total_sec": float(now - t0)}
+    rss = _profile_rss_gb()
+    if rss is not None:
+        rec["rss_gb"] = float(rss)
+    rec.update(extra)
+    store.append(rec)
+    return now
+
+
+def _write_profile_sidecar(profile_path_prefix: str, records: List[Dict[str, Any]]) -> Tuple[str, str]:
+    json_path = profile_path_prefix + ".baseline_profile.json"
+    txt_path = profile_path_prefix + ".baseline_profile.txt"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"records": records}, f, ensure_ascii=False, indent=2)
+    lines = ["# cli baseline profile"]
+    for rec in records:
+        rss = rec.get("rss_gb")
+        rss_txt = f"  rss_gb={rss:.6f}" if isinstance(rss, (int, float)) else ""
+        lines.append(f"{rec['stage']}: dt_stage_sec={rec['dt_stage_sec']:.6f}  dt_total_sec={rec['dt_total_sec']:.6f}{rss_txt}")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return json_path, txt_path
 
 
 def _get_cube_from_hdul(
@@ -387,12 +430,19 @@ def run_cli_pipeline(
     cube_analysis_write_provisional: bool = True,
     write_diagnostics: bool = False,
     diagnostics_prefix: Optional[str] = None,
+    write_profile: bool = False,
+    profile_prefix: Optional[str] = None,
 ) -> None:
     """
     Pipeline:
       read FITS -> iterate baseline fit -> write baselined FITS with QC HDUs
       optionally run cube_analysis to append provisional masks, MASK3D, and moments.
     """
+    _profile_records: List[Dict[str, Any]] = []
+    _t0 = time.perf_counter()
+    _tprev = _t0
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "start", _tprev, _t0, input_fits=str(input_fits), output_fits=str(output_fits), iterations=int(iterations))
     logging.info("Loading FITS: %s", input_fits)
     with fits.open(input_fits, memmap=True) as hdul:
         cube_raw, header, cube_idx = _get_cube_from_hdul(hdul, cube_ext=cube_ext)
@@ -404,6 +454,8 @@ def run_cli_pipeline(
         raise ValueError(f"Cube must be 3D, got shape={cube_raw.shape}")
 
     session, _v_axis = _try_make_session(cube_raw, header)
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "read_and_init_session", _tprev, _t0, cube_shape=list(np.asarray(cube_raw).shape), session_shape=[int(session.nchan), int(session.ny), int(session.nx)])
 
     if target_mask_2d is not None and target_mask_2d.shape != (session.ny, session.nx):
         raise ValueError(
@@ -448,9 +500,13 @@ def run_cli_pipeline(
         rms_map = session.fit_stats.get("rms_map", None)
         if rms_map is not None:
             logging.info("  -> Median BASE_RMS: %.4f", float(np.nanmedian(rms_map)))
+        if write_profile:
+            _tprev = _profile_record(_profile_records, f"iteration_{it + 1}", _tprev, _t0, median_base_rms=(None if rms_map is None else float(np.nanmedian(rms_map))))
 
     logging.info("Writing baselined cube: %s", output_fits)
     cube_out = session.get_full_cube_work(cache=False).astype(np.float32, copy=False)
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "assemble_output_cube", _tprev, _t0)
     axis_order_in = session.axis_order_in
 
     linefree_mask_1d_prior = None if session.linefree_mask_1d_prior is None else np.asarray(session.linefree_mask_1d_prior, dtype=bool).copy()
@@ -476,6 +532,8 @@ def run_cli_pipeline(
 
     with fits.open(input_fits, memmap=True) as hdul_in:
         hdul_out = fits.HDUList([hdu.copy() for hdu in hdul_in])
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "copy_output_hdus", _tprev, _t0, nhdu=int(len(hdul_out)))
 
     target_cube_hdu = hdul_out[cube_idx]
     target_cube_name = str(getattr(target_cube_hdu, "name", "") or "").strip()
@@ -603,7 +661,11 @@ def run_cli_pipeline(
             fits.ImageHDU(data=np.asarray(flag_map, dtype=np.uint8), header=hdr, name="BASE_FLG"),
         )
 
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "prepare_output_hdus", _tprev, _t0)
     hdul_out.writeto(output_fits, overwrite=True)
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "write_fits", _tprev, _t0)
     try:
         hdul_out.close()
     except Exception:
@@ -639,6 +701,11 @@ def run_cli_pipeline(
         prefix = diagnostics_prefix if diagnostics_prefix else output_fits
         json_path, txt_path = write_baseline_diagnostic_files(prefix, payload)
         logging.info("Wrote baseline diagnostics: %s | %s", json_path, txt_path)
+
+    if write_profile:
+        prefix = profile_prefix if profile_prefix else output_fits
+        json_path, txt_path = _write_profile_sidecar(prefix, _profile_records)
+        logging.info("Wrote baseline profile: %s | %s", json_path, txt_path)
 
     if run_cube_analysis:
         from sd_radio_spectral_fits.map.cube_analysis import make_3d_mask_for_existing_fits
@@ -686,6 +753,8 @@ def _main() -> None:
     p.add_argument("--no-provisional", action="store_true")
     p.add_argument("--write-diagnostics", action="store_true", help="Write <prefix>.baseline_diag.json/txt for cross-environment comparison.")
     p.add_argument("--diagnostics-prefix", default=None, help="Prefix (or FITS path) for diagnostic sidecar files.")
+    p.add_argument("--write-profile", action="store_true", help="Write <prefix>.baseline_profile.json/txt with stage timings and RSS.")
+    p.add_argument("--profile-prefix", default=None, help="Prefix (or FITS path) for profiling sidecar files.")
     p.add_argument(
         "--analysis-method",
         default="smooth_mask_lite",
@@ -738,6 +807,8 @@ def _main() -> None:
         cube_analysis_write_provisional=not args.no_provisional,
         write_diagnostics=bool(args.write_diagnostics),
         diagnostics_prefix=args.diagnostics_prefix,
+        write_profile=bool(args.write_profile),
+        profile_prefix=args.profile_prefix,
     )
 
 

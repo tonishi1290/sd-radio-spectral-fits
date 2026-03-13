@@ -45,6 +45,7 @@ import logging
 import os
 import platform
 import sys
+import time
 import warnings
 from dataclasses import dataclass
 from typing import Any, List, Optional, Sequence, Tuple, Union
@@ -57,10 +58,55 @@ from astropy.io import fits
 import astropy.units as u
 
 try:
+    import psutil  # type: ignore
+except Exception:  # pragma: no cover
+    psutil = None  # type: ignore
+
+try:
     from spectral_cube import SpectralCube
 except Exception:  # pragma: no cover
     SpectralCube = None  # type: ignore
 
+
+
+
+def _profile_rss_gb() -> Optional[float]:
+    if psutil is None:
+        return None
+    try:
+        return float(psutil.Process(os.getpid()).memory_info().rss) / 1.0e9
+    except Exception:
+        return None
+
+
+def _profile_record(store: List[dict[str, Any]], stage: str, t_prev: float, t0: float, **extra: Any) -> float:
+    now = time.perf_counter()
+    rec: dict[str, Any] = {
+        "stage": str(stage),
+        "dt_stage_sec": float(now - t_prev),
+        "dt_total_sec": float(now - t0),
+    }
+    rss = _profile_rss_gb()
+    if rss is not None:
+        rec["rss_gb"] = float(rss)
+    rec.update(extra)
+    store.append(rec)
+    return now
+
+
+def _write_profile_sidecar(profile_path_prefix: str, records: List[dict[str, Any]]) -> tuple[str, str]:
+    json_path = profile_path_prefix + ".baseline_profile.json"
+    txt_path = profile_path_prefix + ".baseline_profile.txt"
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump({"records": records}, f, ensure_ascii=False, indent=2)
+    lines = ["# baseline profile"]
+    for rec in records:
+        rss = rec.get("rss_gb")
+        rss_txt = f"  rss_gb={rss:.6f}" if isinstance(rss, (int, float)) else ""
+        lines.append(f"{rec['stage']}: dt_stage_sec={rec['dt_stage_sec']:.6f}  dt_total_sec={rec['dt_total_sec']:.6f}{rss_txt}")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    return json_path, txt_path
 
 __all__ = [
     "LineFreeConfig",
@@ -176,7 +222,30 @@ class BaselineConfig:
     ripple : bool
         If True, include sinusoid terms with frequencies from RippleConfig (or user-provided).
     robust : bool
-        If True, apply a lightweight robust reweighting per pixel (slower). Default False for huge cubes.
+        If True, enable robust refitting. The exact behaviour is controlled by ``robust_mode``.
+    robust_mode : {'full', 'batched_full', 'selective'}
+        'full' keeps the original behaviour and robust-refits every fitted pixel.
+        'batched_full' robust-refits every fitted pixel too, but solves weighted least-squares
+        in small sub-batches via batched QR where possible. It is usually faster than
+        'full', but may not be bit-identical.
+        'selective' first performs a fast ordinary least-squares solve for the whole chunk and
+        then robust-refits only the worst residual spectra.
+    robust_iters : int
+        Number of reweighting iterations for robust refits.
+    robust_early_stop : bool
+        If True, stop robust reweighting early when coefficients have converged.
+    robust_coef_rtol : float
+        Relative tolerance for coefficient-based early stopping.
+    robust_coef_atol : float
+        Absolute tolerance for coefficient-based early stopping.
+    robust_selective_sigma : float
+        Threshold (in robust-sigma units) for selecting spectra to robust-refit in
+        ``robust_mode='selective'``. The threshold is applied to both line-free RMS and
+        line-free max|residual| statistics.
+    robust_selective_frac : float
+        At most this fraction of spectra in a chunk are robust-refit in selective mode.
+    robust_selective_max_pixels : int
+        Hard cap on the number of spectra robust-refit per chunk in selective mode.
     rcond : float or None
         rcond for numpy.linalg.lstsq. If None and reproducible_mode=True, an explicit dtype-based threshold is used.
     chunk_pix : int
@@ -196,6 +265,15 @@ class BaselineConfig:
     poly_order: int = 1
     ripple: bool = True
     robust: bool = False
+    robust_mode: str = "full"
+    robust_iters: int = 3
+    robust_early_stop: bool = False
+    robust_coef_rtol: float = 1.0e-4
+    robust_coef_atol: float = 1.0e-6
+    robust_selective_sigma: float = 4.5
+    robust_selective_frac: float = 0.10
+    robust_selective_max_pixels: int = 2048
+    robust_batch_pixels: int = 512
     rcond: Optional[float] = None
     chunk_pix: int = 65536
     reproducible_mode: bool = False
@@ -860,6 +938,297 @@ def _robust_reweight(
     return w
 
 
+def _robust_reweight_matrix(
+    resid: np.ndarray,
+    *,
+    c: float = 1.345,
+    dtype: np.dtype = np.float32,
+) -> np.ndarray:
+    """Huber weights for residual matrix with residuals in columns.
+
+    Parameters
+    ----------
+    resid : ndarray, shape (n_samples, n_spec)
+        Residuals for multiple spectra.
+    """
+    r = np.asarray(resid, dtype=np.float64)
+    if r.ndim != 2:
+        raise ValueError('resid must be 2D in _robust_reweight_matrix')
+    med = np.nanmedian(r, axis=0, keepdims=True)
+    mad = np.nanmedian(np.abs(r - med), axis=0)
+    scale = 1.4826 * mad
+    bad = (~np.isfinite(scale)) | (scale <= 0)
+    if np.any(bad):
+        scale2 = np.nanstd(r, axis=0)
+        scale = np.where(bad, scale2, scale)
+    bad = (~np.isfinite(scale)) | (scale <= 0)
+    scale = np.where(bad, 1.0, scale)
+    t = np.abs(r) / (float(c) * scale[None, :])
+    w = np.ones_like(r, dtype=np.float64)
+    m = t > 1.0
+    w[m] = 1.0 / t[m]
+    if np.any(bad):
+        w[:, bad] = 1.0
+    return np.asarray(w, dtype=dtype)
+
+
+def _coef_converged_mask(
+    coef_old: np.ndarray,
+    coef_new: np.ndarray,
+    *,
+    rtol: float,
+    atol: float,
+) -> np.ndarray:
+    """Return per-spectrum convergence mask based on coefficient change."""
+    a = np.asarray(coef_old, dtype=np.float64)
+    b = np.asarray(coef_new, dtype=np.float64)
+    if a.shape != b.shape:
+        raise ValueError('coef_old / coef_new shape mismatch in _coef_converged_mask')
+    if a.ndim == 1:
+        a = a[:, None]
+        b = b[:, None]
+    delta = np.max(np.abs(b - a), axis=0)
+    scale = float(atol) + float(rtol) * np.maximum(np.max(np.abs(a), axis=0), np.max(np.abs(b), axis=0))
+    return np.asarray(delta <= scale, dtype=bool)
+
+
+def _solve_weighted_qr_batch(
+    A: np.ndarray,
+    Y: np.ndarray,
+    W: np.ndarray,
+    *,
+    rcond: Optional[float],
+    dtype: np.dtype,
+) -> np.ndarray:
+    """Solve weighted least-squares for a batch of spectra using QR when possible.
+
+    Parameters
+    ----------
+    A : ndarray, shape (n_samples, n_coef)
+    Y : ndarray, shape (n_samples, n_spec)
+    W : ndarray, shape (n_samples, n_spec)
+    rcond : float or None
+        rcond used only in per-spectrum fallback ``np.linalg.lstsq`` solves.
+    """
+    A64 = np.asarray(A, dtype=np.float64)
+    Y64 = np.asarray(Y, dtype=np.float64)
+    W64 = np.asarray(W, dtype=np.float64)
+    if A64.ndim != 2 or Y64.ndim != 2 or W64.shape != Y64.shape:
+        raise ValueError('A/Y/W shape mismatch in _solve_weighted_qr_batch')
+
+    sqrtW = np.sqrt(np.clip(W64, 0.0, None))
+    # Stack spectra on the leading axis for batched QR: (n_spec, n_samples, n_coef).
+    Aw = sqrtW.T[:, :, None] * A64[None, :, :]
+    bw = sqrtW.T[:, :, None] * Y64.T[:, :, None]
+
+    try:
+        Q, R = np.linalg.qr(Aw, mode='reduced')
+        Qtb = np.matmul(np.swapaxes(Q, -1, -2), bw)
+        coef = np.linalg.solve(R, Qtb)[..., 0].T
+        return np.asarray(coef, dtype=dtype)
+    except Exception:
+        n_spec = Y64.shape[1]
+        n_coef = A64.shape[1]
+        coef = np.empty((n_coef, n_spec), dtype=np.float64)
+        for ib in range(n_spec):
+            Ai = Aw[ib]
+            bi = bw[ib, :, 0]
+            try:
+                Qi, Ri = np.linalg.qr(Ai, mode='reduced')
+                coef[:, ib] = np.linalg.solve(Ri, Qi.T @ bi)
+            except Exception:
+                coef[:, ib], *_ = np.linalg.lstsq(Ai, bi, rcond=rcond)
+        return np.asarray(coef, dtype=dtype)
+
+
+def _fit_selected_robust_batched(
+    out_chunk: np.ndarray,
+    Yc_fill: np.ndarray,
+    fit_cols: np.ndarray,
+    selected_rel: np.ndarray,
+    *,
+    A_full: np.ndarray,
+    A_lf: np.ndarray,
+    linefree_mask: np.ndarray,
+    coef_init: Optional[np.ndarray],
+    rcond: Optional[float],
+    dtype: np.dtype,
+    robust_iters: int,
+    batch_pixels: int,
+    robust_early_stop: bool,
+    robust_coef_rtol: float,
+    robust_coef_atol: float,
+) -> None:
+    """Robust re-fit selected spectra using batched IRLS on weighted least-squares via QR."""
+    sel = np.asarray(selected_rel, dtype=np.int64)
+    if sel.size == 0:
+        return
+    Ylf_all = np.asarray(Yc_fill[linefree_mask, :], dtype=dtype)
+    batch = max(1, int(batch_pixels))
+    early = bool(robust_early_stop)
+    for p0 in range(0, sel.size, batch):
+        p1 = min(sel.size, p0 + batch)
+        sub_rel = sel[p0:p1]
+        sub_cols = np.asarray(fit_cols[sub_rel], dtype=np.int64)
+        Ysub = np.asarray(Ylf_all[:, sub_cols], dtype=dtype)
+        if coef_init is not None and coef_init.shape[1] >= np.max(sub_rel) + 1:
+            coef_sub = np.asarray(coef_init[:, sub_rel], dtype=dtype, copy=True)
+        else:
+            coef_sub, *_ = np.linalg.lstsq(A_lf, Ysub, rcond=rcond)
+            coef_sub = np.asarray(coef_sub, dtype=dtype)
+        active = np.arange(sub_rel.size, dtype=np.int64)
+        for _ in range(max(0, int(robust_iters))):
+            if active.size == 0:
+                break
+            coef_old = np.asarray(coef_sub[:, active], dtype=dtype, copy=True)
+            Yact = np.asarray(Ysub[:, active], dtype=dtype)
+            resid = Yact - (A_lf @ coef_old)
+            W = _robust_reweight_matrix(resid, dtype=dtype)
+            coef_new = _solve_weighted_qr_batch(A_lf, Yact, W, rcond=rcond, dtype=dtype)
+            coef_sub[:, active] = coef_new
+            if early:
+                converged = _coef_converged_mask(
+                    coef_old,
+                    coef_new,
+                    rtol=robust_coef_rtol,
+                    atol=robust_coef_atol,
+                )
+                if np.all(converged):
+                    break
+                active = active[~converged]
+        base = np.asarray(A_full @ coef_sub, dtype=dtype)
+        out_chunk[:, sub_cols] = np.asarray(Yc_fill[:, sub_cols] - base, dtype=np.float32)
+
+
+def _robust_loc_scale(x: np.ndarray) -> tuple[float, float]:
+    arr = np.asarray(x, dtype=np.float64)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return 0.0, 0.0
+    med = float(np.nanmedian(arr))
+    mad = float(np.nanmedian(np.abs(arr - med)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale <= 0:
+        scale = float(np.nanstd(arr))
+    if not np.isfinite(scale) or scale <= 0:
+        scale = 0.0
+    return med, scale
+
+
+def _selective_robust_candidates(
+    resid_lf: np.ndarray,
+    finite_lf: np.ndarray,
+    *,
+    sigma: float,
+    max_frac: float,
+    max_pixels: int,
+) -> np.ndarray:
+    """Pick spectra that merit a robust re-fit from an initial ordinary fit.
+
+    Parameters
+    ----------
+    resid_lf : array, shape (n_lf, n_spec)
+        Residuals on line-free channels from the initial ordinary fit.
+    finite_lf : bool array, shape (n_lf, n_spec)
+        Finite mask on line-free channels.
+    sigma : float
+        Threshold in robust-sigma units.
+    max_frac : float
+        Maximum fraction of spectra to refit.
+    max_pixels : int
+        Hard cap on the number of spectra to refit.
+    """
+    r = np.asarray(resid_lf, dtype=np.float64)
+    f = np.asarray(finite_lf, dtype=bool)
+    if r.ndim != 2 or f.shape != r.shape:
+        raise ValueError('resid_lf / finite_lf shape mismatch in selective robust picker')
+    if r.shape[1] == 0:
+        return np.empty(0, dtype=np.int64)
+
+    abs_r = np.abs(r)
+    abs_r[~f] = np.nan
+    cnt = np.sum(np.isfinite(abs_r), axis=0)
+    good = cnt > 0
+    if not np.any(good):
+        return np.empty(0, dtype=np.int64)
+
+    sq = np.where(np.isfinite(abs_r), abs_r * abs_r, 0.0)
+    rms = np.full(abs_r.shape[1], np.nan, dtype=np.float64)
+    rms[good] = np.sqrt(np.sum(sq[:, good], axis=0) / cnt[good])
+
+    peak_work = np.where(np.isfinite(abs_r), abs_r, -np.inf)
+    peak = np.max(peak_work, axis=0)
+    peak[~good] = np.nan
+
+    med_rms, scl_rms = _robust_loc_scale(rms[good])
+    med_peak, scl_peak = _robust_loc_scale(peak[good])
+    cand = np.zeros(abs_r.shape[1], dtype=bool)
+
+    score = np.zeros(abs_r.shape[1], dtype=np.float64)
+    if scl_rms > 0:
+        z_rms = (rms - med_rms) / scl_rms
+        cand |= np.isfinite(z_rms) & (z_rms > float(sigma))
+        score = np.maximum(score, np.where(np.isfinite(z_rms), z_rms, 0.0))
+    if scl_peak > 0:
+        z_peak = (peak - med_peak) / scl_peak
+        cand |= np.isfinite(z_peak) & (z_peak > float(sigma))
+        score = np.maximum(score, np.where(np.isfinite(z_peak), z_peak, 0.0))
+
+    idx = np.where(cand)[0]
+    if idx.size == 0:
+        return idx.astype(np.int64, copy=False)
+
+    limit_frac = int(np.ceil(float(max_frac) * int(np.sum(good)))) if float(max_frac) > 0 else idx.size
+    limit = idx.size
+    if limit_frac > 0:
+        limit = min(limit, limit_frac)
+    if int(max_pixels) > 0:
+        limit = min(limit, int(max_pixels))
+    if limit <= 0:
+        return np.empty(0, dtype=np.int64)
+    if idx.size > limit:
+        order = np.argsort(score[idx], kind='mergesort')[::-1]
+        idx = idx[order[:limit]]
+    return np.asarray(np.sort(idx), dtype=np.int64)
+
+
+def _fit_selected_robust(
+    out_chunk: np.ndarray,
+    Yc_fill: np.ndarray,
+    fit_cols: np.ndarray,
+    selected_rel: np.ndarray,
+    *,
+    A_full: np.ndarray,
+    A_lf: np.ndarray,
+    linefree_mask: np.ndarray,
+    coef_init: Optional[np.ndarray] = None,
+    rcond: Optional[float],
+    dtype: np.dtype,
+    robust_iters: int,
+    batch_pixels: int,
+    robust_early_stop: bool,
+    robust_coef_rtol: float,
+    robust_coef_atol: float,
+) -> None:
+    _fit_selected_robust_batched(
+        out_chunk,
+        Yc_fill,
+        fit_cols,
+        selected_rel,
+        A_full=A_full,
+        A_lf=A_lf,
+        linefree_mask=linefree_mask,
+        coef_init=coef_init,
+        rcond=rcond,
+        dtype=dtype,
+        robust_iters=robust_iters,
+        batch_pixels=batch_pixels,
+        robust_early_stop=robust_early_stop,
+        robust_coef_rtol=robust_coef_rtol,
+        robust_coef_atol=robust_coef_atol,
+    )
+
+
 def _fit_single_spectrum(
     y_full: np.ndarray,
     A_full: np.ndarray,
@@ -867,21 +1236,30 @@ def _fit_single_spectrum(
     linefree_mask: np.ndarray,
     *,
     robust: bool,
+    robust_iters: int,
     rcond: Optional[float],
     dtype: np.dtype,
+    robust_early_stop: bool = False,
+    robust_coef_rtol: float = 1.0e-4,
+    robust_coef_atol: float = 1.0e-6,
 ) -> np.ndarray:
     yj = np.asarray(y_full, dtype=dtype)
     ylf = yj[linefree_mask]
     cj, *_ = np.linalg.lstsq(A_lf, ylf, rcond=rcond)
     cj = np.asarray(cj, dtype=dtype)
     if robust:
-        for _ in range(3):
+        early = bool(robust_early_stop)
+        for _ in range(max(0, int(robust_iters))):
             rj = ylf - (A_lf @ cj)
             w = _robust_reweight(rj, dtype=dtype)
             Aw = A_lf * w[:, None]
             bw = ylf * w
-            cj, *_ = np.linalg.lstsq(Aw, bw, rcond=rcond)
-            cj = np.asarray(cj, dtype=dtype)
+            cj_new, *_ = np.linalg.lstsq(Aw, bw, rcond=rcond)
+            cj_new = np.asarray(cj_new, dtype=dtype)
+            if early and bool(_coef_converged_mask(cj, cj_new, rtol=robust_coef_rtol, atol=robust_coef_atol)[0]):
+                cj = cj_new
+                break
+            cj = cj_new
     base = A_full @ cj
     return np.asarray(yj - base, dtype=np.float32)
 
@@ -929,6 +1307,17 @@ def subtract_baseline_cube(
 
     dtype_compute = _resolve_compute_dtype(bcfg)
     normalize_x = bool(getattr(bcfg, "normalize_x", False) or getattr(bcfg, "reproducible_mode", False))
+    robust_mode = str(getattr(bcfg, "robust_mode", "full") or "full").strip().lower()
+    if robust_mode not in {"full", "batched_full", "selective"}:
+        raise ValueError(f"Unknown robust_mode={robust_mode!r}; expected 'full', 'batched_full' or 'selective'")
+    robust_iters = max(0, int(getattr(bcfg, "robust_iters", 3)))
+    robust_early_stop = bool(getattr(bcfg, "robust_early_stop", False))
+    robust_coef_rtol = float(getattr(bcfg, "robust_coef_rtol", 1.0e-4))
+    robust_coef_atol = float(getattr(bcfg, "robust_coef_atol", 1.0e-6))
+    robust_selective_sigma = float(getattr(bcfg, "robust_selective_sigma", 4.5))
+    robust_selective_frac = float(getattr(bcfg, "robust_selective_frac", 0.10))
+    robust_selective_max_pixels = int(getattr(bcfg, "robust_selective_max_pixels", 2048))
+    robust_batch_pixels = int(getattr(bcfg, "robust_batch_pixels", 512))
 
     finite_orig = np.isfinite(data)
     data2 = _fill_nan_with_median_along_spec(data)
@@ -990,44 +1379,148 @@ def subtract_baseline_cube(
             Yc_fit = np.asarray(Yc_fill[:, fit_cols], dtype=dtype_compute)
             Ylf = Yc_fit[m, :]
             try:
-                if not bcfg.robust:
-                    coef, *_ = np.linalg.lstsq(A_lf, Ylf, rcond=rcond_eff)
-                    coef = np.asarray(coef, dtype=dtype_compute)
-                    base = A_full @ coef
-                    out_fit = np.asarray(Yc_fit - base, dtype=np.float32)
-                    out_chunk[:, fit_cols] = out_fit
-                else:
-                    for j_out, j in enumerate(fit_cols):
-                        out_chunk[:, j] = _fit_single_spectrum(
-                            Yc_fill[:, j],
-                            A_full,
-                            A_lf,
-                            m,
-                            robust=True,
+                coef, *_ = np.linalg.lstsq(A_lf, Ylf, rcond=rcond_eff)
+                coef = np.asarray(coef, dtype=dtype_compute)
+                base = A_full @ coef
+                out_fit = np.asarray(Yc_fit - base, dtype=np.float32)
+                out_chunk[:, fit_cols] = out_fit
+
+                if bool(bcfg.robust):
+                    if robust_mode == "full":
+                        for j in fit_cols:
+                            out_chunk[:, j] = _fit_single_spectrum(
+                                Yc_fill[:, j],
+                                A_full,
+                                A_lf,
+                                m,
+                                robust=True,
+                                robust_iters=robust_iters,
+                                rcond=rcond_eff,
+                                dtype=dtype_compute,
+                                robust_early_stop=robust_early_stop,
+                                robust_coef_rtol=robust_coef_rtol,
+                                robust_coef_atol=robust_coef_atol,
+                            )
+                    elif robust_mode == "batched_full":
+                        _fit_selected_robust(
+                            out_chunk,
+                            Yc_fill,
+                            fit_cols,
+                            np.arange(fit_cols.size, dtype=np.int64),
+                            A_full=A_full,
+                            A_lf=A_lf,
+                            linefree_mask=m,
+                            coef_init=coef,
                             rcond=rcond_eff,
                             dtype=dtype_compute,
+                            robust_iters=robust_iters,
+                            batch_pixels=robust_batch_pixels,
+                            robust_early_stop=robust_early_stop,
+                            robust_coef_rtol=robust_coef_rtol,
+                            robust_coef_atol=robust_coef_atol,
                         )
+                    else:
+                        finite_lf = finite_c[m, :][:, fit_cols]
+                        selected_rel = _selective_robust_candidates(
+                            out_fit[m, :],
+                            finite_lf,
+                            sigma=robust_selective_sigma,
+                            max_frac=robust_selective_frac,
+                            max_pixels=robust_selective_max_pixels,
+                        )
+                        if selected_rel.size > 0:
+                            _fit_selected_robust(
+                                out_chunk,
+                                Yc_fill,
+                                fit_cols,
+                                selected_rel,
+                                A_full=A_full,
+                                A_lf=A_lf,
+                                linefree_mask=m,
+                                coef_init=coef[:, selected_rel] if coef.ndim == 2 else None,
+                                rcond=rcond_eff,
+                                dtype=dtype_compute,
+                                robust_iters=robust_iters,
+                                batch_pixels=robust_batch_pixels,
+                                robust_early_stop=robust_early_stop,
+                                robust_coef_rtol=robust_coef_rtol,
+                                robust_coef_atol=robust_coef_atol,
+                            )
             except Exception:
                 if bool(getattr(bcfg, "strict_failures", False)):
                     raise
                 if not bool(getattr(bcfg, "fallback_to_pixelwise", True)):
                     flag_chunk[fit_cols] = 2
                 else:
-                    for j in fit_cols:
+                    ok_rel: list[int] = []
+                    for jrel, j in enumerate(fit_cols):
                         try:
                             out_chunk[:, j] = _fit_single_spectrum(
                                 Yc_fill[:, j],
                                 A_full,
                                 A_lf,
                                 m,
-                                robust=bool(bcfg.robust),
+                                robust=bool(bcfg.robust and robust_mode == "full"),
+                                robust_iters=robust_iters,
                                 rcond=rcond_eff,
                                 dtype=dtype_compute,
+                                robust_early_stop=robust_early_stop,
+                                robust_coef_rtol=robust_coef_rtol,
+                                robust_coef_atol=robust_coef_atol,
                             )
+                            ok_rel.append(int(jrel))
                         except Exception:
                             if bool(getattr(bcfg, "strict_failures", False)):
                                 raise
                             flag_chunk[j] = 2
+                    if bool(bcfg.robust) and len(ok_rel) > 0:
+                        ok_rel_arr = np.asarray(ok_rel, dtype=np.int64)
+                        fit_cols_ok = fit_cols[ok_rel_arr]
+                        if robust_mode == "batched_full":
+                            _fit_selected_robust(
+                                out_chunk,
+                                Yc_fill,
+                                fit_cols_ok,
+                                np.arange(fit_cols_ok.size, dtype=np.int64),
+                                A_full=A_full,
+                                A_lf=A_lf,
+                                linefree_mask=m,
+                                coef_init=None,
+                                rcond=rcond_eff,
+                                dtype=dtype_compute,
+                                robust_iters=robust_iters,
+                                batch_pixels=robust_batch_pixels,
+                                robust_early_stop=robust_early_stop,
+                                robust_coef_rtol=robust_coef_rtol,
+                                robust_coef_atol=robust_coef_atol,
+                            )
+                        elif robust_mode == "selective":
+                            finite_lf = finite_c[m, :][:, fit_cols_ok]
+                            selected_rel = _selective_robust_candidates(
+                                out_chunk[m, :][:, fit_cols_ok],
+                                finite_lf,
+                                sigma=robust_selective_sigma,
+                                max_frac=robust_selective_frac,
+                                max_pixels=robust_selective_max_pixels,
+                            )
+                            if selected_rel.size > 0:
+                                _fit_selected_robust(
+                                    out_chunk,
+                                    Yc_fill,
+                                    fit_cols_ok,
+                                    selected_rel,
+                                    A_full=A_full,
+                                    A_lf=A_lf,
+                                    linefree_mask=m,
+                                    coef_init=None,
+                                    rcond=rcond_eff,
+                                    dtype=dtype_compute,
+                                    robust_iters=robust_iters,
+                                    batch_pixels=robust_batch_pixels,
+                                    robust_early_stop=robust_early_stop,
+                                    robust_coef_rtol=robust_coef_rtol,
+                                    robust_coef_atol=robust_coef_atol,
+                                )
 
         # Preserve original invalid channels rather than inventing data on NaN inputs.
         out_chunk[~finite_c] = np.nan
@@ -1230,6 +1723,8 @@ def subtract_baseline_from_fits(
     overwrite: bool = True,
     write_diagnostics: bool = False,
     diagnostics_prefix: Optional[str] = None,
+    write_profile: bool = False,
+    profile_prefix: Optional[str] = None,
 ) -> None:
     """
     Read cube FITS, estimate/reuse line-free + ripple frequencies, subtract baseline, write new FITS.
@@ -1247,6 +1742,11 @@ def subtract_baseline_from_fits(
     - If load_prior_from_input=True, existing LINEFREE / RIPFREQ HDUs are used as priors
       according to linefree_mode / ripple_mode.
     """
+    _profile_records: List[dict[str, Any]] = []
+    _t0 = time.perf_counter()
+    _tprev = _t0
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "start", _tprev, _t0, input_fits=str(input_fits), output_fits=str(output_fits), cube_ext=(None if cube_ext is None else str(cube_ext)))
     def _read_linefree_prior(hdul_local: fits.HDUList) -> Optional[np.ndarray]:
         for name in ("LINEFREE", "LINEFREE_USED", "LINEFREE_PRIOR"):
             if name in hdul_local:
@@ -1274,6 +1774,8 @@ def subtract_baseline_from_fits(
         data_raw = np.asarray(hdu_cube.data, dtype=np.float32)
         data, axis_order_in = _standardize_cube_for_processing(data_raw, hdu_cube.header)
         nchan, ny, nx = data.shape
+        if write_profile:
+            _tprev = _profile_record(_profile_records, "read_and_standardize", _tprev, _t0, cube_shape=[int(nchan), int(ny), int(nx)], axis_order_in=str(axis_order_in))
 
         lf_prior = _read_linefree_prior(hdul_in) if load_prior_from_input else None
         freqs_prior = _read_ripple_prior(hdul_in) if load_prior_from_input else None
@@ -1324,6 +1826,8 @@ def subtract_baseline_from_fits(
             lf = np.asarray(lf, dtype=bool) & (~manual_signal)
 
         logging.info("Line-free fraction: %.3f", lf.mean())
+        if write_profile:
+            _tprev = _profile_record(_profile_records, "prepare_linefree", _tprev, _t0, linefree_fraction=float(np.mean(lf)))
 
         freqs: List[float] = []
         if reproducible_mode is not None:
@@ -1355,6 +1859,8 @@ def subtract_baseline_from_fits(
                     spec = np.nanmedian(flat, axis=1)
                 freqs = estimate_ripple_frequencies_fft(spec, lf, rcfg=ripple_cfg, poly_order_pre=baseline_cfg.poly_order)
                 logging.info("Estimated ripple frequencies (cycles/chan): %s", freqs)
+        if write_profile:
+            _tprev = _profile_record(_profile_records, "prepare_ripple", _tprev, _t0, nfreq=int(len(freqs)))
 
         out_cube, rms_map, flag_map = subtract_baseline_cube(
             data,
@@ -1363,10 +1869,16 @@ def subtract_baseline_from_fits(
             ripple_freqs=freqs,
             return_qc=add_qc_hdus,
         )
+        if write_profile:
+            _tprev = _profile_record(_profile_records, "fit_baseline", _tprev, _t0)
 
         hdul_out = fits.HDUList([h.copy() for h in hdul_in])
+        if write_profile:
+            _tprev = _profile_record(_profile_records, "copy_output_hdus", _tprev, _t0, nhdu=int(len(hdul_out)))
 
     out_cube_write = _restore_cube_axis_order(out_cube, axis_order_in)
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "restore_axis_order", _tprev, _t0)
     if idx == 0:
         hdul_out[0].data = out_cube_write
     else:
@@ -1437,7 +1949,12 @@ def subtract_baseline_from_fits(
             hdr["COMMENT"] = "0=OK, 1=insufficient finite line-free points, 2=lstsq failed (spectrum left unchanged), 3=all-NaN spectrum."
             _replace_or_append_hdu(hdul_out, fits.ImageHDU(data=np.asarray(flag_map, dtype=np.uint8), header=hdr, name="BASE_FLG"))
 
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "add_qc_hdus", _tprev, _t0)
+
     hdul_out.writeto(output_fits, overwrite=overwrite)
+    if write_profile:
+        _tprev = _profile_record(_profile_records, "write_fits", _tprev, _t0)
 
     if write_diagnostics:
         payload = build_baseline_diagnostic_payload(
@@ -1461,5 +1978,10 @@ def subtract_baseline_from_fits(
         prefix = diagnostics_prefix if diagnostics_prefix else output_fits
         json_path, txt_path = write_baseline_diagnostic_files(prefix, payload)
         logging.info("Wrote baseline diagnostics: %s | %s", json_path, txt_path)
+
+    if write_profile:
+        prefix = profile_prefix if profile_prefix else output_fits
+        json_path, txt_path = _write_profile_sidecar(prefix, _profile_records)
+        logging.info("Wrote baseline profile: %s | %s", json_path, txt_path)
 
     logging.info("Wrote baselined cube FITS: %s", output_fits)
