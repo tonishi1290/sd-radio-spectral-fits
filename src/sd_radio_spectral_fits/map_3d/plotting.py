@@ -21,9 +21,10 @@ Main features
 
 Notes
 -----
-- This first implementation intentionally does not perform reprojection.
 - Contours are drawn either on the same WCS/shape or via the WCSAxes
   transform when the target axes can interpret the input WCS directly.
+- Image overlays can optionally be reprojected to the base WCS when the
+  optional ``reproject`` package is installed.
 - For provisional moments, this implementation assumes:
     * LINECAND3D : True means line/signal candidate -> integrate there
     * BASESUP3D  : True means baseline support      -> integrate complement
@@ -34,13 +35,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+import sys
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 import warnings
 
 import numpy as np
 
 from astropy.convolution import Gaussian2DKernel, convolve
+from astropy.coordinates import SkyCoord
 from astropy.io import fits
+from astropy.nddata import Cutout2D
 from astropy.stats import gaussian_fwhm_to_sigma
 import astropy.units as u
 from astropy.visualization import (
@@ -70,7 +74,14 @@ __all__ = [
     "resolve_map_input",
     "resolve_cube_input",
     "build_normalize",
+    "estimate_rms_robust",
+    "compute_contour_levels",
     "apply_gaussian_smoothing_2d",
+    "crop_map2d",
+    "describe_map2d",
+    "describe_source",
+    "plotting_help_text",
+    "print_plotting_help",
     "make_2d_map",
     "make_provisional_moment",
     "make_final_moment",
@@ -78,6 +89,10 @@ __all__ = [
     "plot_map",
     "make_rgb_map",
     "plot_rgb",
+    "add_scalebar",
+    "add_north_arrow",
+    "plot_scene",
+    "quicklook",
     "main",
 ]
 
@@ -679,6 +694,231 @@ def apply_gaussian_smoothing_2d(
     sigma_pix = (float(kernel_fwhm_arcsec) / pix_arcsec) * gaussian_fwhm_to_sigma
     kernel = Gaussian2DKernel(x_stddev=sigma_pix)
     return convolve(arr, kernel, boundary=boundary, preserve_nan=True, normalize_kernel=True)
+
+
+# -----------------------------------------------------------------------------
+# Description / cropping / convenience helpers
+# -----------------------------------------------------------------------------
+
+
+def _safe_header_get_float(header: Optional[fits.Header], key: str) -> Optional[float]:
+    if header is None:
+        return None
+    try:
+        value = header.get(key)
+        return None if value is None else float(value)
+    except Exception:
+        return None
+
+
+def _format_range_value(value: Any) -> str:
+    if value is None:
+        return "none"
+    if isinstance(value, tuple) and len(value) == 2:
+        return f"({value[0]}, {value[1]})"
+    return str(value)
+
+
+def describe_map2d(map2d: Map2D, *, name: Optional[str] = None) -> str:
+    """Return a short human-readable description of a 2D map."""
+    lines: List[str] = []
+    if name:
+        lines.append(f"name: {name}")
+    lines.append(f"shape: {map2d.data.shape[1]} x {map2d.data.shape[0]} pixels")
+    lines.append(f"coord_system: {_infer_native_coord_system(map2d.wcs)}")
+    if map2d.unit is not None:
+        lines.append(f"unit: {map2d.unit.to_string()}")
+    mode = map2d.meta.get("mode")
+    if mode is not None:
+        lines.append(f"mode: {mode}")
+    range_kind = map2d.meta.get("range_kind")
+    range_value = map2d.meta.get("range_value")
+    if range_kind is not None:
+        lines.append(f"range: {range_kind} {_format_range_value(range_value)}")
+    smooth_info = map2d.meta.get("smooth_info", {}) if isinstance(map2d.meta, dict) else {}
+    eff_hpbw = smooth_info.get("effective_hpbw_arcsec")
+    if eff_hpbw is None:
+        bmaj = _safe_header_get_float(map2d.header, "BMAJ")
+        bmin = _safe_header_get_float(map2d.header, "BMIN")
+        if bmaj is not None:
+            if bmin is None:
+                bmin = bmaj
+            lines.append(f"beam: {bmaj * 3600.0:.3g} x {bmin * 3600.0:.3g} arcsec")
+    else:
+        lines.append(f"effective_beam: {float(eff_hpbw):.3g} arcsec")
+
+    finite = np.asarray(map2d.data, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size > 0:
+        lines.append(
+            "value_range: "
+            f"min={float(np.nanmin(finite)):.6g}, max={float(np.nanmax(finite)):.6g}, median={float(np.nanmedian(finite)):.6g}"
+        )
+    return "\n".join(lines)
+
+
+def describe_source(
+    source: SourceLike = None,
+    *,
+    data: Optional[np.ndarray] = None,
+    header: Optional[fits.Header] = None,
+    ext: Optional[Union[int, str]] = None,
+    mode: str = "moment0",
+    chan_range: Optional[Tuple[int, int]] = None,
+    vel_range: Optional[Tuple[float, float]] = None,
+    spectral_unit: Union[str, u.UnitBase] = "km/s",
+    mask: Optional[np.ndarray] = None,
+    mask_mode: Optional[str] = None,
+    zero_fill: bool = False,
+    nan_fill: bool = True,
+    smooth_fwhm_arcsec: Optional[float] = None,
+    target_hpbw_arcsec: Optional[float] = None,
+    orig_hpbw_arcsec: Optional[float] = None,
+    linefree_ext: str = "LINEFREE",
+    linecand_ext: str = "LINECAND3D",
+    basesup_ext: str = "BASESUP3D",
+    final_mask_ext: str = "MASK3D",
+) -> str:
+    """Resolve the source to 2D and return a short description.
+
+    Either ``source`` or ``(header, data)`` may be supplied. When ``data`` is
+    given, ``header`` must also be given. If both are supplied, ``(header, data)``
+    takes precedence because it is the more explicit in-memory representation.
+    """
+    actual_source = source
+    if data is not None:
+        if header is None:
+            raise ValueError("header must be given together with data.")
+        if source is not None:
+            warnings.warn(
+                "describe_source received both source=... and data/header=...; using the in-memory (header, data) pair.",
+                RuntimeWarning,
+            )
+        actual_source = (header, data)
+
+    map2d = make_2d_map(
+        source=actual_source,
+        ext=ext,
+        mode=mode,
+        chan_range=chan_range,
+        vel_range=vel_range,
+        spectral_unit=spectral_unit,
+        mask=mask,
+        mask_mode=mask_mode,
+        zero_fill=zero_fill,
+        nan_fill=nan_fill,
+        smooth_fwhm_arcsec=smooth_fwhm_arcsec,
+        target_hpbw_arcsec=target_hpbw_arcsec,
+        orig_hpbw_arcsec=orig_hpbw_arcsec,
+        linefree_ext=linefree_ext,
+        linecand_ext=linecand_ext,
+        basesup_ext=basesup_ext,
+        final_mask_ext=final_mask_ext,
+    )
+    return describe_map2d(map2d)
+def plotting_help_text() -> str:
+    """Return a compact programmatic help text for the plotting helpers."""
+    return (
+        "Minimal API\n"
+        "-----------\n"
+        "quicklook(source, ...)\n"
+        "    Fast entry point for showing one 2D map or one reduced 3D cube with sensible defaults.\n\n"
+        "plot_scene(base=..., overlays=[...], ...)\n"
+        "    High-level API with one base layer and optional overlay layers.\n"
+        "    Supported overlay kinds: image, contour, marker, catalog, text, beam, scalebar, north_arrow.\n"
+        "    catalog layers can use coords/lon+lat/xy directly, or table-like input (pandas / astropy.table / dict of arrays).\n\n"
+        "describe_source(source, ...)\n"
+        "    Return a short text summary of what would be plotted.\n\n"
+        "Typical quicklook examples\n"
+        "--------------------------\n"
+        "quicklook('cube.fits')\n"
+        "quicklook('cube.fits', vel_range=(20, 40), title='12CO integrated intensity')\n"
+        "quicklook((header, data), grid=False, save='map.pdf')\n"
+        "quicklook('cube.fits', contours=[{'levels': 'auto', 'colors': 'white'}])\n\n"
+        "Typical scene example\n"
+        "---------------------\n"
+        "plot_scene(\n"
+        "    base={'kind': 'image', 'source': 'optical.fits'},\n"
+        "    overlays=[\n"
+        "        {'kind': 'contour', 'source': 'co.fits', 'mode': 'moment0', 'vel_range': (20, 40), 'colors': 'cyan'},\n"
+        "        {'kind': 'beam', 'beam': 'auto'},\n"
+        "    ],\n"
+        "    title='Optical + CO contours',\n"
+        ")\n"
+    )
+
+
+def print_plotting_help() -> None:
+    """Print the compact programmatic help text."""
+    print(plotting_help_text())
+
+
+def crop_map2d(
+    map2d: Map2D,
+    *,
+    center: Optional[Any] = None,
+    size: Optional[Any] = None,
+    xlim: Optional[Tuple[float, float]] = None,
+    ylim: Optional[Tuple[float, float]] = None,
+    mode: str = "trim",
+    fill_value: float = np.nan,
+) -> Map2D:
+    """Return a cropped cutout of a 2D map.
+
+    Supported forms
+    ---------------
+    1. center + size
+       - center: (xpix, ypix) or SkyCoord
+       - size  : scalar / (ny, nx) in pixels, or astropy Quantity for world-size cutouts
+    2. xlim + ylim
+       - pixel-coordinate bounds; converted internally to center + size
+    """
+    if center is None and size is None and xlim is None and ylim is None:
+        return map2d
+
+    if (xlim is None) ^ (ylim is None):
+        raise ValueError("xlim and ylim must be provided together.")
+
+    position = center
+    cutout_size = size
+    if xlim is not None and ylim is not None:
+        x0, x1 = float(xlim[0]), float(xlim[1])
+        y0, y1 = float(ylim[0]), float(ylim[1])
+        xc = 0.5 * (x0 + x1)
+        yc = 0.5 * (y0 + y1)
+        nx = max(1, int(round(abs(x1 - x0))))
+        ny = max(1, int(round(abs(y1 - y0))))
+        position = (xc, yc)
+        cutout_size = (ny, nx)
+
+    if position is None or cutout_size is None:
+        raise ValueError("Either center+size or xlim+ylim must be provided for cropping.")
+
+    cutout = Cutout2D(
+        data=np.asarray(map2d.data, dtype=float),
+        position=position,
+        size=cutout_size,
+        wcs=map2d.wcs,
+        mode=mode,
+        fill_value=fill_value,
+    )
+    hdr = fits.Header(map2d.header)
+    hdr.update(cutout.wcs.to_header())
+    meta = dict(map2d.meta)
+    meta["crop"] = {
+        "center": repr(center),
+        "size": repr(size),
+        "xlim": xlim,
+        "ylim": ylim,
+        "mode": mode,
+    }
+    return Map2D(
+        data=np.asarray(cutout.data, dtype=float),
+        header=hdr,
+        wcs=cutout.wcs.celestial,
+        unit=map2d.unit,
+        meta=meta,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1347,6 +1587,824 @@ def make_final_moment(
 
 
 # -----------------------------------------------------------------------------
+# Plotting helpers
+# -----------------------------------------------------------------------------
+
+
+def _looks_like_layer_mapping(obj: Any) -> bool:
+    return isinstance(obj, Mapping)
+
+
+def _layer_dict(obj: Any, *, default_kind: Optional[str] = None) -> Dict[str, Any]:
+    if isinstance(obj, Mapping):
+        out = dict(obj)
+    else:
+        out = {"source": obj}
+    if default_kind is not None and "kind" not in out:
+        out["kind"] = default_kind
+    return out
+
+
+def _layer_to_map2d(layer: Any, *, default_mode: str = "identity") -> Map2D:
+    layer = _layer_dict(layer)
+    contour_map_keys = {
+        "mode",
+        "chan_range",
+        "vel_range",
+        "spectral_unit",
+        "mask",
+        "mask_mode",
+        "zero_fill",
+        "nan_fill",
+        "smooth_fwhm_arcsec",
+        "target_hpbw_arcsec",
+        "orig_hpbw_arcsec",
+        "linefree_ext",
+        "linecand_ext",
+        "basesup_ext",
+        "final_mask_ext",
+    }
+    mode = layer.get("mode", default_mode)
+    if any(k in layer for k in contour_map_keys) or mode not in {None, "identity", "map", "2d"}:
+        return make_2d_map(
+            source=layer.get("source"),
+            ext=layer.get("ext"),
+            mode=mode or "identity",
+            chan_range=layer.get("chan_range"),
+            vel_range=layer.get("vel_range"),
+            spectral_unit=layer.get("spectral_unit", "km/s"),
+            mask=layer.get("mask"),
+            mask_mode=layer.get("mask_mode"),
+            zero_fill=layer.get("zero_fill", False),
+            nan_fill=layer.get("nan_fill", True),
+            smooth_fwhm_arcsec=layer.get("smooth_fwhm_arcsec"),
+            target_hpbw_arcsec=layer.get("target_hpbw_arcsec"),
+            orig_hpbw_arcsec=layer.get("orig_hpbw_arcsec"),
+            linefree_ext=layer.get("linefree_ext", "LINEFREE"),
+            linecand_ext=layer.get("linecand_ext", "LINECAND3D"),
+            basesup_ext=layer.get("basesup_ext", "BASESUP3D"),
+            final_mask_ext=layer.get("final_mask_ext", "MASK3D"),
+        )
+    return resolve_map_input(
+        source=layer.get("source"),
+        data=layer.get("data"),
+        header=layer.get("header"),
+        ext=layer.get("ext"),
+    )
+
+
+def _resolve_base_spec(base: Any) -> Dict[str, Any]:
+    layer = _layer_dict(base, default_kind="image")
+    kind = str(layer.get("kind", "image")).lower()
+    if kind not in {"image", "rgb"}:
+        raise ValueError("base kind must be 'image' or 'rgb'.")
+    return layer
+
+
+def _save_figure(
+    fig: Any,
+    save: Optional[Union[str, Path]],
+    *,
+    dpi: int = 250,
+    bbox_inches: str = "tight",
+    transparent: bool = False,
+) -> None:
+    if save is None:
+        return
+    fig.savefig(str(save), dpi=dpi, bbox_inches=bbox_inches, transparent=transparent)
+
+
+def _apply_readout_formatter(ax: Any, map2d: Map2D) -> None:
+    def _fmt(x: float, y: float) -> str:
+        try:
+            ix = int(np.round(x))
+            iy = int(np.round(y))
+            if 0 <= ix < map2d.data.shape[1] and 0 <= iy < map2d.data.shape[0]:
+                value = map2d.data[iy, ix]
+            else:
+                value = np.nan
+            world = map2d.wcs.pixel_to_world_values(x, y)
+            lon = float(world[0])
+            lat = float(world[1])
+            return f"x={x:.2f}, y={y:.2f} | lon={lon:.6f}, lat={lat:.6f} | value={value:.6g}"
+        except Exception:
+            return f"x={x:.2f}, y={y:.2f}"
+
+    ax.format_coord = _fmt
+
+
+def _beam_config_from_map(map2d: Map2D, beam: Union[str, Mapping[str, Any]]) -> Dict[str, Any]:
+    if isinstance(beam, str) and beam.lower() in {"header", "auto"}:
+        smooth_info = map2d.meta.get("smooth_info", {}) if isinstance(map2d.meta, dict) else {}
+        eff_hpbw = smooth_info.get("effective_hpbw_arcsec")
+        if eff_hpbw is not None:
+            return {"major": float(eff_hpbw), "minor": float(eff_hpbw), "angle": 0.0, "units": "arcsec"}
+        bmaj = map2d.header.get("BMAJ")
+        bmin = map2d.header.get("BMIN", bmaj)
+        bpa = map2d.header.get("BPA", 0.0)
+        if bmaj is not None:
+            return {"major": float(bmaj), "minor": float(bmin), "angle": float(bpa), "units": "deg"}
+        return {}
+    return dict(beam)
+
+
+def _add_beam_artist(ax: Any, map2d: Map2D, beam: Union[str, Mapping[str, Any]]) -> Optional[Any]:
+    from matplotlib.patches import Ellipse
+
+    beam_cfg = _beam_config_from_map(map2d, beam)
+    if not beam_cfg:
+        return None
+
+    pix_arcsec = _pixel_scale_arcsec(map2d.wcs)
+    major = beam_cfg.get("major")
+    minor = beam_cfg.get("minor", major)
+    angle = beam_cfg.get("angle", 0.0)
+    units = str(beam_cfg.get("units", "arcsec")).lower()
+    if major is None:
+        return None
+
+    if units in {"arcsec", "asec", "arcseconds"}:
+        major_pix = float(major) / pix_arcsec
+        minor_pix = float(minor) / pix_arcsec
+    elif units in {"deg", "degree", "degrees"}:
+        major_pix = float(major) * 3600.0 / pix_arcsec
+        minor_pix = float(minor) * 3600.0 / pix_arcsec
+    elif units in {"pix", "pixel", "pixels"}:
+        major_pix = float(major)
+        minor_pix = float(minor)
+    else:
+        raise ValueError(f"Unsupported beam units: {units}")
+
+    ny, nx = map2d.data.shape
+    x0 = beam_cfg.get("x", 0.12 * nx)
+    y0 = beam_cfg.get("y", 0.12 * ny)
+    artist = Ellipse(
+        (x0, y0),
+        width=major_pix,
+        height=minor_pix,
+        angle=angle,
+        facecolor=beam_cfg.get("facecolor", "none"),
+        edgecolor=beam_cfg.get("edgecolor", "white"),
+        linewidth=beam_cfg.get("linewidth", 1.2),
+        alpha=beam_cfg.get("alpha", 0.9),
+    )
+    ax.add_patch(artist)
+    return artist
+
+
+def _world_transform_for(ax: Any, wcs: WCS) -> Any:
+    """Return the native world-coordinate transform for the current WCSAxes.
+
+    World overlays handled by this module are first converted into the base
+    celestial frame of the axes and then passed as native longitude/latitude
+    values in degrees. In that situation, WCSAxes expects the generic
+    ``'world'`` transform rather than a transform constructed from the base WCS
+    object itself. Using ``ax.get_transform('world')`` avoids ambiguities
+    between pixel/data and world inputs for marker/text/catalog overlays.
+    """
+    return ax.get_transform("world")
+
+
+def _normalize_frame_name(frame: Optional[Any]) -> Optional[str]:
+    if frame is None:
+        return None
+    text = str(frame).strip().lower()
+    if text in {"", "none", "auto", "world", "native"}:
+        return None
+    aliases = {
+        "equatorial": "icrs",
+        "j2000": "icrs",
+        "radec": "icrs",
+        "ra/dec": "icrs",
+        "fk5j2000": "fk5",
+        "gal": "galactic",
+        "gal_lonlat": "galactic",
+        "glon/glat": "galactic",
+        "l/b": "galactic",
+    }
+    return aliases.get(text, text)
+
+
+def _target_frame_name_from_wcs(wcs: WCS) -> str:
+    mode = _infer_native_coord_system(wcs)
+    if mode == "galactic":
+        return "galactic"
+    cwcs = wcs.celestial.wcs
+    radesys = _normalize_frame_name(getattr(cwcs, "radesys", None))
+    if radesys in {"icrs", "fk5", "fk4"}:
+        return str(radesys)
+    return "icrs"
+
+
+def _transform_skycoord_to_frame(sc: SkyCoord, frame_name: Optional[str]) -> SkyCoord:
+    target = _normalize_frame_name(frame_name)
+    if target is None:
+        return sc
+    if target == "icrs":
+        return sc.icrs
+    if target == "fk5":
+        return sc.fk5
+    if target == "fk4":
+        return sc.fk4
+    if target == "galactic":
+        return sc.galactic
+    try:
+        return sc.transform_to(target)
+    except Exception as exc:
+        raise ValueError(f"Unsupported or unavailable coordinate frame: {frame_name}") from exc
+
+
+def _skycoord_from_lonlat(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    *,
+    frame_name: Optional[str],
+    coord_unit: Union[str, u.UnitBase] = "deg",
+) -> SkyCoord:
+    frame = _normalize_frame_name(frame_name) or "icrs"
+    unit = u.Unit(coord_unit)
+    lon_q = np.asarray(lon, dtype=float) * unit
+    lat_q = np.asarray(lat, dtype=float) * unit
+    if frame == "galactic":
+        return SkyCoord(l=lon_q, b=lat_q, frame="galactic")
+    if frame in {"icrs", "fk5", "fk4"}:
+        return SkyCoord(ra=lon_q, dec=lat_q, frame=frame)
+    return SkyCoord(lon_q, lat_q, frame=frame)
+
+
+def _skycoord_to_base_lonlat(sc: SkyCoord, base_wcs: WCS) -> np.ndarray:
+    target = _target_frame_name_from_wcs(base_wcs)
+    sc_t = _transform_skycoord_to_frame(sc, target)
+    return np.column_stack([
+        np.asarray(sc_t.spherical.lon.deg, dtype=float).ravel(),
+        np.asarray(sc_t.spherical.lat.deg, dtype=float).ravel(),
+    ])
+
+
+def _world_array_to_base_lonlat(
+    arr: np.ndarray,
+    *,
+    base_wcs: WCS,
+    frame_name: Optional[str] = None,
+    coord_unit: Union[str, u.UnitBase] = "deg",
+) -> np.ndarray:
+    target = _target_frame_name_from_wcs(base_wcs)
+    source = _normalize_frame_name(frame_name) or target
+    sc = _skycoord_from_lonlat(
+        np.asarray(arr, dtype=float)[:, 0],
+        np.asarray(arr, dtype=float)[:, 1],
+        frame_name=source,
+        coord_unit=coord_unit,
+    )
+    return _skycoord_to_base_lonlat(sc, base_wcs)
+
+
+def _infer_frame_from_position_column_names(lon_name: Optional[str], lat_name: Optional[str]) -> Optional[str]:
+    lon_lower = "" if lon_name is None else str(lon_name).strip().lower()
+    lat_lower = "" if lat_name is None else str(lat_name).strip().lower()
+    gal_lon = {"glon", "glon_deg", "l", "l_deg"}
+    gal_lat = {"glat", "glat_deg", "b", "b_deg"}
+    eq_lon = {"ra", "ra_deg"}
+    eq_lat = {"dec", "dec_deg"}
+    if lon_lower in gal_lon or lat_lower in gal_lat:
+        return "galactic"
+    if lon_lower in eq_lon or lat_lower in eq_lat:
+        return "icrs"
+    return None
+
+
+def _layer_plot_positions(layer: Mapping[str, Any], base_wcs: WCS) -> Tuple[np.ndarray, bool]:
+    positions, mode, frame_name = _extract_marker_positions(layer)
+    if mode == "skycoord":
+        return _skycoord_to_base_lonlat(positions, base_wcs), True
+    if mode == "world":
+        return _world_array_to_base_lonlat(
+            np.asarray(positions, dtype=float),
+            base_wcs=base_wcs,
+            frame_name=frame_name,
+            coord_unit=layer.get("coord_unit", "deg"),
+        ), True
+    return np.asarray(positions, dtype=float), False
+def _table_like_column_names(obj: Any) -> List[str]:
+    if obj is None:
+        return []
+    try:
+        if hasattr(obj, "colnames"):
+            return [str(v) for v in list(obj.colnames)]
+    except Exception:
+        pass
+    try:
+        if hasattr(obj, "columns"):
+            cols = getattr(obj, "columns")
+            if hasattr(cols, "keys"):
+                return [str(v) for v in list(cols.keys())]
+            return [str(v) for v in list(cols)]
+    except Exception:
+        pass
+    try:
+        if isinstance(obj, Mapping) or hasattr(obj, "keys"):
+            return [str(v) for v in list(obj.keys())]
+    except Exception:
+        pass
+    return []
+
+
+
+def _table_like_get_column(obj: Any, name: str) -> Optional[np.ndarray]:
+    try:
+        col = obj[name]
+    except Exception:
+        return None
+    try:
+        if hasattr(col, "to_numpy"):
+            col = col.to_numpy()
+    except Exception:
+        pass
+    try:
+        return np.asarray(col)
+    except Exception:
+        try:
+            return np.asarray(list(col))
+        except Exception:
+            return None
+
+
+
+def _find_table_like_column(obj: Any, candidates: Sequence[str]) -> Tuple[Optional[str], Optional[np.ndarray]]:
+    names = _table_like_column_names(obj)
+    if not names:
+        return None, None
+
+    name_map = {str(n).lower(): str(n) for n in names}
+    for cand in candidates:
+        key = str(cand)
+        if key in names:
+            return key, _table_like_get_column(obj, key)
+        lowered = key.lower()
+        if lowered in name_map:
+            actual = name_map[lowered]
+            return actual, _table_like_get_column(obj, actual)
+    return None, None
+
+
+
+def _extract_positions_from_table_like(layer: Mapping[str, Any]) -> Tuple[np.ndarray, Optional[str], Optional[str]]:
+    table = layer.get("table", layer.get("catalog"))
+    if table is None:
+        raise ValueError("No table-like input was supplied.")
+
+    mode = str(layer.get("coord_mode", "auto")).lower()
+
+    lon_candidates = [v for v in (layer.get("lon_col"),) if v is not None] + [
+        "lon", "glon", "l", "longitude", "ra", "ra_deg", "lon_deg", "glon_deg", "l_deg"
+    ]
+    lat_candidates = [v for v in (layer.get("lat_col"),) if v is not None] + [
+        "lat", "glat", "b", "latitude", "dec", "dec_deg", "lat_deg", "glat_deg", "b_deg"
+    ]
+    x_candidates = [v for v in (layer.get("x_col"),) if v is not None] + [
+        "x", "xpix", "x_pix", "xpixel", "col", "ix"
+    ]
+    y_candidates = [v for v in (layer.get("y_col"),) if v is not None] + [
+        "y", "ypix", "y_pix", "ypixel", "row", "iy"
+    ]
+
+    explicit_frame = _normalize_frame_name(layer.get("frame"))
+
+    if mode in {"auto", "world"}:
+        lon_name, lon = _find_table_like_column(table, lon_candidates)
+        lat_name, lat = _find_table_like_column(table, lat_candidates)
+        if lon is not None and lat is not None:
+            lon = np.asarray(lon, dtype=float).ravel()
+            lat = np.asarray(lat, dtype=float).ravel()
+            if lon.size != lat.size:
+                raise ValueError("table-like lon/lat columns must have the same length.")
+            inferred_frame = _infer_frame_from_position_column_names(lon_name, lat_name)
+            return np.column_stack([lon, lat]), "world", explicit_frame or inferred_frame
+        if mode == "world":
+            raise ValueError("coord_mode='world' was requested, but lon/lat columns were not found.")
+
+    _, x = _find_table_like_column(table, x_candidates)
+    _, y = _find_table_like_column(table, y_candidates)
+    if x is not None and y is not None:
+        x = np.asarray(x, dtype=float).ravel()
+        y = np.asarray(y, dtype=float).ravel()
+        if x.size != y.size:
+            raise ValueError("table-like x/y columns must have the same length.")
+        return np.column_stack([x, y]), None, None
+
+    available = ", ".join(_table_like_column_names(table))
+    raise ValueError(
+        "Could not infer positions from the table-like input. "
+        f"Available columns: {available if available else '(none)'}"
+    )
+
+
+
+def _extract_catalog_labels(layer: Mapping[str, Any], npos: Optional[int] = None) -> Optional[List[str]]:
+    labels = layer.get("labels")
+    if labels is None:
+        table = layer.get("table", layer.get("catalog"))
+        if table is not None:
+            label_candidates = [v for v in (layer.get("label_col"),) if v is not None] + [
+                "label", "labels", "name", "names", "id", "ids", "source", "object", "obj"
+            ]
+            _, col = _find_table_like_column(table, label_candidates)
+            if col is not None:
+                labels = [str(v) for v in np.asarray(col).ravel().tolist()]
+    if labels is None:
+        return None
+    out = [str(v) if v is not None else "" for v in list(labels)]
+    if npos is not None and len(out) != int(npos):
+        raise ValueError("catalog labels must have the same length as the positions.")
+    return out
+
+
+def _extract_marker_positions(layer: Mapping[str, Any]) -> Tuple[Any, Optional[str], Optional[str]]:
+    if layer.get("table", layer.get("catalog")) is not None:
+        return _extract_positions_from_table_like(layer)
+
+    if layer.get("coords") is not None:
+        arr = np.asarray(layer.get("coords"), dtype=float)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError("marker coords must have shape (N, 2).")
+        return arr, "world", _normalize_frame_name(layer.get("frame"))
+
+    if layer.get("skycoord") is not None:
+        sc = layer.get("skycoord")
+        if not isinstance(sc, SkyCoord):
+            raise TypeError("skycoord must be an astropy.coordinates.SkyCoord instance.")
+        return sc, "skycoord", None
+
+    if layer.get("xy") is not None:
+        arr = np.asarray(layer.get("xy"), dtype=float)
+        if arr.ndim == 1:
+            arr = arr[None, :]
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError("marker xy must have shape (N, 2).")
+        return arr, None, None
+
+    if layer.get("lon") is not None and layer.get("lat") is not None:
+        lon = np.asarray(layer.get("lon"), dtype=float).ravel()
+        lat = np.asarray(layer.get("lat"), dtype=float).ravel()
+        if lon.size != lat.size:
+            raise ValueError("lon and lat must have the same number of elements.")
+        return np.column_stack([lon, lat]), "world", _normalize_frame_name(layer.get("frame"))
+
+    raise ValueError("marker/catalog layer requires coords=..., skycoord=..., xy=..., or lon=... and lat=... .")
+def _set_artist_label(artist: Any, label: Optional[str]) -> Any:
+    if label in (None, ""):
+        return artist
+    try:
+        artist.set_label(str(label))
+        return artist
+    except Exception:
+        pass
+    try:
+        artist.collections[0].set_label(str(label))
+    except Exception:
+        pass
+    return artist
+
+
+
+def _annotation_map_from_base(base_obj: Any) -> Optional[Map2D]:
+    if isinstance(base_obj, Map2D):
+        return base_obj
+    if isinstance(base_obj, RGBMap):
+        return Map2D(
+            data=np.asarray(np.nanmean(base_obj.rgb, axis=2), dtype=float),
+            header=_copy_header(base_obj.header),
+            wcs=base_obj.wcs,
+            unit=None,
+            meta=dict(base_obj.meta),
+        )
+    return None
+
+
+
+def _nice_length(value: float) -> float:
+    if not np.isfinite(value) or value <= 0:
+        return 1.0
+    exp = float(np.floor(np.log10(value)))
+    base = 10.0 ** exp
+    best = base
+    for mult in (1.0, 2.0, 5.0, 10.0):
+        cand = mult * base
+        if cand <= value:
+            best = cand
+        else:
+            break
+    return float(best)
+
+
+
+def _format_angular_label_arcsec(value_arcsec: float) -> str:
+    value_arcsec = float(value_arcsec)
+    if value_arcsec >= 3600.0 and abs(value_arcsec / 3600.0 - round(value_arcsec / 3600.0)) < 1e-6:
+        return f"{int(round(value_arcsec / 3600.0))}°"
+    if value_arcsec >= 60.0 and abs(value_arcsec / 60.0 - round(value_arcsec / 60.0)) < 1e-6:
+        return f"{int(round(value_arcsec / 60.0))}′"
+    if value_arcsec >= 60.0:
+        return f"{value_arcsec / 60.0:.2g}′"
+    if abs(value_arcsec - round(value_arcsec)) < 1e-6:
+        return f"{int(round(value_arcsec))}″"
+    return f"{value_arcsec:.2g}″"
+
+
+
+def _resolve_anchor_xy(shape: Tuple[int, int], *, width_pix: float, height_pix: float = 0.0, location: str = "lower right", margin_frac: float = 0.06) -> Tuple[float, float]:
+    ny, nx = shape
+    mx = margin_frac * nx
+    my = margin_frac * ny
+    loc = str(location).lower().replace("_", " ")
+    if "left" in loc:
+        x0 = mx
+    else:
+        x0 = nx - mx - width_pix
+    if "upper" in loc:
+        y0 = ny - my - max(height_pix, 1.0)
+    else:
+        y0 = my + max(height_pix, 1.0)
+    return float(x0), float(y0)
+
+
+
+def add_scalebar(ax: Any, map2d: Map2D, config: Optional[Union[bool, Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    cfg = {} if config in (None, True) else dict(config)
+    pix_arcsec = _pixel_scale_arcsec(map2d.wcs)
+    if not np.isfinite(pix_arcsec) or pix_arcsec <= 0:
+        raise ValueError("Could not determine a finite positive pixel scale for the scalebar.")
+
+    units = str(cfg.get("units", "arcsec")).lower()
+    length = cfg.get("length")
+    if length is None:
+        target_arcsec = 0.18 * map2d.data.shape[1] * pix_arcsec
+        length_arcsec = _nice_length(target_arcsec)
+    else:
+        if units in {"arcsec", "asec", "arcseconds"}:
+            length_arcsec = float(length)
+        elif units in {"arcmin", "amin", "arcminutes"}:
+            length_arcsec = float(length) * 60.0
+        elif units in {"deg", "degree", "degrees"}:
+            length_arcsec = float(length) * 3600.0
+        elif units in {"pix", "pixel", "pixels"}:
+            length_arcsec = float(length) * pix_arcsec
+        else:
+            raise ValueError(f"Unsupported scalebar units: {units}")
+
+    width_pix = float(length_arcsec / pix_arcsec)
+    x0, y0 = _resolve_anchor_xy(
+        map2d.data.shape,
+        width_pix=width_pix,
+        height_pix=0.10 * map2d.data.shape[0],
+        location=cfg.get("location", "lower right"),
+        margin_frac=float(cfg.get("margin_frac", 0.06)),
+    )
+    x1 = x0 + width_pix
+
+    line_kwargs = dict(cfg.get("line_style", {}))
+    line_kwargs.setdefault("color", cfg.get("color", "white"))
+    line_kwargs.setdefault("linewidth", cfg.get("linewidth", 2.0))
+    line_kwargs.setdefault("solid_capstyle", cfg.get("solid_capstyle", "butt"))
+    line = ax.plot([x0, x1], [y0, y0], **line_kwargs)[0]
+
+    label = cfg.get("label")
+    if label in (None, "auto"):
+        label = _format_angular_label_arcsec(length_arcsec)
+    text_kwargs = dict(cfg.get("text_style", {}))
+    text_kwargs.setdefault("color", cfg.get("color", "white"))
+    text_kwargs.setdefault("fontsize", cfg.get("fontsize", 9))
+    text_kwargs.setdefault("ha", "center")
+    text_kwargs.setdefault("va", cfg.get("text_va", "bottom"))
+    text_dy = float(cfg.get("text_dy", 0.015 * map2d.data.shape[0]))
+    text = ax.text(0.5 * (x0 + x1), y0 + text_dy, str(label), **text_kwargs)
+    return {"line": line, "text": text, "length_arcsec": float(length_arcsec)}
+
+
+
+def add_north_arrow(ax: Any, map2d: Map2D, config: Optional[Union[bool, Mapping[str, Any]]] = None) -> Dict[str, Any]:
+    cfg = {} if config in (None, True) else dict(config)
+    pix_arcsec = _pixel_scale_arcsec(map2d.wcs)
+    length = cfg.get("length")
+    units = str(cfg.get("units", "arcsec")).lower()
+    if length is None:
+        length_arcsec = _nice_length(0.12 * min(map2d.data.shape) * pix_arcsec)
+    else:
+        if units in {"arcsec", "asec", "arcseconds"}:
+            length_arcsec = float(length)
+        elif units in {"arcmin", "amin", "arcminutes"}:
+            length_arcsec = float(length) * 60.0
+        elif units in {"deg", "degree", "degrees"}:
+            length_arcsec = float(length) * 3600.0
+        elif units in {"pix", "pixel", "pixels"}:
+            length_arcsec = float(length) * pix_arcsec
+        else:
+            raise ValueError(f"Unsupported north_arrow units: {units}")
+
+    width_pix = float(length_arcsec / pix_arcsec)
+    x0, y0 = _resolve_anchor_xy(
+        map2d.data.shape,
+        width_pix=width_pix,
+        height_pix=width_pix,
+        location=cfg.get("location", "upper left"),
+        margin_frac=float(cfg.get("margin_frac", 0.06)),
+    )
+
+    world0 = map2d.wcs.pixel_to_world(float(x0), float(y0))
+    if not isinstance(world0, SkyCoord):
+        raise TypeError("north_arrow requires a celestial WCS that converts pixels to SkyCoord.")
+
+    sep = float(length_arcsec) * u.arcsec
+    wn = world0.directional_offset_by(0.0 * u.deg, sep)
+    we = world0.directional_offset_by(90.0 * u.deg, sep)
+    xn, yn = map2d.wcs.world_to_pixel(wn)
+    xe, ye = map2d.wcs.world_to_pixel(we)
+
+    arrowprops = dict(cfg.get("arrowprops", {}))
+    arrowprops.setdefault("color", cfg.get("color", "white"))
+    arrowprops.setdefault("lw", cfg.get("linewidth", 1.5))
+    arrowprops.setdefault("arrowstyle", cfg.get("arrowstyle", "-|>"))
+
+    ann_n = ax.annotate("", xy=(xn, yn), xytext=(x0, y0), arrowprops=arrowprops)
+    ann_e = ax.annotate("", xy=(xe, ye), xytext=(x0, y0), arrowprops=arrowprops)
+
+    text_kwargs = dict(cfg.get("text_style", {}))
+    text_kwargs.setdefault("color", cfg.get("color", "white"))
+    text_kwargs.setdefault("fontsize", cfg.get("fontsize", 9))
+    txt_n = ax.text(float(xn), float(yn), str(cfg.get("north_label", "N")), ha="center", va="bottom", **text_kwargs)
+    txt_e = ax.text(float(xe), float(ye), str(cfg.get("east_label", "E")), ha="left", va="center", **text_kwargs)
+    return {"north_arrow": ann_n, "east_arrow": ann_e, "north_text": txt_n, "east_text": txt_e, "length_arcsec": float(length_arcsec)}
+
+
+
+def _scatter_points(ax: Any, base_wcs: WCS, layer: Mapping[str, Any]) -> Any:
+    kwargs = dict(layer.get("style", {}))
+    kwargs.setdefault("s", layer.get("s", 40))
+    kwargs.setdefault("marker", layer.get("marker", "+"))
+    kwargs.setdefault("color", layer.get("color", "white"))
+    kwargs.setdefault("linewidths", layer.get("linewidths", 1.0))
+
+    arr, is_world = _layer_plot_positions(layer, base_wcs)
+    if is_world:
+        artist = ax.scatter(arr[:, 0], arr[:, 1], transform=_world_transform_for(ax, base_wcs), **kwargs)
+    else:
+        artist = ax.scatter(arr[:, 0], arr[:, 1], **kwargs)
+    return _set_artist_label(artist, layer.get("label"))
+
+
+
+def _scatter_catalog(ax: Any, base_wcs: WCS, layer: Mapping[str, Any]) -> Dict[str, Any]:
+    marker_artist = _scatter_points(ax, base_wcs, layer)
+    arr, is_world = _layer_plot_positions(layer, base_wcs)
+    labels = _extract_catalog_labels(layer, npos=arr.shape[0])
+    text_artists: List[Any] = []
+    if labels is not None:
+        text_kwargs = dict(layer.get("text_style", {}))
+        text_kwargs.setdefault("color", layer.get("text_color", layer.get("color", "white")))
+        text_kwargs.setdefault("fontsize", layer.get("fontsize", 9))
+        text_kwargs.setdefault("ha", layer.get("ha", "left"))
+        text_kwargs.setdefault("va", layer.get("va", "bottom"))
+        dx = float(layer.get("label_dx", 6.0))
+        dy = float(layer.get("label_dy", 4.0))
+        offset_mode = str(layer.get("label_offset_mode", "pixel")).lower()
+        for (x, y), label in zip(arr, labels):
+            if label in (None, ""):
+                continue
+            if offset_mode == "world":
+                if is_world:
+                    art = ax.text(x + dx, y + dy, str(label), transform=_world_transform_for(ax, base_wcs), **text_kwargs)
+                else:
+                    art = ax.text(x + dx, y + dy, str(label), **text_kwargs)
+            else:
+                ann_kwargs = dict(text_kwargs)
+                if is_world:
+                    art = ax.annotate(
+                        str(label),
+                        xy=(x, y),
+                        xycoords=_world_transform_for(ax, base_wcs),
+                        xytext=(dx, dy),
+                        textcoords="offset pixels",
+                        **ann_kwargs,
+                    )
+                else:
+                    art = ax.annotate(
+                        str(label),
+                        xy=(x, y),
+                        xytext=(dx, dy),
+                        textcoords="offset pixels",
+                        **ann_kwargs,
+                    )
+            text_artists.append(art)
+    return {"marker": marker_artist, "texts": text_artists}
+
+
+
+def _add_text_artist(ax: Any, base_wcs: WCS, layer: Mapping[str, Any]) -> Any:
+    kwargs = dict(layer.get("style", {}))
+    kwargs.setdefault("color", layer.get("color", "white"))
+    kwargs.setdefault("fontsize", layer.get("fontsize", 10))
+    kwargs.setdefault("ha", layer.get("ha", "left"))
+    kwargs.setdefault("va", layer.get("va", "bottom"))
+    text = str(layer.get("text", ""))
+
+    if layer.get("coord") is not None:
+        arr = np.asarray(layer.get("coord"), dtype=float).ravel()
+        if arr.size != 2:
+            raise ValueError("text coord must contain exactly two world-coordinate values.")
+        xy = _world_array_to_base_lonlat(
+            arr.reshape(1, 2),
+            base_wcs=base_wcs,
+            frame_name=_normalize_frame_name(layer.get("frame")),
+            coord_unit=layer.get("coord_unit", "deg"),
+        )[0]
+        return ax.text(float(xy[0]), float(xy[1]), text, transform=_world_transform_for(ax, base_wcs), **kwargs)
+    if layer.get("skycoord") is not None:
+        sc = layer.get("skycoord")
+        if not isinstance(sc, SkyCoord):
+            raise TypeError("skycoord must be an astropy.coordinates.SkyCoord instance.")
+        xy = _skycoord_to_base_lonlat(sc, base_wcs)[0]
+        return ax.text(float(xy[0]), float(xy[1]), text, transform=_world_transform_for(ax, base_wcs), **kwargs)
+    if layer.get("xy") is not None:
+        x, y = layer.get("xy")
+        return ax.text(x, y, text, **kwargs)
+    raise ValueError("text layer requires coord=..., skycoord=..., or xy=... .")
+def _reproject_map2d_to(overlay: Map2D, *, target_wcs: WCS, target_shape: Tuple[int, int]) -> Map2D:
+    try:
+        from reproject import reproject_interp  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "Image reprojection requested, but the optional 'reproject' package is not available."
+        ) from exc
+
+    array, _ = reproject_interp((np.asarray(overlay.data, dtype=float), overlay.wcs), target_wcs, shape_out=target_shape)
+    hdr = _copy_header(overlay.header)
+    hdr.update(target_wcs.to_header())
+    return Map2D(data=np.asarray(array, dtype=float), header=hdr, wcs=target_wcs.celestial, unit=overlay.unit, meta=dict(overlay.meta, reprojected=True))
+
+
+# Compare only core celestial header keys for a cheap same-grid check.
+def _same_celestial_wcs_and_shape(a: Map2D, target_wcs: WCS, target_shape: Tuple[int, int]) -> bool:
+    if tuple(a.data.shape) != tuple(target_shape):
+        return False
+    try:
+        ah = a.wcs.celestial.to_header()
+        bh = target_wcs.celestial.to_header()
+        keys = ("CTYPE1", "CTYPE2", "CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CDELT1", "CDELT2", "CUNIT1", "CUNIT2")
+        return all(str(ah.get(k)) == str(bh.get(k)) for k in keys)
+    except Exception:
+        return False
+
+
+def _add_image_overlay(ax: Any, layer: Mapping[str, Any], *, target_wcs: Optional[WCS] = None, target_shape: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:
+    overlay = _layer_to_map2d(layer, default_mode="identity")
+    reproject_mode = str(layer.get("reproject", "never")).lower()
+    if reproject_mode not in {"never", "auto", "required"}:
+        raise ValueError("image overlay reproject must be one of: never, auto, required")
+
+    if target_wcs is not None and target_shape is not None and reproject_mode != "never":
+        if not _same_celestial_wcs_and_shape(overlay, target_wcs, target_shape):
+            try:
+                overlay = _reproject_map2d_to(overlay, target_wcs=target_wcs, target_shape=target_shape)
+            except Exception as exc:
+                if reproject_mode == "required":
+                    raise
+                warnings.warn(f"Image overlay reprojection was skipped: {exc}", RuntimeWarning)
+
+    norm = layer.get("norm")
+    if norm is None:
+        norm = build_normalize(
+            overlay.data,
+            mode=layer.get("norm_mode", "asinh"),
+            percentile=layer.get("norm_percentile", (1.0, 99.5)),
+            cmin=layer.get("cmin"),
+            cmax=layer.get("cmax"),
+            stretch_a=layer.get("stretch_a", 0.1),
+            power_gamma=layer.get("power_gamma", 1.0),
+        )
+    artist = ax.imshow(
+        overlay.data,
+        origin=layer.get("origin", "lower"),
+        cmap=layer.get("cmap", "magma"),
+        norm=norm,
+        alpha=layer.get("alpha", 0.5),
+        interpolation=layer.get("interpolation", "nearest"),
+        transform=ax.get_transform(overlay.wcs),
+        zorder=layer.get("zorder"),
+    )
+    _set_artist_label(artist, layer.get("label"))
+    return {"artist": artist, "map2d": overlay}
+
+
+def _prepare_contour_layer(layer: Mapping[str, Any]) -> Dict[str, Any]:
+    contour = dict(layer)
+    contour.pop("kind", None)
+    return contour
+
+
+
+# -----------------------------------------------------------------------------
 # Plotting
 # -----------------------------------------------------------------------------
 
@@ -1360,6 +2418,150 @@ def _auto_contour_levels(data: np.ndarray) -> np.ndarray:
         return vmax * np.array([0.1, 0.3, 0.5, 0.7, 0.9])
     vmin = float(np.nanmin(finite))
     return np.linspace(vmin, vmax, 5)
+
+
+def estimate_rms_robust(data: np.ndarray, *, finite_only: bool = True) -> float:
+    """Estimate a robust RMS using MAD.
+
+    The estimate is intended for contour-level defaults, not for precision
+    noise analysis. NaN/Inf values are ignored by default.
+    """
+    arr = np.asarray(data, dtype=float)
+    if finite_only:
+        arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    med = float(np.nanmedian(arr))
+    mad = float(np.nanmedian(np.abs(arr - med)))
+    if not np.isfinite(mad) or mad == 0.0:
+        std = float(np.nanstd(arr))
+        return std if np.isfinite(std) else float("nan")
+    return 1.4826 * mad
+
+
+def compute_contour_levels(
+    data: np.ndarray,
+    *,
+    levels: Optional[Any] = None,
+    level_mode: str = "auto",
+    rms: Optional[float] = None,
+    sigma_levels: Optional[Sequence[float]] = None,
+    negative_sigma_levels: Optional[Sequence[float]] = None,
+    fraction_levels: Optional[Sequence[float]] = None,
+    level_scale: float = 1.0,
+    sigma_scale: float = 1.0,
+    symmetric: bool = False,
+) -> np.ndarray:
+    """Compute contour levels for auto, fraction, manual, or RMS-based modes.
+
+    Parameters
+    ----------
+    levels
+        Explicit contour factors or explicit contour values, depending on
+        ``level_mode``. In ``'manual'``/``'explicit'`` mode, the returned levels
+        are ``level_scale * levels``. In the other modes, a numeric ``levels``
+        input is interpreted as already-final contour values and returned as-is
+        for backward compatibility.
+    level_mode
+        One of ``'auto'``, ``'fraction'``, ``'manual'``, ``'explicit'``,
+        ``'rms'``, or ``'sigma'``. ``'auto'`` intentionally follows the legacy
+        behaviour and means legacy automatic fractional levels based on the
+        positive peak. ``'sigma'`` is accepted as an alias of ``'rms'`` for
+        backward compatibility.
+    rms
+        Noise estimate to use for RMS-based contour levels. If omitted in
+        ``'rms'``/``'sigma'`` mode, a robust MAD-based estimate is derived from
+        the 2D contour image as a convenience fallback. This is not intended to
+        replace physically motivated error propagation from 3D cubes.
+    sigma_levels
+        Multipliers for RMS-based contour levels. Default is ``[3, 5, 7]``.
+        Combined with ``sigma_scale`` so that, for example,
+        ``sigma_levels=[1,2,3,4], sigma_scale=3`` yields ``3,6,9,12 × rms``.
+    negative_sigma_levels
+        Optional negative RMS multipliers. If omitted and ``symmetric=True``,
+        mirrored negative levels are generated from the positive RMS levels.
+    fraction_levels
+        Fractions of the positive peak for fractional levels. Default is
+        ``[0.1, 0.3, 0.5, 0.7, 0.9]``.
+    level_scale
+        Multiplicative scale used in ``'manual'``/``'explicit'`` mode.
+        For example, ``levels=[1,2,3,4], level_scale=3`` yields ``[3,6,9,12]``.
+    sigma_scale
+        Extra multiplicative factor applied before ``sigma_levels`` in
+        ``'rms'``/``'sigma'`` mode. For example,
+        ``rms=0.8, sigma_levels=[1,2,3,4], sigma_scale=3`` yields
+        ``[2.4, 4.8, 7.2, 9.6]``.
+    symmetric
+        If True, include negative mirrored levels in fraction or RMS-based
+        modes.
+    """
+    level_mode = str(level_mode).lower()
+    if level_mode == 'sigma':
+        level_mode = 'rms'
+    if level_mode == 'explicit':
+        level_mode = 'manual'
+
+    arr_levels = None
+    if levels is not None and not (isinstance(levels, str) and levels.lower() == 'auto'):
+        arr_levels = np.asarray(levels, dtype=float).ravel()
+        arr_levels = arr_levels[np.isfinite(arr_levels)]
+        if arr_levels.size == 0:
+            raise ValueError('Explicit contour levels contain no finite values.')
+        if level_mode == 'manual':
+            arr = float(level_scale) * arr_levels
+            return np.unique(np.sort(arr))
+        # Backward compatibility: if explicit numeric levels are provided while
+        # using a non-manual mode, interpret them as already-final contour
+        # values and return them unchanged.
+        return np.unique(np.sort(arr_levels))
+
+    finite = np.asarray(data, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return np.array([0.0])
+
+    if sigma_levels is None:
+        sigma_levels = [3.0, 5.0, 7.0]
+    if fraction_levels is None:
+        fraction_levels = [0.1, 0.3, 0.5, 0.7, 0.9]
+
+    def _fraction_based() -> np.ndarray:
+        vmax = float(np.nanmax(finite))
+        if vmax > 0:
+            pos = vmax * np.asarray(fraction_levels, dtype=float)
+            if symmetric:
+                return np.unique(np.sort(np.concatenate([-pos[::-1], pos])))
+            return np.unique(np.sort(pos))
+        vmin = float(np.nanmin(finite))
+        return np.linspace(vmin, vmax, 5)
+
+    def _rms_based() -> np.ndarray:
+        local_rms = float(rms) if rms is not None else estimate_rms_robust(finite)
+        if not np.isfinite(local_rms) or local_rms <= 0:
+            raise ValueError('Could not determine a positive finite RMS for RMS contour levels.')
+        base = local_rms * float(sigma_scale)
+        pos = base * np.asarray(sigma_levels, dtype=float)
+        neg = np.array([], dtype=float)
+        if negative_sigma_levels is not None:
+            neg = -base * np.asarray(negative_sigma_levels, dtype=float)
+        elif symmetric:
+            neg = -pos[::-1]
+        arr = np.concatenate([neg, pos]) if neg.size else pos
+        arr = arr[np.isfinite(arr)]
+        arr = arr[arr != 0]
+        if arr.size == 0:
+            raise ValueError('RMS contour levels collapsed to an empty set.')
+        return np.unique(np.sort(arr))
+
+    if level_mode == 'manual':
+        raise ValueError("level_mode='manual' requires explicit numeric 'levels'.")
+    if level_mode == 'fraction':
+        return _fraction_based()
+    if level_mode == 'rms':
+        return _rms_based()
+    if level_mode == 'auto':
+        return _auto_contour_levels(np.asarray(data, dtype=float))
+    raise ValueError(f'Unsupported contour level_mode: {level_mode}')
 
 
 
@@ -1385,6 +2587,7 @@ def add_contours(
 
     for layer in contours:
         layer = dict(layer)
+        already_smoothed = False
         if base_map is not None and not any(k in layer for k in ("source", "data", "header")):
             cmap = base_map
         else:
@@ -1422,6 +2625,10 @@ def add_contours(
                     basesup_ext=layer.get("basesup_ext", "BASESUP3D"),
                     final_mask_ext=layer.get("final_mask_ext", "MASK3D"),
                 )
+                already_smoothed = (
+                    layer.get("smooth_fwhm_arcsec") is not None
+                    or layer.get("target_hpbw_arcsec") is not None
+                )
             else:
                 cmap = resolve_map_input(
                     source=layer.get("source"),
@@ -1430,8 +2637,13 @@ def add_contours(
                     ext=layer.get("ext"),
                 )
 
+        if layer.get("crop"):
+            cmap = crop_map2d(cmap, **dict(layer.get("crop")))
+
         cdata = np.asarray(cmap.data, dtype=float)
-        if layer.get("smooth_fwhm_arcsec") is not None or layer.get("target_hpbw_arcsec") is not None:
+        if (not already_smoothed) and (
+            layer.get("smooth_fwhm_arcsec") is not None or layer.get("target_hpbw_arcsec") is not None
+        ):
             orig_hpbw, _ = _infer_orig_hpbw_arcsec(cmap.header)
             cdata = apply_gaussian_smoothing_2d(
                 cdata,
@@ -1441,9 +2653,18 @@ def add_contours(
                 orig_hpbw_arcsec=layer.get("orig_hpbw_arcsec") or orig_hpbw,
             )
 
-        levels = layer.get("levels", "auto")
-        if isinstance(levels, str) and levels.lower() == "auto":
-            levels = _auto_contour_levels(cdata)
+        levels = compute_contour_levels(
+            cdata,
+            levels=layer.get("levels", "auto"),
+            level_mode=layer.get("level_mode", "auto"),
+            rms=layer.get("rms"),
+            sigma_levels=layer.get("sigma_levels"),
+            negative_sigma_levels=layer.get("negative_sigma_levels"),
+            fraction_levels=layer.get("fraction_levels"),
+            level_scale=layer.get("level_scale", 1.0),
+            sigma_scale=layer.get("sigma_scale", 1.0),
+            symmetric=layer.get("symmetric", False),
+        )
 
         artist = ax.contour(
             cdata,
@@ -1462,6 +2683,30 @@ def add_contours(
                 pass
         artists.append(artist)
     return artists
+
+
+
+def _add_legend(ax: Any, legend: Union[bool, Mapping[str, Any]]) -> Optional[Any]:
+    if not legend:
+        return None
+    kwargs = dict(legend) if isinstance(legend, Mapping) else {}
+    handles, labels = ax.get_legend_handles_labels()
+    unique_h: List[Any] = []
+    unique_l: List[str] = []
+    seen = set()
+    for handle, label in zip(handles, labels):
+        if label in (None, "") or str(label).startswith("_"):
+            continue
+        label_str = str(label)
+        if label_str in seen:
+            continue
+        seen.add(label_str)
+        unique_h.append(handle)
+        unique_l.append(label_str)
+    if not unique_h:
+        return None
+    kwargs.setdefault("loc", "best")
+    return ax.legend(unique_h, unique_l, **kwargs)
 
 
 
@@ -1488,20 +2733,30 @@ def plot_map(
     contours: Optional[Sequence[Mapping[str, Any]]] = None,
     grid: bool = True,
     beam: Optional[Union[str, Mapping[str, Any]]] = None,
+    scalebar: Optional[Union[bool, Mapping[str, Any]]] = None,
+    north_arrow: Optional[Union[bool, Mapping[str, Any]]] = None,
+    legend: Union[bool, Mapping[str, Any]] = False,
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
+    crop: Optional[Mapping[str, Any]] = None,
+    show_readout: bool = True,
+    describe: bool = False,
+    save: Optional[Union[str, Path]] = None,
+    save_dpi: int = 250,
+    save_transparent: bool = False,
     show: bool = True,
     figsize: Tuple[float, float] = (10, 8),
+    interpolation: str = "nearest",
+    alpha: float = 1.0,
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """Plot a 2D map on WCSAxes with optional contours.
+    """Plot a 2D map on WCSAxes with optional contours and convenience helpers.
 
     ``cmin`` / ``cmax`` set the display color-scale limits.
     Deprecated aliases ``vmin`` / ``vmax`` are still accepted for backward compatibility.
     """
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Ellipse
 
     if vmin is not None or vmax is not None:
         warnings.warn(
@@ -1515,6 +2770,8 @@ def plot_map(
             cmax = vmax
 
     map2d = resolve_map_input(source=source, data=data, header=header, ext=ext)
+    if crop:
+        map2d = crop_map2d(map2d, **dict(crop))
     proj = projection or map2d.wcs
 
     created_fig = False
@@ -1548,7 +2805,15 @@ def plot_map(
     else:
         normalize_info["mode"] = "external_norm"
 
-    im = ax.imshow(map2d.data, origin=origin, cmap=cmap, norm=norm, transform=ax.get_transform(map2d.wcs))
+    im = ax.imshow(
+        map2d.data,
+        origin=origin,
+        cmap=cmap,
+        norm=norm,
+        interpolation=interpolation,
+        alpha=alpha,
+        transform=ax.get_transform(map2d.wcs),
+    )
 
     cbar = None
     if colorbar:
@@ -1572,56 +2837,25 @@ def plot_map(
 
     beam_artist = None
     if beam is not None:
-        beam_cfg: Dict[str, Any]
-        if isinstance(beam, str) and beam.lower() in {"header", "auto"}:
-            smooth_info = map2d.meta.get("smooth_info", {}) if isinstance(map2d.meta, dict) else {}
-            eff_hpbw = smooth_info.get("effective_hpbw_arcsec")
-            if eff_hpbw is not None:
-                beam_cfg = {"major": float(eff_hpbw), "minor": float(eff_hpbw), "angle": 0.0, "units": "arcsec"}
-            else:
-                bmaj = map2d.header.get("BMAJ")
-                bmin = map2d.header.get("BMIN", bmaj)
-                bpa = map2d.header.get("BPA", 0.0)
-                if bmaj is not None:
-                    beam_cfg = {"major": float(bmaj), "minor": float(bmin), "angle": float(bpa), "units": "deg"}
-                else:
-                    beam_cfg = {}
-        else:
-            beam_cfg = dict(beam)
+        beam_artist = _add_beam_artist(ax, map2d, beam)
 
-        if beam_cfg:
-            pix_arcsec = _pixel_scale_arcsec(map2d.wcs)
-            major = beam_cfg.get("major")
-            minor = beam_cfg.get("minor", major)
-            angle = beam_cfg.get("angle", 0.0)
-            units = str(beam_cfg.get("units", "arcsec")).lower()
-            if major is not None:
-                if units in {"arcsec", "asec", "arcseconds"}:
-                    major_pix = float(major) / pix_arcsec
-                    minor_pix = float(minor) / pix_arcsec
-                elif units in {"deg", "degree", "degrees"}:
-                    major_pix = float(major) * 3600.0 / pix_arcsec
-                    minor_pix = float(minor) * 3600.0 / pix_arcsec
-                elif units in {"pix", "pixel", "pixels"}:
-                    major_pix = float(major)
-                    minor_pix = float(minor)
-                else:
-                    raise ValueError(f"Unsupported beam units: {units}")
+    scalebar_artists = None
+    if scalebar:
+        scalebar_artists = add_scalebar(ax, map2d, scalebar)
 
-                ny, nx = map2d.data.shape
-                x0 = beam_cfg.get("x", 0.12 * nx)
-                y0 = beam_cfg.get("y", 0.12 * ny)
-                beam_artist = Ellipse(
-                    (x0, y0),
-                    width=major_pix,
-                    height=minor_pix,
-                    angle=angle,
-                    facecolor=beam_cfg.get("facecolor", "none"),
-                    edgecolor=beam_cfg.get("edgecolor", "white"),
-                    linewidth=beam_cfg.get("linewidth", 1.2),
-                    alpha=beam_cfg.get("alpha", 0.9),
-                )
-                ax.add_patch(beam_artist)
+    north_arrow_artists = None
+    if north_arrow:
+        north_arrow_artists = add_north_arrow(ax, map2d, north_arrow)
+
+    if show_readout:
+        _apply_readout_formatter(ax, map2d)
+
+    if describe:
+        print(describe_map2d(map2d))
+
+    legend_artist = _add_legend(ax, legend)
+
+    _save_figure(fig, save, dpi=save_dpi, transparent=save_transparent)
 
     if show and created_fig:
         plt.show()
@@ -1636,6 +2870,10 @@ def plot_map(
         "colorbar": cbar,
         "contours": contour_artists,
         "beam": beam_artist,
+        "scalebar": scalebar_artists,
+        "north_arrow": north_arrow_artists,
+        "legend": legend_artist,
+        "description": describe_map2d(map2d),
         "map2d": Map2D(data=map2d.data, header=map2d.header, wcs=map2d.wcs, unit=map2d.unit, meta=out_meta),
     }
 
@@ -1739,6 +2977,15 @@ def plot_rgb(
     grid: bool = True,
     xlabel: Optional[str] = None,
     ylabel: Optional[str] = None,
+    crop: Optional[Mapping[str, Any]] = None,
+    show_readout: bool = False,
+    scalebar: Optional[Union[bool, Mapping[str, Any]]] = None,
+    north_arrow: Optional[Union[bool, Mapping[str, Any]]] = None,
+    legend: Union[bool, Mapping[str, Any]] = False,
+    describe: bool = False,
+    save: Optional[Union[str, Path]] = None,
+    save_dpi: int = 250,
+    save_transparent: bool = False,
     show: bool = True,
     figsize: Tuple[float, float] = (10, 8),
     **rgb_kwargs: Any,
@@ -1748,6 +2995,24 @@ def plot_rgb(
 
     if rgb_source is None:
         rgb_source = make_rgb_map(red, green, blue, **rgb_kwargs)
+
+    if crop:
+        # Apply an identical celestial cutout to each channel.
+        chans = []
+        cc: Optional[Map2D] = None
+        for i in range(3):
+            cm = Map2D(
+                data=np.asarray(rgb_source.rgb[..., i], dtype=float),
+                header=rgb_source.header,
+                wcs=rgb_source.wcs,
+                unit=None,
+                meta=dict(rgb_source.meta),
+            )
+            cc = crop_map2d(cm, **dict(crop))
+            chans.append(np.asarray(cc.data, dtype=float))
+        if cc is None:
+            raise RuntimeError("RGB crop requested, but no channels were processed.")
+        rgb_source = RGBMap(rgb=np.dstack(chans), header=cc.header, wcs=cc.wcs, meta=dict(rgb_source.meta))
 
     created_fig = False
     if ax is None:
@@ -1767,10 +3032,304 @@ def plot_rgb(
     if title is not None:
         ax.set_title(title)
 
+    tmp = Map2D(data=np.asarray(np.nanmean(rgb_source.rgb, axis=2), dtype=float), header=rgb_source.header, wcs=rgb_source.wcs, unit=None, meta=dict(rgb_source.meta))
+
+    if scalebar:
+        add_scalebar(ax, tmp, scalebar)
+    if north_arrow:
+        add_north_arrow(ax, tmp, north_arrow)
+
+    if show_readout:
+        _apply_readout_formatter(ax, tmp)
+
+    desc = f"RGB map\nshape: {rgb_source.rgb.shape[1]} x {rgb_source.rgb.shape[0]} pixels\ncoord_system: {_infer_native_coord_system(rgb_source.wcs)}"
+    if describe:
+        print(desc)
+
+    legend_artist = _add_legend(ax, legend)
+
+    _save_figure(fig, save, dpi=save_dpi, transparent=save_transparent)
+
     if show and created_fig:
         plt.show()
 
-    return {"fig": fig, "ax": ax, "image": im, "rgb": rgb_source}
+    return {"fig": fig, "ax": ax, "image": im, "rgb": rgb_source, "legend": legend_artist, "description": desc}
+
+
+def plot_scene(
+    base: Any,
+    *,
+    overlays: Optional[Sequence[Any]] = None,
+    ax: Optional[Any] = None,
+    title: Optional[str] = None,
+    grid: bool = True,
+    xlabel: Optional[str] = None,
+    ylabel: Optional[str] = None,
+    colorbar: bool = True,
+    show_readout: bool = True,
+    describe: bool = False,
+    save: Optional[Union[str, Path]] = None,
+    save_dpi: int = 250,
+    save_transparent: bool = False,
+    show: bool = True,
+    figsize: Tuple[float, float] = (10, 8),
+    legend: Union[bool, Mapping[str, Any]] = False,
+    crop: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
+    """High-level plotting API with one base layer and optional overlays.
+
+    Parameters
+    ----------
+    base : source or mapping
+        Base layer specification. Supported base kinds are ``image`` and ``rgb``.
+        Bare sources are interpreted as ``{'kind': 'image', 'source': source}``.
+    overlays : sequence
+        Optional layer specifications. Supported kinds in this implementation:
+        ``image``, ``contour``, ``marker``, ``catalog``, ``text``, ``beam``,
+        ``scalebar``, and ``north_arrow``.
+    """
+    overlays = list(overlays or [])
+    scene_created_fig = ax is None
+    base_layer = _resolve_base_spec(base)
+    kind = str(base_layer.get("kind", "image")).lower()
+
+    if kind == "rgb":
+        result = plot_rgb(
+            rgb_source=base_layer.get("rgb_source"),
+            red=base_layer.get("red"),
+            green=base_layer.get("green"),
+            blue=base_layer.get("blue"),
+            ax=ax,
+            title=title or base_layer.get("title"),
+            grid=grid if base_layer.get("grid") is None else base_layer.get("grid"),
+            xlabel=xlabel or base_layer.get("xlabel"),
+            ylabel=ylabel or base_layer.get("ylabel"),
+            crop=crop or base_layer.get("crop"),
+            show_readout=show_readout,
+            describe=describe or base_layer.get("describe", False),
+            save=None,
+            show=False,
+            figsize=figsize,
+            scalebar=base_layer.get("scalebar"),
+            north_arrow=base_layer.get("north_arrow"),
+            legend=False,
+            red_norm=base_layer.get("red_norm"),
+            green_norm=base_layer.get("green_norm"),
+            blue_norm=base_layer.get("blue_norm"),
+        )
+        fig = result["fig"]
+        ax = result["ax"]
+        base_wcs = result["rgb"].wcs
+        base_description = result["description"]
+        base_obj = result["rgb"]
+    else:
+        base_map = _layer_to_map2d(base_layer, default_mode=base_layer.get("mode", "identity") or "identity")
+        result = plot_map(
+            base_map,
+            ax=ax,
+            projection=base_layer.get("projection"),
+            cmap=base_layer.get("cmap", "viridis"),
+            norm=base_layer.get("norm"),
+            norm_mode=base_layer.get("norm_mode", "asinh"),
+            norm_percentile=base_layer.get("norm_percentile"),
+            cmin=base_layer.get("cmin"),
+            cmax=base_layer.get("cmax"),
+            stretch_a=base_layer.get("stretch_a", 0.1),
+            power_gamma=base_layer.get("power_gamma", 1.0),
+            colorbar=colorbar if base_layer.get("colorbar") is None else base_layer.get("colorbar"),
+            colorbar_label=base_layer.get("colorbar_label"),
+            title=title or base_layer.get("title"),
+            origin=base_layer.get("origin", "lower"),
+            contours=None,
+            grid=grid if base_layer.get("grid") is None else base_layer.get("grid"),
+            beam=base_layer.get("beam"),
+            xlabel=xlabel or base_layer.get("xlabel"),
+            ylabel=ylabel or base_layer.get("ylabel"),
+            crop=crop or base_layer.get("crop"),
+            show_readout=show_readout,
+            describe=describe or base_layer.get("describe", False),
+            save=None,
+            show=False,
+            figsize=figsize,
+            interpolation=base_layer.get("interpolation", "nearest"),
+            alpha=base_layer.get("alpha", 1.0),
+            scalebar=base_layer.get("scalebar"),
+            north_arrow=base_layer.get("north_arrow"),
+            legend=False,
+        )
+        fig = result["fig"]
+        ax = result["ax"]
+        base_wcs = result["map2d"].wcs
+        base_description = result["description"]
+        base_obj = result["map2d"]
+
+    contour_specs: List[Dict[str, Any]] = []
+    overlay_artists: List[Any] = []
+    overlay_maps: List[Map2D] = []
+    beam_artists: List[Any] = []
+    base_shape: Optional[Tuple[int, int]] = None
+    if isinstance(base_obj, Map2D):
+        base_shape = tuple(base_obj.data.shape)
+    elif isinstance(base_obj, RGBMap):
+        base_shape = tuple(base_obj.rgb.shape[:2])
+
+    for overlay in overlays:
+        layer = _layer_dict(overlay)
+        layer_kind = str(layer.get("kind", "contour")).lower()
+        if layer_kind == "contour":
+            contour_specs.append(_prepare_contour_layer(layer))
+        elif layer_kind == "image":
+            info = _add_image_overlay(ax, layer, target_wcs=base_wcs, target_shape=base_shape)
+            overlay_artists.append(info["artist"])
+            overlay_maps.append(info["map2d"])
+        elif layer_kind == "marker":
+            overlay_artists.append(_scatter_points(ax, base_wcs, layer))
+        elif layer_kind == "catalog":
+            info = _scatter_catalog(ax, base_wcs, layer)
+            overlay_artists.append(info["marker"])
+            overlay_artists.extend(info["texts"])
+        elif layer_kind == "text":
+            overlay_artists.append(_add_text_artist(ax, base_wcs, layer))
+        elif layer_kind == "beam":
+            beam_cfg = layer.get("beam", layer.get("config", "auto"))
+            ann_map = _annotation_map_from_base(base_obj)
+            if ann_map is not None:
+                art = _add_beam_artist(ax, ann_map, beam_cfg)
+                if art is not None:
+                    _set_artist_label(art, layer.get("label"))
+                    beam_artists.append(art)
+            else:
+                warnings.warn("beam overlay was requested, but the current base has no beam-compatible WCS image.", RuntimeWarning)
+        elif layer_kind == "scalebar":
+            ann_map = _annotation_map_from_base(base_obj)
+            if ann_map is not None:
+                overlay_artists.append(add_scalebar(ax, ann_map, layer.get("config", layer)))
+        elif layer_kind in {"north_arrow", "compass"}:
+            ann_map = _annotation_map_from_base(base_obj)
+            if ann_map is not None:
+                overlay_artists.append(add_north_arrow(ax, ann_map, layer.get("config", layer)))
+        else:
+            raise ValueError(f"Unsupported overlay kind: {layer_kind}")
+
+    contour_artists: List[Any] = []
+    if contour_specs:
+        contour_artists = add_contours(ax, contour_specs, base_map=base_obj if isinstance(base_obj, Map2D) else None)
+
+    legend_artist = _add_legend(ax, legend)
+
+    _save_figure(fig, save, dpi=save_dpi, transparent=save_transparent)
+
+    if show and scene_created_fig:
+        import matplotlib.pyplot as plt
+        plt.show()
+
+    return {
+        "fig": fig,
+        "ax": ax,
+        "base": base_obj,
+        "base_description": base_description,
+        "overlay_artists": overlay_artists,
+        "overlay_maps": overlay_maps,
+        "contours": contour_artists,
+        "beam_artists": beam_artists,
+        "legend": legend_artist,
+    }
+
+
+def quicklook(
+    source: Any,
+    *,
+    ext: Optional[Union[int, str]] = None,
+    mode: str = "moment0",
+    chan_range: Optional[Tuple[int, int]] = None,
+    vel_range: Optional[Tuple[float, float]] = None,
+    spectral_unit: Union[str, u.UnitBase] = "km/s",
+    smooth_fwhm_arcsec: Optional[float] = None,
+    target_hpbw_arcsec: Optional[float] = None,
+    orig_hpbw_arcsec: Optional[float] = None,
+    cmap: str = "viridis",
+    norm_mode: str = "asinh",
+    norm_percentile: Optional[Tuple[float, float]] = (1.0, 99.5),
+    cmin: Optional[float] = None,
+    cmax: Optional[float] = None,
+    contours: Optional[Sequence[Mapping[str, Any]]] = None,
+    title: Optional[str] = None,
+    grid: bool = True,
+    beam: Optional[Union[str, Mapping[str, Any]]] = None,
+    crop: Optional[Mapping[str, Any]] = None,
+    describe: bool = False,
+    help: bool = False,
+    save: Optional[Union[str, Path]] = None,
+    save_dpi: int = 250,
+    save_transparent: bool = False,
+    show_readout: bool = True,
+    show: bool = True,
+    figsize: Tuple[float, float] = (10, 8),
+) -> Dict[str, Any]:
+    """Quick entry point for plotting one source with minimal required options.
+
+    Parameters are intentionally biased toward the most common single-panel use case.
+    ``contours`` is accepted as a convenience shortcut and is forwarded as contour
+    overlays on top of the same base source unless the contour spec explicitly
+    overrides ``source`` / reduction parameters.
+    """
+    if help:
+        print_plotting_help()
+
+    base = {
+        "kind": "image",
+        "source": source,
+        "ext": ext,
+        "mode": mode,
+        "chan_range": chan_range,
+        "vel_range": vel_range,
+        "spectral_unit": spectral_unit,
+        "smooth_fwhm_arcsec": smooth_fwhm_arcsec,
+        "target_hpbw_arcsec": target_hpbw_arcsec,
+        "orig_hpbw_arcsec": orig_hpbw_arcsec,
+        "cmap": cmap,
+        "norm_mode": norm_mode,
+        "norm_percentile": norm_percentile,
+        "cmin": cmin,
+        "cmax": cmax,
+        "beam": beam,
+        "crop": crop,
+    }
+
+    overlay_list: Optional[List[Dict[str, Any]]] = None
+    if contours:
+        overlay_list = []
+        base_for_contours = {
+            "source": source,
+            "ext": ext,
+            "mode": mode,
+            "chan_range": chan_range,
+            "vel_range": vel_range,
+            "spectral_unit": spectral_unit,
+            "smooth_fwhm_arcsec": smooth_fwhm_arcsec,
+            "target_hpbw_arcsec": target_hpbw_arcsec,
+            "orig_hpbw_arcsec": orig_hpbw_arcsec,
+            "crop": crop,
+        }
+        for spec in contours:
+            ov = dict(base_for_contours)
+            ov.update(dict(spec))
+            ov["kind"] = "contour"
+            overlay_list.append(ov)
+
+    return plot_scene(
+        base,
+        overlays=overlay_list,
+        title=title,
+        grid=grid,
+        describe=describe,
+        save=save,
+        save_dpi=save_dpi,
+        save_transparent=save_transparent,
+        show_readout=show_readout,
+        show=show,
+        figsize=figsize,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -1790,10 +3349,10 @@ def _parse_comma_pair(text: Optional[str], cast=float) -> Optional[Tuple[Any, An
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     import argparse
-    import matplotlib.pyplot as plt
 
     parser = argparse.ArgumentParser(description="Plot 2D/3D radio astronomy FITS data on WCSAxes.")
-    parser.add_argument("source", help="Input FITS file.")
+    parser.add_argument("--api-help", action="store_true", help="Print compact Python API help and exit.")
+    parser.add_argument("source", nargs="?", help="Input FITS file.")
     parser.add_argument("--ext", default=None, help="Primary HDU or extension name/index.")
     parser.add_argument(
         "--mode",
@@ -1826,9 +3385,24 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--stretch-a", type=float, default=0.1)
     parser.add_argument("--power-gamma", type=float, default=1.0)
     parser.add_argument("--title", default=None)
+    parser.add_argument("--describe", action="store_true", help="Print a short summary of the plotted map.")
+    parser.add_argument("--beam", default=None, help="Beam setting: auto/header or omit.")
+    parser.add_argument("--legend", action="store_true", help="Show a legend for labeled overlays/contours.")
+    parser.add_argument("--scalebar", action="store_true", help="Draw a simple angular scale bar.")
+    parser.add_argument("--scalebar-length", type=float, default=None, help="Scale-bar length in arcsec.")
+    parser.add_argument("--north-arrow", action="store_true", help="Draw north/east orientation arrows.")
+    parser.add_argument("--no-grid", dest="grid", action="store_false", default=True, help="Disable coordinate grid.")
     parser.add_argument("--output", default=None, help="Save figure to this path.")
     parser.add_argument("--dpi", type=int, default=250)
-    parser.add_argument("--contour-levels", default=None, help="Contour levels as v1,v2,v3 or 'auto'.")
+    parser.add_argument("--transparent", action="store_true", help="Save figure with transparent background.")
+    parser.add_argument("--contour-levels", default=None, help="Contour levels as v1,v2,v3 or 'auto'. In manual mode these are treated as factors and multiplied by --contour-level-scale.")
+    parser.add_argument("--contour-level-mode", default="auto", choices=["auto", "fraction", "manual", "explicit", "rms", "sigma"], help="How contour levels are generated: auto=fraction (legacy), fraction, manual/explicit, or rms/sigma.")
+    parser.add_argument("--contour-level-scale", type=float, default=1.0, help="Scale factor for manual contour levels. Example: levels=1,2,3,4 with scale=3 gives 3,6,9,12.")
+    parser.add_argument("--contour-fractions", default=None, help="Fraction levels as f1,f2,f3 for fraction/auto contour mode.")
+    parser.add_argument("--contour-sigmas", default=None, help="RMS multipliers as s1,s2,s3 for rms/sigma contour mode.")
+    parser.add_argument("--contour-sigma-scale", type=float, default=1.0, help="Extra scale factor for rms/sigma contour mode. Example: sigmas=1,2,3,4 with sigma-scale=3 gives 3,6,9,12 times rms.")
+    parser.add_argument("--contour-negative", action="store_true", help="Add mirrored negative contour levels in fraction or rms contour modes.")
+    parser.add_argument("--contour-rms", type=float, default=None, help="Explicit RMS to use for rms/sigma contour mode.")
     parser.add_argument("--contour-color", default="white")
     parser.add_argument("--contour-linewidth", type=float, default=0.8)
     parser.add_argument("--zero-fill", action="store_true", help="Use zero fill outside the mask.")
@@ -1839,7 +3413,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=True,
         help="Disable NaN fill outside the mask.",
     )
-    args = parser.parse_args(argv)
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    args = parser.parse_args(argv_list)
+
+    if args.api_help:
+        print_plotting_help()
+        if args.source is None:
+            return
+
+    if args.source is None:
+        parser.error("source is required unless --api-help is used by itself.")
 
     ext = args.ext
     if isinstance(ext, str) and ext.isdigit():
@@ -1863,15 +3446,47 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         orig_hpbw_arcsec=args.orig_hpbw_arcsec,
     )
 
+    contour_flag_names = (
+        "--contour-levels",
+        "--contour-level-mode",
+        "--contour-level-scale",
+        "--contour-fractions",
+        "--contour-sigmas",
+        "--contour-sigma-scale",
+        "--contour-negative",
+        "--contour-rms",
+        "--contour-color",
+        "--contour-linewidth",
+    )
+    wants_contours = any(
+        str(token).startswith(contour_flag_names)
+        for token in argv_list
+    )
+
     contours = None
-    if args.contour_levels is not None:
-        if args.contour_levels.strip().lower() == "auto":
-            levels: Union[str, List[float]] = "auto"
-        else:
-            levels = [float(v.strip()) for v in args.contour_levels.split(",") if v.strip()]
+    if wants_contours:
+        levels = None
+        if args.contour_levels is not None:
+            if args.contour_levels.strip().lower() == "auto":
+                levels = "auto"
+            else:
+                levels = [float(v.strip()) for v in args.contour_levels.split(",") if v.strip()]
+        sigma_levels = None
+        if args.contour_sigmas:
+            sigma_levels = [float(v.strip()) for v in args.contour_sigmas.split(",") if v.strip()]
+        fraction_levels = None
+        if args.contour_fractions:
+            fraction_levels = [float(v.strip()) for v in args.contour_fractions.split(",") if v.strip()]
         contours = [
             {
                 "levels": levels,
+                "level_mode": args.contour_level_mode,
+                "level_scale": args.contour_level_scale,
+                "sigma_levels": sigma_levels,
+                "sigma_scale": args.contour_sigma_scale,
+                "fraction_levels": fraction_levels,
+                "symmetric": args.contour_negative,
+                "rms": args.contour_rms,
                 "colors": args.contour_color,
                 "linewidths": args.contour_linewidth,
             }
@@ -1897,13 +3512,18 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         power_gamma=args.power_gamma,
         contours=contours,
         title=args.title,
+        grid=args.grid,
+        beam=args.beam,
+        describe=args.describe,
+        save=args.output,
+        save_dpi=args.dpi,
+        save_transparent=args.transparent,
         show=args.output is None,
+        scalebar={"length": args.scalebar_length, "units": "arcsec"} if args.scalebar else None,
+        north_arrow=True if args.north_arrow else None,
+        legend=args.legend,
     )
 
-    if args.output is not None:
-        result["fig"].savefig(args.output, dpi=args.dpi, bbox_inches="tight")
-    else:
-        plt.show()
 
 
 if __name__ == "__main__":
