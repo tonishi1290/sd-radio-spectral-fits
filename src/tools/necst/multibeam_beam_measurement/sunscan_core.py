@@ -46,16 +46,24 @@ def make_ripple_policy(config: SunScanAnalysisConfig) -> Dict[str, object]:
     return compat.make_ripple_policy_from_args(args)
 
 
-def _annotate_results_metadata(results: Dict[int, dict], config: SunScanAnalysisConfig, ycol: str) -> None:
+def _annotate_results_metadata(results: Dict[int, dict], config: SunScanAnalysisConfig, ycol: str, df_attrs: Dict[str, object] | None = None) -> None:
     tag = config.resolved_tag()
+    df_attrs = dict(df_attrs or {})
     for sid, row in list(results.items()):
         if not isinstance(sid, int) or not isinstance(row, dict):
             continue
         row.setdefault("data_tag", tag)
         row.setdefault("y_axis", ycol)
+        row.setdefault("spec_time_basis", df_attrs.get("spec_time_basis"))
+        row.setdefault("spec_time_suffix", df_attrs.get("spec_time_suffix"))
+        row.setdefault("spec_time_fallback_field", df_attrs.get("spec_time_fallback_field"))
+        row.setdefault("spec_time_example", df_attrs.get("spec_time_example"))
         row.setdefault("azel_source", config.input.azel_source)
         row.setdefault("altaz_apply", config.input.altaz_apply)
+        row.setdefault("spectrometer_time_offset_sec", float(config.input.spectrometer_time_offset_sec))
         row.setdefault("encoder_shift_sec", float(config.input.encoder_shift_sec))
+        row.setdefault("encoder_az_time_offset_sec", float(config.input.encoder_az_time_offset_sec))
+        row.setdefault("encoder_el_time_offset_sec", float(config.input.encoder_el_time_offset_sec))
         row.setdefault("encoder_vavg_sec", float(config.input.encoder_vavg_sec))
         row.setdefault("chopper_wheel", bool(config.calibration.chopper_wheel))
         row.setdefault("ripple_remove", bool(config.ripple.enabled))
@@ -65,6 +73,10 @@ def _annotate_results_metadata(results: Dict[int, dict], config: SunScanAnalysis
         row.setdefault("hpbw_init_arcsec", float(config.edge_fit.hpbw_init_arcsec))
         row.setdefault("trim_scan", bool(config.trim.enabled))
         row.setdefault("profile_xlim_deg", float(config.profile.profile_xlim_deg))
+        row.setdefault("db_namespace", str(config.input.db_namespace))
+        row.setdefault("telescope", str(config.input.telescope))
+        row.setdefault("tel_loaddata", str(config.input.tel_loaddata))
+        row.setdefault("planet", str(config.input.planet))
 
 
 def run_debug_plots(config: SunScanAnalysisConfig, az_scans: Dict[int, object], el_scans: Dict[int, object], trim_params: Dict[str, object]) -> List[Path]:
@@ -145,7 +157,7 @@ def analyze_single_stream(config: SunScanAnalysisConfig) -> SingleBeamAnalysisRe
             el_profile_raw = results.pop("__el_profile_raw__", {}) if isinstance(results, dict) else {}
             az_profile = results.pop("__az_profile__", {}) if isinstance(results, dict) else {}
             el_profile = results.pop("__el_profile__", {}) if isinstance(results, dict) else {}
-            _annotate_results_metadata(results, config, ycol)
+            _annotate_results_metadata(results, config, ycol, df_attrs=getattr(df, "attrs", {}))
             result.az_deriv = az_deriv
             result.el_deriv = el_deriv
             result.az_fit = az_fit

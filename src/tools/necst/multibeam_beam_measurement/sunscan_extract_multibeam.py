@@ -6,18 +6,50 @@ from typing import Any, Dict, List, Optional, Sequence
 import json
 import math
 import traceback
+import sys
 
 import pandas as pd
 
 from .config_io import (
+    filter_streams_for_purpose,
     load_spectrometer_config,
+    resolve_stream_usage_policy,
     restfreq_hz_for_stream,
+    stream_extras_by_name,
     stream_table_from_config,
     validate_spectrometer_config,
 )
 from .sunscan_config import SunScanAnalysisConfig
 from .sunscan_core import analyze_single_stream
 from .sunscan_report import results_to_summary_dataframe, write_singlebeam_outputs
+
+
+def _argv_has_option(argv: Optional[Sequence[str]], *opts: str) -> bool:
+    sargv = [str(x) for x in (argv or [])]
+    for a in sargv:
+        for opt in opts:
+            if a == opt or a.startswith(opt + "="):
+                return True
+    return False
+
+
+def _load_global_cfg(spectrometer_config: Optional[str]) -> Dict[str, Any]:
+    if not spectrometer_config:
+        return {}
+    cfg = load_spectrometer_config(Path(spectrometer_config).expanduser().resolve())
+    return dict(cfg.get("global", {}) or {})
+
+
+def _choose_float_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: float = 0.0) -> float:
+    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt) or (global_cfg.get(global_key) is None):
+        return float(getattr(args, attr, default))
+    return float(global_cfg.get(global_key))
+
+
+def _choose_str_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: str) -> str:
+    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt) or (global_cfg.get(global_key) is None):
+        return str(getattr(args, attr, default))
+    return str(global_cfg.get(global_key))
 
 
 
@@ -68,7 +100,8 @@ def _collect_singlebeam_rows(result, run_id: str, source_db_path: Path, stream: 
 
 
 
-def _empty_manifest_row(stream: Any, spectral_name: str, error: str) -> Dict[str, Any]:
+def _empty_manifest_row(stream: Any, spectral_name: str, error: str, *, status: str = "error", skip_reason: Optional[str] = None, usage_policy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    usage_policy = dict(usage_policy or {})
     return {
         "stream_name": str(stream.name),
         "beam_id": str(stream.beam.beam_id),
@@ -76,21 +109,38 @@ def _empty_manifest_row(stream: Any, spectral_name: str, error: str) -> Dict[str
         "summary_csv": None,
         "derivative_png_count": 0,
         "debug_png_count": 0,
-        "status": "error",
+        "spec_time_basis": None,
+        "spec_time_suffix": None,
+        "spec_time_fallback_field": None,
+        "spec_time_example": None,
+        "status": status,
+        "skip_reason": skip_reason,
+        "enabled": usage_policy.get("enabled"),
+        "use_for_convert": usage_policy.get("use_for_convert"),
+        "use_for_sunscan": usage_policy.get("use_for_sunscan"),
+        "use_for_fit": usage_policy.get("use_for_fit"),
+        "beam_fit_use": usage_policy.get("beam_fit_use"),
         "error": error,
     }
 
 
 
-def _write_config_snapshot(path: Path, *, base_config: SunScanAnalysisConfig, validation) -> Path:
+def _write_config_snapshot(path: Path, *, base_config: SunScanAnalysisConfig, validation, stream_usage: Dict[str, Dict[str, Any]]) -> Path:
     payload = {
         "rawdata_path": str(base_config.input.rawdata_path),
         "resolved_outdir": str(base_config.report.outdir),
         "config_digest": base_config.config_digest(),
         "analysis": {
+            "db_namespace": base_config.input.db_namespace,
+            "telescope": base_config.input.telescope,
+            "tel_loaddata": base_config.input.tel_loaddata,
+            "planet": base_config.input.planet,
             "azel_source": base_config.input.azel_source,
             "altaz_apply": base_config.input.altaz_apply,
+            "spectrometer_time_offset_sec": base_config.input.spectrometer_time_offset_sec,
             "encoder_shift_sec": base_config.input.encoder_shift_sec,
+            "encoder_az_time_offset_sec": base_config.input.encoder_az_time_offset_sec,
+            "encoder_el_time_offset_sec": base_config.input.encoder_el_time_offset_sec,
             "encoder_vavg_sec": base_config.input.encoder_vavg_sec,
             "chopper_wheel": base_config.calibration.chopper_wheel,
             "ripple_enabled": base_config.ripple.enabled,
@@ -105,6 +155,7 @@ def _write_config_snapshot(path: Path, *, base_config: SunScanAnalysisConfig, va
             "primary_streams": validation.primary_streams,
             "warnings": validation.warnings,
         },
+        "stream_usage": stream_usage,
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path
@@ -122,10 +173,9 @@ def run_extract(
 ) -> Dict[str, Any]:
     config = load_spectrometer_config(spectrometer_config)
     validation = validate_spectrometer_config(spectrometer_config, explicit_stream_names=stream_names)
-    streams = list(config.get("streams", []) or [])
-    if stream_names:
-        wanted = {str(s) for s in stream_names}
-        streams = [s for s in streams if str(s.name) in wanted]
+    all_streams = list(config.get("streams", []) or [])
+    extras_by_name = stream_extras_by_name(spectrometer_config)
+    streams = filter_streams_for_purpose(spectrometer_config, config, "sunscan", explicit_stream_names=stream_names)
     if not streams:
         raise ValueError("no streams selected for extraction")
 
@@ -142,7 +192,23 @@ def run_extract(
     stream_table_csv = outdir / f"spectrometer_stream_table_{base_tag}.csv"
     stream_table.to_csv(stream_table_csv, index=False)
     config_snapshot_json = outdir / f"analysis_config_snapshot_{base_tag}.json"
-    _write_config_snapshot(config_snapshot_json, base_config=base_config, validation=validation)
+    _write_config_snapshot(config_snapshot_json, base_config=base_config, validation=validation, stream_usage=extras_by_name)
+
+    selected_names = {str(stream.name) for stream in streams}
+    if not stream_names:
+        for stream in all_streams:
+            stream_name = str(stream.name)
+            if stream_name in selected_names:
+                continue
+            usage_policy = resolve_stream_usage_policy(extras_by_name.get(stream_name, {}))
+            manifests.append(_empty_manifest_row(
+                stream,
+                str(getattr(stream, "db_stream_name", None) or stream.name),
+                "",
+                status="skipped",
+                skip_reason="disabled by enabled/use_for_sunscan flags",
+                usage_policy=usage_policy,
+            ))
 
     for stream in streams:
         per_stream_outdir = outdir / "per_stream" / str(stream.name)
@@ -174,6 +240,7 @@ def run_extract(
             result = write_singlebeam_outputs(result)
             rows = _collect_singlebeam_rows(result, run_id=run_id, source_db_path=rawdata_path, stream=stream)
             all_rows.append(rows)
+            usage_policy = resolve_stream_usage_policy(extras_by_name.get(str(stream.name), {}))
             manifests.append({
                 "stream_name": str(stream.name),
                 "beam_id": str(stream.beam.beam_id),
@@ -183,11 +250,26 @@ def run_extract(
                 "summary_csv": str(result.report_paths.summary_csv) if result.report_paths.summary_csv else None,
                 "derivative_png_count": int(len(result.report_paths.derivative_pngs)),
                 "debug_png_count": int(len(result.report_paths.debug_pngs)),
+                "spec_time_basis": result.df.attrs.get("spec_time_basis"),
+                "spec_time_suffix": result.df.attrs.get("spec_time_suffix"),
+                "spec_time_fallback_field": result.df.attrs.get("spec_time_fallback_field"),
+                "spec_time_example": result.df.attrs.get("spec_time_example"),
                 "status": "ok",
+                "skip_reason": None,
+                "enabled": usage_policy.get("enabled"),
+                "use_for_convert": usage_policy.get("use_for_convert"),
+                "use_for_sunscan": usage_policy.get("use_for_sunscan"),
+                "use_for_fit": usage_policy.get("use_for_fit"),
+                "beam_fit_use": usage_policy.get("beam_fit_use"),
                 "error": None,
             })
         except Exception as exc:
-            manifests.append(_empty_manifest_row(stream, spectral_name, f"{type(exc).__name__}: {exc}"))
+            manifests.append(_empty_manifest_row(
+                stream,
+                spectral_name,
+                f"{type(exc).__name__}: {exc}",
+                usage_policy=resolve_stream_usage_policy(extras_by_name.get(str(stream.name), {})),
+            ))
             (per_stream_outdir / "analysis_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
             if not base_config.runtime.continue_on_error:
                 raise
@@ -223,6 +305,7 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--spectrometer-config", required=True, help="converter-compatible spectrometer config TOML")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--run-id", default=None, help="Override run_id (default: rawdata directory name)")
+    ap.add_argument("--db-namespace", default="necst", help="Database namespace/prefix used in NECST DB table names")
     ap.add_argument("--telescope", default="OMU1P85M", help="Telescope name used in NECST DB table names")
     ap.add_argument("--tel-loaddata", default="OMU1p85m", help="Telescope name passed to nercst loaddb()")
     ap.add_argument("--planet", default="sun", help="Target body name passed to astropy.get_body()")
@@ -230,7 +313,10 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
 
     ap.add_argument("--azel-source", choices=["encoder", "altaz"], default="encoder")
     ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default="none")
+    ap.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-shift-sec", type=float, default=0.0)
+    ap.add_argument("--encoder-az-time-offset-sec", type=float, default=0.0)
+    ap.add_argument("--encoder-el-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-vavg-sec", type=float, default=0.0)
     ap.add_argument("--no-chopper-wheel", dest="chopper_wheel", action="store_false")
     ap.add_argument("--tamb-k", type=float, default=None)
@@ -291,14 +377,20 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
 
 
 
-def config_from_args(args: argparse.Namespace) -> SunScanAnalysisConfig:
+def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> SunScanAnalysisConfig:
     cfg = SunScanAnalysisConfig.default(rawdata_path=Path(args.rawdata).expanduser().resolve(), spectral_name="__unused__", outdir=Path(args.outdir).expanduser().resolve())
-    cfg.input.telescope = str(args.telescope)
-    cfg.input.tel_loaddata = str(args.tel_loaddata)
-    cfg.input.planet = str(args.planet)
+    global_cfg = _load_global_cfg(getattr(args, "spectrometer_config", None))
+
+    cfg.input.db_namespace = _choose_str_setting(args, argv, "--db-namespace", "db_namespace", global_cfg, "db_namespace", "necst")
+    cfg.input.telescope = _choose_str_setting(args, argv, "--telescope", "telescope", global_cfg, "telescope", "OMU1P85M")
+    cfg.input.tel_loaddata = _choose_str_setting(args, argv, "--tel-loaddata", "tel_loaddata", global_cfg, "tel_loaddata", "OMU1p85m")
+    cfg.input.planet = _choose_str_setting(args, argv, "--planet", "planet", global_cfg, "planet", "sun")
     cfg.input.azel_source = str(args.azel_source)
     cfg.input.altaz_apply = str(args.altaz_apply)
-    cfg.input.encoder_shift_sec = float(args.encoder_shift_sec)
+    cfg.input.spectrometer_time_offset_sec = _choose_float_setting(args, argv, "--spectrometer-time-offset-sec", "spectrometer_time_offset_sec", global_cfg, "spectrometer_time_offset_sec", 0.0)
+    cfg.input.encoder_shift_sec = _choose_float_setting(args, argv, "--encoder-shift-sec", "encoder_shift_sec", global_cfg, "encoder_shift_sec", 0.0)
+    cfg.input.encoder_az_time_offset_sec = _choose_float_setting(args, argv, "--encoder-az-time-offset-sec", "encoder_az_time_offset_sec", global_cfg, "encoder_az_time_offset_sec", 0.0)
+    cfg.input.encoder_el_time_offset_sec = _choose_float_setting(args, argv, "--encoder-el-time-offset-sec", "encoder_el_time_offset_sec", global_cfg, "encoder_el_time_offset_sec", 0.0)
     cfg.input.encoder_vavg_sec = float(args.encoder_vavg_sec)
     cfg.calibration.chopper_wheel = bool(args.chopper_wheel)
     cfg.calibration.tamb_k = args.tamb_k
@@ -344,12 +436,13 @@ def config_from_args(args: argparse.Namespace) -> SunScanAnalysisConfig:
     return cfg
 
 
-
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    if argv is None:
+        argv = list(sys.argv[1:])
     ap = argparse.ArgumentParser(description="Run sun_scan-compatible analysis for every configured stream in a RawData directory.")
     add_extract_arguments(ap)
     args = ap.parse_args(argv)
-    cfg = config_from_args(args)
+    cfg = config_from_args(args, argv=argv)
     outputs = run_extract(
         rawdata_path=Path(args.rawdata).expanduser().resolve(),
         spectrometer_config=Path(args.spectrometer_config).expanduser().resolve(),

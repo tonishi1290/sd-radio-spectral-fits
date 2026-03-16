@@ -42,7 +42,7 @@ import warnings
 import numpy as np
 
 from astropy.convolution import Gaussian2DKernel, convolve
-from astropy.coordinates import SkyCoord
+from astropy.coordinates import Angle, SkyCoord
 from astropy.io import fits
 from astropy.nddata import Cutout2D
 from astropy.stats import gaussian_fwhm_to_sigma
@@ -1674,6 +1674,99 @@ def _save_figure(
     fig.savefig(str(save), dpi=dpi, bbox_inches=bbox_inches, transparent=transparent)
 
 
+def _format_readout_value(value: Any) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return str(value)
+    if not np.isfinite(v):
+        return "nan"
+    av = abs(v)
+    if av == 0:
+        return "0"
+    if av >= 1.0e6 or av < 1.0e-6:
+        return f"{v:.5g}"
+    return f"{v:.5g}"
+
+
+
+def _estimate_readout_coord_precision(map2d: Map2D) -> Tuple[int, int]:
+    try:
+        scales = np.asarray(proj_plane_pixel_scales(map2d.wcs.celestial), dtype=float)
+        finite = scales[np.isfinite(scales) & (scales > 0)]
+        if finite.size == 0:
+            raise ValueError
+        deg_per_pix = float(np.nanmin(np.abs(finite)))
+        arcsec_per_pix = deg_per_pix * 3600.0
+    except Exception:
+        arcsec_per_pix = 1.0
+        deg_per_pix = 1.0 / 3600.0
+
+    if arcsec_per_pix >= 1.0:
+        sexa_precision = 0
+    elif arcsec_per_pix >= 0.1:
+        sexa_precision = 1
+    else:
+        sexa_precision = 2
+
+    decimal_deg_precision = int(np.clip(np.ceil(-np.log10(max(deg_per_pix, 1.0e-12))) + 2, 4, 8))
+    return sexa_precision, decimal_deg_precision
+
+
+
+def _format_ra_deg_to_hms(ra_deg: float, precision: int = 0) -> str:
+    ang = Angle(float(ra_deg), unit=u.deg).wrap_at(360.0 * u.deg)
+    return ang.to_string(unit=u.hourangle, sep=":", pad=True, precision=precision)
+
+
+
+def _format_dec_deg_to_dms(dec_deg: float, precision: int = 0) -> str:
+    ang = Angle(float(dec_deg), unit=u.deg)
+    return ang.to_string(unit=u.deg, sep=":", pad=True, alwayssign=True, precision=precision)
+
+
+
+def _format_lonlat_readout(map2d: Map2D, lon_deg: float, lat_deg: float) -> Tuple[str, str]:
+    native = _infer_native_coord_system(map2d.wcs)
+    sexa_precision, decimal_deg_precision = _estimate_readout_coord_precision(map2d)
+
+    if native == "equatorial":
+        return (
+            f"ra={_format_ra_deg_to_hms(lon_deg, precision=sexa_precision)}",
+            f"dec={_format_dec_deg_to_dms(lat_deg, precision=sexa_precision)}",
+        )
+
+    lon_s = f"{float(lon_deg):.{decimal_deg_precision}f}"
+    lat_s = f"{float(lat_deg):.{decimal_deg_precision}f}"
+    return (f"lon={lon_s} deg", f"lat={lat_s} deg")
+
+
+
+def _disable_artist_cursor_data(artist: Any) -> None:
+    try:
+        artist.get_cursor_data = lambda event: None
+    except Exception:
+        pass
+    try:
+        artist.format_cursor_data = lambda data: ""
+    except Exception:
+        pass
+
+
+
+def _disable_axes_cursor_readout(ax: Any) -> None:
+    try:
+        ax.format_coord = lambda x, y: ""
+    except Exception:
+        pass
+    try:
+        for child in ax.get_children():
+            _disable_artist_cursor_data(child)
+    except Exception:
+        pass
+
+
+
 def _apply_readout_formatter(ax: Any, map2d: Map2D) -> None:
     def _fmt(x: float, y: float) -> str:
         try:
@@ -1686,7 +1779,9 @@ def _apply_readout_formatter(ax: Any, map2d: Map2D) -> None:
             world = map2d.wcs.pixel_to_world_values(x, y)
             lon = float(world[0])
             lat = float(world[1])
-            return f"x={x:.2f}, y={y:.2f} | lon={lon:.6f}, lat={lat:.6f} | value={value:.6g}"
+            lon_s, lat_s = _format_lonlat_readout(map2d, lon, lat)
+            value_s = _format_readout_value(value)
+            return f"x={x:.2f}, y={y:.2f} | {lon_s}, {lat_s} | value={value_s}"
         except Exception:
             return f"x={x:.2f}, y={y:.2f}"
 
@@ -2393,6 +2488,7 @@ def _add_image_overlay(ax: Any, layer: Mapping[str, Any], *, target_wcs: Optiona
         transform=ax.get_transform(overlay.wcs),
         zorder=layer.get("zorder"),
     )
+    _disable_artist_cursor_data(artist)
     _set_artist_label(artist, layer.get("label"))
     return {"artist": artist, "map2d": overlay}
 
@@ -2814,14 +2910,16 @@ def plot_map(
         alpha=alpha,
         transform=ax.get_transform(map2d.wcs),
     )
+    _disable_artist_cursor_data(im)
 
     cbar = None
     if colorbar:
         cbar = fig.colorbar(im, ax=ax, pad=0.02, fraction=0.046)
+        _disable_axes_cursor_readout(cbar.ax)
         if colorbar_label is None:
             colorbar_label = _default_colorbar_label(map2d)
         if colorbar_label:
-            cbar.set_label(colorbar_label)
+            cbar.set_label(colorbar_label, rotation=270, va="bottom")
 
     if grid:
         ax.coords.grid(color="white", alpha=0.25, linestyle="solid")
@@ -3023,6 +3121,7 @@ def plot_rgb(
         fig = ax.figure
 
     im = ax.imshow(rgb_source.rgb, origin="lower", transform=ax.get_transform(rgb_source.wcs))
+    _disable_artist_cursor_data(im)
     if grid:
         ax.coords.grid(color="white", alpha=0.25, linestyle="solid")
 

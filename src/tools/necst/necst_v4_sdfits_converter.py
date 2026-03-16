@@ -1624,6 +1624,57 @@ def apply_beam_offset(boresight_az_deg, boresight_el_deg, beam):
     }
 
 
+def select_radec_azel_source(pointing, beam, radec_azel_source):
+    source = str(radec_azel_source if radec_azel_source is not None else "beam").strip().lower()
+
+    if source == "beam":
+        return {
+            "source": "beam",
+            "az_deg": np.asarray(pointing["beam_az_deg"], dtype=float),
+            "el_deg": np.asarray(pointing["beam_el_deg"], dtype=float),
+            "meaning": "beam-center Az/El from (encoder - correction) boresight + beam offset",
+        }
+
+    if source == "true":
+        return {
+            "source": "true",
+            "az_deg": np.asarray(pointing["boresight_az"], dtype=float),
+            "el_deg": np.asarray(pointing["boresight_el"], dtype=float),
+            "meaning": "boresight Az/El from encoder - correction (no beam offset)",
+        }
+
+    if source == "encoder":
+        applied = apply_beam_offset(pointing["az_enc_t"], pointing["el_enc_t"], beam)
+        return {
+            "source": "encoder",
+            "az_deg": np.asarray(applied["beam_az_deg"], dtype=float),
+            "el_deg": np.asarray(applied["beam_el_deg"], dtype=float),
+            "meaning": "beam-offset Az/El from measured encoder lon/lat",
+        }
+
+    if source == "altaz":
+        applied = apply_beam_offset(pointing["az_cmd_t"], pointing["el_cmd_t"], beam)
+        return {
+            "source": "altaz",
+            "az_deg": np.asarray(applied["beam_az_deg"], dtype=float),
+            "el_deg": np.asarray(applied["beam_el_deg"], dtype=float),
+            "meaning": "beam-offset Az/El from raw altaz/cmd lon/lat",
+        }
+
+    if source == "cmd":
+        cmd_boresight_az = (np.asarray(pointing["az_cmd_t"], dtype=float) - np.asarray(pointing["dlon_t"], dtype=float)) % 360.0
+        cmd_boresight_el = np.asarray(pointing["el_cmd_t"], dtype=float) - np.asarray(pointing["dlat_t"], dtype=float)
+        applied = apply_beam_offset(cmd_boresight_az, cmd_boresight_el, beam)
+        return {
+            "source": "cmd",
+            "az_deg": np.asarray(applied["beam_az_deg"], dtype=float),
+            "el_deg": np.asarray(applied["beam_el_deg"], dtype=float),
+            "meaning": "beam-offset Az/El from (altaz/cmd - correction) boresight",
+        }
+
+    raise ValueError("unsupported radec_azel_source={!r}".format(radec_azel_source))
+
+
 def normalize_radec(wcs_df, t_spec, beam_az_deg, beam_el_deg, site,
                     radec_method="wcs_first",
                     apply_refraction=True,
@@ -2185,8 +2236,16 @@ def parse_args(argv):
     p.add_argument("--wcs-table", default="necst-telescope-coordinate-wcs", help="WCS table name for RA/DEC time series")
 
     p.add_argument("--radec-method", default="wcs_first", choices=["wcs_first", "azel"])
-    p.add_argument("--radec-azel-source", default="beam", choices=["beam", "true", "encoder", "altaz", "cmd"],
-                   help="Deprecated. v1_40 always uses beam-center Az/El for Az/El-derived RA/DEC.")
+    p.add_argument(
+        "--radec-azel-source",
+        default="beam",
+        choices=["beam", "true", "encoder", "altaz", "cmd"],
+        help=(
+            "Az/El source used when RA/DEC is derived from Az/El (wcs_first fallback or --radec-method azel). "
+            "beam=current beam-center; true=encoder-corrected boresight; encoder=measured encoder with beam offset; "
+            "altaz=raw altaz/cmd with beam offset; cmd=(altaz/cmd - dlon/dlat) with beam offset."
+        ),
+    )
     p.add_argument("--refraction", default="on", choices=["on", "off"])
     p.add_argument("--met-pressure-hpa", type=float, default=None)
     p.add_argument("--met-temperature-c", type=float, default=10.0)
@@ -2269,8 +2328,11 @@ def main(argv=None):
             print("[warn] {}=recorded_time is not supported; forcing to 'time'".format(attr))
             setattr(args, attr, "time")
 
-    if str(getattr(args, "radec_azel_source", "beam")).strip().lower() not in ("beam",):
-        print("[warn] --radec-azel-source is deprecated in v1_40; beam-center Az/El is always used for Az/El-derived RA/DEC.")
+    radec_azel_source_now = str(getattr(args, "radec_azel_source", "beam")).strip().lower()
+    if radec_azel_source_now not in ("beam", "true", "encoder", "altaz", "cmd"):
+        raise ValueError("unsupported --radec-azel-source={!r}".format(radec_azel_source_now))
+    if radec_azel_source_now != "beam":
+        print("[info] using --radec-azel-source={} for Az/El-derived RA/DEC".format(radec_azel_source_now))
     if bool(getattr(args, "strict_config", False)):
         print("[warn] --strict-config is reserved in v1_40 and is not yet enforced beyond current validation.")
 
@@ -2384,6 +2446,15 @@ def main(argv=None):
                 "Beam-center Az/El contains NaN after applying beam offset/rotation for stream '{}'. Check beam offsets and elevations near the pole.".format(stream.name)
             )
 
+        radec_azel = select_radec_azel_source(pointing, stream.beam, str(args.radec_azel_source))
+        if np.any(~np.isfinite(radec_azel["az_deg"])) or np.any(~np.isfinite(radec_azel["el_deg"])):
+            nbad = int(np.count_nonzero(~np.isfinite(radec_azel["az_deg"])) + np.count_nonzero(~np.isfinite(radec_azel["el_deg"])))
+            raise RuntimeError(
+                "Selected RA/DEC Az/El source '{}' contains NaN for stream '{}' ({} elements).".format(
+                    radec_azel["source"], stream.name, nbad
+                )
+            )
+
         temp_c, press_hpa, humid_pct, met_weather = resolve_stream_meteorology(
             common, stream_data, str(args.met_source).strip().lower(), str(args.interp_extrap)
         )
@@ -2398,8 +2469,8 @@ def main(argv=None):
         radec = normalize_radec(
             wcs_df=common.wcs_df if str(args.radec_method).strip().lower() == "wcs_first" else None,
             t_spec=stream_data.t_spec,
-            beam_az_deg=pointing["beam_az_deg"],
-            beam_el_deg=pointing["beam_el_deg"],
+            beam_az_deg=radec_azel["az_deg"],
+            beam_el_deg=radec_azel["el_deg"],
             site=site,
             radec_method=str(args.radec_method),
             apply_refraction=apply_refraction,
@@ -2446,7 +2517,7 @@ def main(argv=None):
 
         writer.add_history(
             "stream_{}".format(stream.stream_index),
-            "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={}".format(
+            "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={};radec_azel_source={};radec_azel_meaning={}".format(
                 stream.name,
                 stream.fdnum,
                 stream.ifnum,
@@ -2462,6 +2533,8 @@ def main(argv=None):
                 stream_data.spec_time_basis,
                 (stream_data.spec_time_suffix or ""),
                 (stream_data.spec_time_fallback_field or ""),
+                radec_azel["source"],
+                radec_azel["meaning"],
             ),
         )
 

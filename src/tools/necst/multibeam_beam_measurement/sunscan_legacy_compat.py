@@ -2730,8 +2730,11 @@ def build_dataframe(
     planet: str = PLANET,
     azel_source: str,
     altaz_apply: str,
-    encoder_shift_sec: float,
-    encoder_vavg_sec: float,
+    spectrometer_time_offset_sec: float = 0.0,
+    encoder_shift_sec: float = 0.0,
+    encoder_az_time_offset_sec: float = 0.0,
+    encoder_el_time_offset_sec: float = 0.0,
+    encoder_vavg_sec: float = 0.0,
     chopper_wheel: bool,
     tamb_k: Optional[float],
     chopper_win_sec: float,
@@ -2746,6 +2749,7 @@ def build_dataframe(
         telescope=telescope,
         db_namespace=db_namespace,
     )
+    t_spec = np.asarray(t_spec, dtype=float) + float(spectrometer_time_offset_sec)
 
     names_spec = list(arr_spec.dtype.names or [])
     id_valid = False
@@ -2841,14 +2845,16 @@ def build_dataframe(
         t_enc, s_enc = _normalize_time_units(t_spec, t_enc, "encoder")
         if s_enc != 1.0:
             print(f"[info] encoder time scaled by {s_enc} to match unix seconds")
-        t_enc = t_enc + float(encoder_shift_sec)
+        t_enc_base = t_enc + float(encoder_shift_sec)
+        t_enc_az = t_enc_base + float(encoder_az_time_offset_sec)
+        t_enc_el = t_enc_base + float(encoder_el_time_offset_sec)
 
         lon_enc = enc["lon"].to_numpy(float)
         lat_enc = enc["lat"].to_numpy(float)
 
         # raw interpolation (diagnostic)
-        az_enc_raw = _interp_az_deg(t_enc, lon_enc, t_spec)
-        el_enc_raw = _interp_lin(t_enc, lat_enc, t_spec)
+        az_enc_raw = _interp_az_deg(t_enc_az, lon_enc, t_spec)
+        el_enc_raw = _interp_lin(t_enc_el, lat_enc, t_spec)
 
         # safe local smoothing on interpolated positions (no cumulative integration)
         wsec = float(encoder_vavg_sec)
@@ -2923,6 +2929,10 @@ def build_dataframe(
         df.attrs["spec_time_suffix"] = spec_time_meta.get("suffix")
         df.attrs["spec_time_fallback_field"] = spec_time_meta.get("fallback_field")
         df.attrs["spec_time_example"] = spec_time_meta.get("first_timestamp_text")
+        df.attrs["spectrometer_time_offset_sec"] = float(spectrometer_time_offset_sec)
+        df.attrs["encoder_shift_sec"] = float(encoder_shift_sec)
+        df.attrs["encoder_az_time_offset_sec"] = float(encoder_az_time_offset_sec)
+        df.attrs["encoder_el_time_offset_sec"] = float(encoder_el_time_offset_sec)
     except Exception:
         pass
 
@@ -2936,6 +2946,12 @@ def build_dataframe(
         f"[info] spectral time basis: applied={spec_time_meta.get('applied')} "
         f"suffix={spec_time_meta.get('suffix')} fallback={spec_time_meta.get('fallback_field')} "
         f"example={spec_time_meta.get('first_timestamp_text')}"
+    )
+    print(
+        f"[info] time offsets: spectrometer={float(spectrometer_time_offset_sec):+.6f}s "
+        f"encoder_common={float(encoder_shift_sec):+.6f}s "
+        f"encoder_az={float(encoder_az_time_offset_sec):+.6f}s "
+        f"encoder_el={float(encoder_el_time_offset_sec):+.6f}s"
     )
     return df, az_scans, el_scans
 
@@ -3312,8 +3328,10 @@ def write_scan_summary_csv(out_csv: pathlib.Path, scan_ids: List[int], results: 
         "az_track_az_deg", "az_track_el_deg", "az_track_main_offset_deg", "az_track_cross_offset_deg",
         "el_track_az_deg", "el_track_el_deg", "el_track_main_offset_deg", "el_track_cross_offset_deg",
         "data_tag", "y_axis",
+        "spec_time_basis", "spec_time_suffix", "spec_time_fallback_field", "spec_time_example",
         "azel_source", "altaz_apply",
-        "encoder_shift_sec", "encoder_vavg_sec",
+        "spectrometer_time_offset_sec",
+        "encoder_shift_sec", "encoder_az_time_offset_sec", "encoder_el_time_offset_sec", "encoder_vavg_sec",
         "chopper_wheel",
         "ripple_remove", "ripple_preset",
         "edge_fit_win_deg", "edge_fit_threshold", "hpbw_init_arcsec",
@@ -3763,8 +3781,14 @@ def main() -> None:
                     help="Az/El source. encoder uses encoder lon/lat; altaz uses altaz lon/lat (commands).")
     ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default=DEFAULT_ALTAZ_APPLY,
                     help="Only for --azel-source altaz: whether to apply dlon/dlat to lon/lat.")
+    ap.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0,
+                    help="Time offset (sec) applied to spectral timestamps before interpolation. Corrected time = recorded spectral time + offset.")
     ap.add_argument("--encoder-shift-sec", type=float, default=DEFAULT_ENCODER_SHIFT_SEC,
-                    help="Time shift (sec) added to encoder.time before interpolation (try if encoder timestamp has bias).")
+                    help="Common time shift (sec) added to encoder.time before interpolation.")
+    ap.add_argument("--encoder-az-time-offset-sec", type=float, default=0.0,
+                    help="Additional time offset (sec) applied only to encoder Az interpolation.")
+    ap.add_argument("--encoder-el-time-offset-sec", type=float, default=0.0,
+                    help="Additional time offset (sec) applied only to encoder El interpolation.")
 
     ap.add_argument("--tel-loaddata", default=TEL_LOADDATA,
                     help="Deprecated compatibility option from the old nercst path. It is now ignored because spectral data are read directly from necstdb.")
@@ -3910,7 +3934,10 @@ def main() -> None:
         db_namespace=args.db_namespace,
         azel_source=args.azel_source,
         altaz_apply=args.altaz_apply,
+        spectrometer_time_offset_sec=args.spectrometer_time_offset_sec,
         encoder_shift_sec=args.encoder_shift_sec,
+        encoder_az_time_offset_sec=args.encoder_az_time_offset_sec,
+        encoder_el_time_offset_sec=args.encoder_el_time_offset_sec,
         encoder_vavg_sec=args.encoder_vavg_sec,
         chopper_wheel=bool(args.chopper_wheel),
         tamb_k=args.tamb_k,

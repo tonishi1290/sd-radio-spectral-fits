@@ -7,6 +7,7 @@ import hashlib
 import json
 
 
+DEFAULT_DB_NAMESPACE = "necst"
 DEFAULT_TELESCOPE = "OMU1P85M"
 DEFAULT_TEL_LOADDATA = "OMU1p85m"
 DEFAULT_PLANET = "sun"
@@ -14,7 +15,10 @@ DEFAULT_SPECTRAL_NAME = "xffts-board1"
 DEFAULT_OUTDIR = "."
 DEFAULT_AZEL_SOURCE = "encoder"
 DEFAULT_ALTAZ_APPLY = "none"
+DEFAULT_SPECTROMETER_TIME_OFFSET_SEC = 0.0
 DEFAULT_ENCODER_SHIFT_SEC = 0.0
+DEFAULT_ENCODER_AZ_TIME_OFFSET_SEC = 0.0
+DEFAULT_ENCODER_EL_TIME_OFFSET_SEC = 0.0
 DEFAULT_ENCODER_VAVG_SEC = 0.0
 DEFAULT_CHOPPER_WHEEL = True
 DEFAULT_TAMB_FALLBACK_K = 300.0
@@ -62,13 +66,17 @@ DEFAULT_DISH_DIAMETER_M = 1.85
 @dataclass
 class InputConfig:
     rawdata_path: Path
+    db_namespace: str = DEFAULT_DB_NAMESPACE
     telescope: str = DEFAULT_TELESCOPE
     tel_loaddata: str = DEFAULT_TEL_LOADDATA
     planet: str = DEFAULT_PLANET
     spectral_name: str = DEFAULT_SPECTRAL_NAME
     azel_source: str = DEFAULT_AZEL_SOURCE
     altaz_apply: str = DEFAULT_ALTAZ_APPLY
+    spectrometer_time_offset_sec: float = DEFAULT_SPECTROMETER_TIME_OFFSET_SEC
     encoder_shift_sec: float = DEFAULT_ENCODER_SHIFT_SEC
+    encoder_az_time_offset_sec: float = DEFAULT_ENCODER_AZ_TIME_OFFSET_SEC
+    encoder_el_time_offset_sec: float = DEFAULT_ENCODER_EL_TIME_OFFSET_SEC
     encoder_vavg_sec: float = DEFAULT_ENCODER_VAVG_SEC
 
 

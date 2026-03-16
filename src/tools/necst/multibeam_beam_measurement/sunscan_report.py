@@ -29,12 +29,15 @@ CANONICAL_SUMMARY_COLUMNS = [
     "az_track_az_deg", "az_track_el_deg", "az_track_main_offset_deg", "az_track_cross_offset_deg",
     "el_track_az_deg", "el_track_el_deg", "el_track_main_offset_deg", "el_track_cross_offset_deg",
     "data_tag", "y_axis",
+    "spec_time_basis", "spec_time_suffix", "spec_time_fallback_field", "spec_time_example",
     "azel_source", "altaz_apply",
-    "encoder_shift_sec", "encoder_vavg_sec",
+    "spectrometer_time_offset_sec",
+    "encoder_shift_sec", "encoder_az_time_offset_sec", "encoder_el_time_offset_sec", "encoder_vavg_sec",
     "chopper_wheel",
     "ripple_remove", "ripple_preset",
     "edge_fit_win_deg", "edge_fit_threshold", "hpbw_init_arcsec",
     "trim_scan", "profile_xlim_deg",
+    "db_namespace", "telescope", "tel_loaddata", "planet",
 ]
 
 

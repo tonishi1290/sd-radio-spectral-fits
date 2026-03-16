@@ -46,6 +46,11 @@ class LightStream:
     frequency_axis: Dict[str, Any] = field(default_factory=dict)
     local_oscillators: Dict[str, Any] = field(default_factory=dict)
     override: Dict[str, Any] = field(default_factory=dict)
+    enabled: bool = True
+    use_for_convert: bool = True
+    use_for_sunscan: bool = True
+    use_for_fit: bool = True
+    beam_fit_use: Optional[bool] = None
     wcs: Optional[LightWCS] = None
     wcs_full: Optional[LightWCS] = None
 
@@ -62,6 +67,76 @@ class SpectrometerValidationResult:
 def load_raw_toml(config_path: Path) -> Dict[str, Any]:
     with open(config_path, "rb") as fh:
         return tomllib.load(fh)
+
+
+def _coerce_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise ValueError(f"cannot coerce to bool: {value!r}")
+
+
+def resolve_stream_usage_policy(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    extra = dict(extra or {})
+    enabled_raw = _coerce_optional_bool(extra.get("enabled", None))
+    enabled = True if enabled_raw is None else bool(enabled_raw)
+
+    def _resolve_simple(key: str) -> bool:
+        raw = _coerce_optional_bool(extra.get(key, None))
+        if raw is None:
+            return bool(enabled)
+        return bool(enabled) and bool(raw)
+
+    beam_fit_use = _coerce_optional_bool(extra.get("beam_fit_use", None))
+    use_for_fit_raw = _coerce_optional_bool(extra.get("use_for_fit", None))
+    if use_for_fit_raw is None:
+        if beam_fit_use is None:
+            use_for_fit = bool(enabled)
+        else:
+            use_for_fit = bool(enabled) and bool(beam_fit_use)
+    else:
+        use_for_fit = bool(enabled) and bool(use_for_fit_raw)
+
+    return {
+        "enabled": bool(enabled),
+        "use_for_convert": _resolve_simple("use_for_convert"),
+        "use_for_sunscan": _resolve_simple("use_for_sunscan"),
+        "use_for_fit": bool(use_for_fit),
+        "beam_fit_use": beam_fit_use,
+    }
+
+
+def stream_enabled_for_purpose(extra: Optional[Dict[str, Any]], purpose: str) -> bool:
+    resolved = resolve_stream_usage_policy(extra)
+    purpose_key = {
+        "convert": "use_for_convert",
+        "sunscan": "use_for_sunscan",
+        "fit": "use_for_fit",
+    }.get(str(purpose))
+    if purpose_key is None:
+        raise ValueError(f"unsupported purpose={purpose!r}")
+    return bool(resolved[purpose_key])
+
+
+def filter_streams_for_purpose(raw_config_path: Path, stream_cfg: Dict[str, Any], purpose: str, *, explicit_stream_names: Optional[Sequence[str]] = None) -> List[Any]:
+    streams = list(stream_cfg.get("streams", []) or [])
+    if explicit_stream_names:
+        wanted = {str(s) for s in explicit_stream_names}
+        selected = [stream for stream in streams if str(getattr(stream, "name", "")) in wanted]
+        missing = sorted(wanted - {str(getattr(stream, "name", "")) for stream in selected})
+        if missing:
+            raise ValueError(f"stream(s) not found in spectrometer config: {missing}")
+        return selected
+    extras = stream_extras_by_name(raw_config_path)
+    return [stream for stream in streams if stream_enabled_for_purpose(extras.get(str(getattr(stream, "name", "")), {}), purpose)]
 
 
 
@@ -97,6 +172,7 @@ def _fallback_load_spectrometer_config(config_path: Path) -> Dict[str, Any]:
         except Exception:
             restfreq_hz = float("nan")
         wcs = LightWCS(restfreq_hz=restfreq_hz)
+        usage_policy = resolve_stream_usage_policy(block)
         streams.append(
             LightStream(
                 name=name,
@@ -115,6 +191,11 @@ def _fallback_load_spectrometer_config(config_path: Path) -> Dict[str, Any]:
                 override=dict(block.get("override", {}) or {}),
                 wcs=wcs,
                 wcs_full=wcs,
+                enabled=usage_policy.get("enabled", True),
+                use_for_convert=usage_policy.get("use_for_convert", True),
+                use_for_sunscan=usage_policy.get("use_for_sunscan", True),
+                use_for_fit=usage_policy.get("use_for_fit", True),
+                beam_fit_use=usage_policy.get("beam_fit_use", None),
             )
         )
     return {
@@ -143,6 +224,10 @@ def stream_extras_by_name(config_path: Path) -> Dict[str, Dict[str, Any]]:
         if not name:
             continue
         extras[name] = {
+            "enabled": block.get("enabled", None),
+            "use_for_convert": block.get("use_for_convert", None),
+            "use_for_sunscan": block.get("use_for_sunscan", None),
+            "use_for_fit": block.get("use_for_fit", None),
             "beam_fit_use": block.get("beam_fit_use", None),
         }
     return extras
@@ -173,6 +258,7 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
     extras = stream_extras_by_name(config_path)
     rows: List[Dict[str, Any]] = []
     for stream in list(cfg.get("streams", []) or []):
+        usage_policy = resolve_stream_usage_policy(extras.get(str(stream.name), {}))
         rows.append(
             {
                 "stream_name": str(stream.name),
@@ -186,7 +272,11 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
                 "sampler": stream.sampler,
                 "frontend": getattr(stream, "frontend", None),
                 "backend": getattr(stream, "backend", None),
-                "beam_fit_use": extras.get(str(stream.name), {}).get("beam_fit_use", None),
+                "enabled": usage_policy.get("enabled", True),
+                "use_for_convert": usage_policy.get("use_for_convert", True),
+                "use_for_sunscan": usage_policy.get("use_for_sunscan", True),
+                "use_for_fit": usage_policy.get("use_for_fit", True),
+                "beam_fit_use": usage_policy.get("beam_fit_use", None),
                 "rotation_mode": str(getattr(stream.beam, "rotation_mode", "none")),
                 "reference_angle_deg": float(getattr(stream.beam, "reference_angle_deg", 0.0)),
                 "rotation_sign": float(getattr(stream.beam, "rotation_sign", 1.0)),
@@ -200,7 +290,7 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
 
 
 def resolve_primary_stream_names(raw_config_path: Path, stream_cfg: Dict[str, Any], explicit_stream_names: Optional[Sequence[str]] = None) -> List[str]:
-    streams = list(stream_cfg.get("streams", []) or [])
+    streams = filter_streams_for_purpose(raw_config_path, stream_cfg, "fit", explicit_stream_names=explicit_stream_names)
     if explicit_stream_names:
         return [str(s) for s in explicit_stream_names]
     extras = stream_extras_by_name(raw_config_path)
@@ -209,14 +299,18 @@ def resolve_primary_stream_names(raw_config_path: Path, stream_cfg: Dict[str, An
     for stream in streams:
         by_beam.setdefault(str(stream.beam.beam_id), []).append(stream)
     for beam_id, group in by_beam.items():
-        chosen = [s.name for s in group if extras.get(s.name, {}).get("beam_fit_use") is True]
+        chosen = []
+        for stream in group:
+            policy = resolve_stream_usage_policy(extras.get(str(stream.name), {}))
+            if policy.get("beam_fit_use") is True:
+                chosen.append(stream.name)
         if len(chosen) > 1:
             raise ValueError(f"multiple primary streams declared for beam_id={beam_id!r}: {chosen}")
         if len(group) > 1 and not chosen:
             names = [s.name for s in group]
             raise ValueError(
-                f"beam_id={beam_id!r} has multiple streams {names} but no primary stream was specified. "
-                "Add beam_fit_use=true to exactly one stream or pass --fit-stream-name."
+                f"beam_id={beam_id!r} has multiple fit-enabled streams {names} but no primary stream was specified. "
+                "Add use_for_fit=true to the desired streams and beam_fit_use=true to exactly one stream, or pass --fit-stream-name."
             )
         primary.extend(chosen if chosen else [group[0].name])
     return primary
@@ -350,7 +444,8 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
 
         scalar_keys = [
             "name", "fdnum", "ifnum", "plnum", "polariza", "beam_id",
-            "frontend", "backend", "sampler", "db_stream_name", "db_table_name", "beam_fit_use",
+            "frontend", "backend", "sampler", "db_stream_name", "db_table_name",
+            "enabled", "use_for_convert", "use_for_sunscan", "use_for_fit", "beam_fit_use",
         ]
         for key in scalar_keys:
             if key in block_copy and block_copy[key] is not None:
