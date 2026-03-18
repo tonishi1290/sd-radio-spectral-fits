@@ -529,16 +529,129 @@ def _to_rh01_guess(humid_arr):
         rh = x / 100.0
     return np.clip(rh, 0.0, 1.0)
 
+def _normalize_azel_correction_apply(value: Optional[str], default: str = "none") -> str:
+    if value is None:
+        return str(default)
+    s = str(value).strip().lower()
+    if not s:
+        return str(default)
+    if s == "minus":
+        return "subtract"
+    if s == "plus":
+        return "add"
+    if s in {"subtract", "add", "none"}:
+        return s
+    return str(default)
 
-def _load_weather_meteo_for_tspec(
+
+def _sanitize_time_col(preferred_time_col: str, *, label: str = "time") -> str:
+    pref = str(preferred_time_col).strip()
+    if pref.lower() == "recorded_time":
+        print(f"[warn] {label}=recorded_time is not supported; forcing to 'time'")
+        pref = "time"
+    return pref
+
+
+def _resolve_table_name(*, db_namespace: str, telescope: str, full_table: Optional[str], suffix: Optional[str], default_suffix: str) -> str:
+    if full_table is not None:
+        s = str(full_table).strip()
+        if s:
+            return s
+    suf = str(suffix).strip() if suffix is not None and str(suffix).strip() else str(default_suffix)
+    return f"{str(db_namespace)}-{str(telescope)}-{suf}"
+
+
+def _apply_azel_correction(lon: np.ndarray, lat: np.ndarray, dlon: np.ndarray, dlat: np.ndarray, mode: str) -> Tuple[np.ndarray, np.ndarray]:
+    m = _normalize_azel_correction_apply(mode, default="none")
+    if m == "add":
+        return (np.asarray(lon, dtype=float) + np.asarray(dlon, dtype=float)) % 360.0, np.asarray(lat, dtype=float) + np.asarray(dlat, dtype=float)
+    if m == "subtract":
+        return (np.asarray(lon, dtype=float) - np.asarray(dlon, dtype=float)) % 360.0, np.asarray(lat, dtype=float) - np.asarray(dlat, dtype=float)
+    return np.asarray(lon, dtype=float) % 360.0, np.asarray(lat, dtype=float)
+
+
+def _sanitize_meteo_series(arr, t_spec: np.ndarray, *, default: float, vmin: Optional[float] = None, vmax: Optional[float] = None) -> Tuple[np.ndarray, bool]:
+    out = np.full_like(np.asarray(t_spec, dtype=float), float(default), dtype=float)
+    used_default = True
+    if arr is not None:
+        try:
+            cand = np.asarray(arr, dtype=float)
+            if cand.shape == out.shape:
+                mask = np.isfinite(cand)
+                if vmin is not None:
+                    mask &= cand >= float(vmin)
+                if vmax is not None:
+                    mask &= cand <= float(vmax)
+                if np.any(mask):
+                    out[mask] = cand[mask]
+                    used_default = bool(np.any(~mask))
+                else:
+                    used_default = True
+            else:
+                used_default = True
+        except Exception:
+            used_default = True
+    return out, bool(used_default)
+
+
+def _finalize_outside_weather_meteo(weather_meteo, t_spec: np.ndarray, *, default_temperature_c: float, default_pressure_hpa: float, default_humidity_pct: float,
+                                    temperature_min_c: float, temperature_max_c: float, pressure_min_hpa: float, pressure_max_hpa: float,
+                                    humidity_min_pct: float, humidity_max_pct: float):
+    temp_c, used_t = _sanitize_meteo_series(None if weather_meteo is None else weather_meteo.get("temp_c"), t_spec, default=float(default_temperature_c), vmin=float(temperature_min_c), vmax=float(temperature_max_c))
+    press_hpa, used_p = _sanitize_meteo_series(None if weather_meteo is None else weather_meteo.get("press_hpa"), t_spec, default=float(default_pressure_hpa), vmin=float(pressure_min_hpa), vmax=float(pressure_max_hpa))
+    humid_pct, used_h = _sanitize_meteo_series(None if weather_meteo is None else weather_meteo.get("humid_pct"), t_spec, default=float(default_humidity_pct), vmin=float(humidity_min_pct), vmax=float(humidity_max_pct))
+    source = "default"
+    if weather_meteo is not None:
+        source = "mixed" if (used_t or used_p or used_h) else "outside_weather"
+    return {
+        "table": None if weather_meteo is None else weather_meteo.get("table"),
+        "time_col": None if weather_meteo is None else weather_meteo.get("time_col"),
+        "temp_c": np.asarray(temp_c, dtype=float),
+        "press_hpa": np.asarray(press_hpa, dtype=float),
+        "humid_pct": np.asarray(humid_pct, dtype=float),
+        "humid_rh": np.asarray(np.clip(np.asarray(humid_pct, dtype=float) / 100.0, 0.0, 1.0), dtype=float),
+        "used_default_temperature": bool(used_t),
+        "used_default_pressure": bool(used_p),
+        "used_default_humidity": bool(used_h),
+        "source": source,
+    }
+
+
+def _estimate_tamb_k_with_source(*, weather_meteo=None, structured_arr=None, fallback_k: float = 300.0, min_k: float = 250.0, max_k: float = 330.0) -> Tuple[float, str]:
+    if weather_meteo is not None:
+        try:
+            temp_c = weather_meteo.get("temp_c")
+            if temp_c is not None:
+                med_k = float(np.nanmedian(np.asarray(temp_c, dtype=float))) + 273.15
+                if np.isfinite(med_k) and (float(min_k) <= med_k <= float(max_k)):
+                    return med_k, "inside_weather"
+        except Exception:
+            pass
+    if structured_arr is not None:
+        names = list(structured_arr.dtype.names or [])
+        for field in ("Tamb", "temp_k", "temperature"):
+            name = _pick_field_name(names, field, [field])
+            if name is None:
+                continue
+            try:
+                arr = np.asarray(structured_arr[name], dtype=float)
+                med = float(np.nanmedian(arr))
+                if field == "temperature" and np.isfinite(med) and med < 120.0:
+                    med = med + 273.15
+                if np.isfinite(med) and (float(min_k) <= med <= float(max_k)):
+                    return med, "spectral"
+            except Exception:
+                continue
+    return float(fallback_k), "default"
+
+
+def _load_weather_meteo_for_tspec_from_table(
     db,
-    telescope: str,
+    table_name: str,
     t_spec: np.ndarray,
     *,
-    db_namespace: str = DEFAULT_DB_NAMESPACE,
     preferred_time_col: str = "time",
 ):
-    table_name = f"{str(db_namespace)}-{str(telescope)}-weather-ambient"
     try:
         arr = _read_structured_array_tolerant(db, table_name)
     except Exception as e:
@@ -546,10 +659,7 @@ def _load_weather_meteo_for_tspec(
         return None
 
     names = list(arr.dtype.names or [])
-    pref = str(preferred_time_col).strip()
-    if pref.lower() == "recorded_time":
-        print("[warn] weather_time_col=recorded_time is not supported; forcing to 'time'")
-        pref = "time"
+    pref = _sanitize_time_col(preferred_time_col, label="weather_time_col")
 
     t_name = _pick_field_name(names, pref, ["time", "timestamp"])
     if (t_name is None) or (str(t_name).strip().lower() == "recorded_time"):
@@ -601,6 +711,18 @@ def _load_weather_meteo_for_tspec(
         print("[warn] weather table fields exist but all are NaN after interpolation; ignoring weather meteo")
         return None
     return out
+
+
+def _load_weather_meteo_for_tspec(
+    db,
+    telescope: str,
+    t_spec: np.ndarray,
+    *,
+    db_namespace: str = DEFAULT_DB_NAMESPACE,
+    preferred_time_col: str = "time",
+):
+    table_name = f"{str(db_namespace)}-{str(telescope)}-weather-ambient"
+    return _load_weather_meteo_for_tspec_from_table(db, table_name, t_spec, preferred_time_col=preferred_time_col)
 
 
 # -----------------------------
@@ -2729,16 +2851,41 @@ def build_dataframe(
     tel_loaddata: str = TEL_LOADDATA,
     planet: str = PLANET,
     azel_source: str,
-    altaz_apply: str,
+    altaz_apply: Optional[str] = None,
+    azel_correction_apply: Optional[str] = None,
+    encoder_table: Optional[str] = None,
+    encoder_table_suffix: str = "ctrl-antenna-encoder",
+    altaz_table: Optional[str] = None,
+    altaz_table_suffix: str = "ctrl-antenna-altaz",
+    encoder_time_col: str = "time",
+    altaz_time_col: str = "time",
     spectrometer_time_offset_sec: float = 0.0,
     encoder_shift_sec: float = 0.0,
     encoder_az_time_offset_sec: float = 0.0,
     encoder_el_time_offset_sec: float = 0.0,
     encoder_vavg_sec: float = 0.0,
-    chopper_wheel: bool,
-    tamb_k: Optional[float],
-    chopper_win_sec: float,
-    chopper_stat: str,
+    chopper_wheel: bool = True,
+    tamb_k: Optional[float] = None,
+    tamb_default_k: float = 300.0,
+    tamb_min_k: float = 250.0,
+    tamb_max_k: float = 330.0,
+    weather_inside_table: Optional[str] = None,
+    weather_inside_table_suffix: str = "weather-ambient",
+    weather_inside_time_col: str = "time",
+    weather_outside_table: Optional[str] = None,
+    weather_outside_table_suffix: str = "weather-ambient",
+    weather_outside_time_col: str = "time",
+    outside_default_temperature_c: float = 0.0,
+    outside_default_pressure_hpa: float = 760.0,
+    outside_default_humidity_pct: float = 30.0,
+    outside_temperature_min_c: float = -50.0,
+    outside_temperature_max_c: float = 50.0,
+    outside_pressure_min_hpa: float = 400.0,
+    outside_pressure_max_hpa: float = 1100.0,
+    outside_humidity_min_pct: float = 0.0,
+    outside_humidity_max_pct: float = 100.0,
+    chopper_win_sec: float = 5.0,
+    chopper_stat: str = "median",
 ) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
     ensure_obs_and_config_files(rawdata_path)
 
@@ -2775,15 +2922,49 @@ def build_dataframe(
         telescope=telescope,
         db_namespace=db_namespace,
     )
-    weather_meteo = _load_weather_meteo_for_tspec(db, telescope, t_spec, db_namespace=db_namespace)
+    src = str(azel_source).lower().strip()
+    azel_apply_mode = _normalize_azel_correction_apply(
+        azel_correction_apply if azel_correction_apply is not None else altaz_apply,
+        default=("subtract" if src == "encoder" else "none"),
+    )
+    encoder_table_resolved = _resolve_table_name(db_namespace=db_namespace, telescope=telescope, full_table=encoder_table, suffix=encoder_table_suffix, default_suffix="ctrl-antenna-encoder")
+    altaz_table_resolved = _resolve_table_name(db_namespace=db_namespace, telescope=telescope, full_table=altaz_table, suffix=altaz_table_suffix, default_suffix="ctrl-antenna-altaz")
+    weather_inside_table_resolved = _resolve_table_name(db_namespace=db_namespace, telescope=telescope, full_table=weather_inside_table, suffix=weather_inside_table_suffix, default_suffix="weather-ambient")
+    weather_outside_table_resolved = _resolve_table_name(db_namespace=db_namespace, telescope=telescope, full_table=weather_outside_table, suffix=weather_outside_table_suffix, default_suffix="weather-ambient")
+    weather_inside_meteo = _load_weather_meteo_for_tspec_from_table(db, weather_inside_table_resolved, t_spec, preferred_time_col=weather_inside_time_col)
+    if weather_outside_table_resolved == weather_inside_table_resolved and str(weather_outside_time_col).strip() == str(weather_inside_time_col).strip():
+        weather_outside_raw = weather_inside_meteo
+    else:
+        weather_outside_raw = _load_weather_meteo_for_tspec_from_table(db, weather_outside_table_resolved, t_spec, preferred_time_col=weather_outside_time_col)
+    weather_outside_meteo = _finalize_outside_weather_meteo(
+        weather_outside_raw,
+        t_spec,
+        default_temperature_c=float(outside_default_temperature_c),
+        default_pressure_hpa=float(outside_default_pressure_hpa),
+        default_humidity_pct=float(outside_default_humidity_pct),
+        temperature_min_c=float(outside_temperature_min_c),
+        temperature_max_c=float(outside_temperature_max_c),
+        pressure_min_hpa=float(outside_pressure_min_hpa),
+        pressure_max_hpa=float(outside_pressure_max_hpa),
+        humidity_min_pct=float(outside_humidity_min_pct),
+        humidity_max_pct=float(outside_humidity_max_pct),
+    )
 
-    # Tamb: user provided OR estimate from weather/spectral necstdb fields else fallback 300 K
+    # Tamb: user provided OR estimate from inside weather/spectral necstdb fields else fallback.
     if tamb_k is None or (isinstance(tamb_k, float) and (not np.isfinite(tamb_k))):
-        tamb_use = _estimate_tamb_k(weather_meteo=weather_meteo, structured_arr=arr_spec, fallback_k=300.0)
+        tamb_use, tamb_source = _estimate_tamb_k_with_source(
+            weather_meteo=weather_inside_meteo,
+            structured_arr=arr_spec,
+            fallback_k=float(tamb_default_k),
+            min_k=float(tamb_min_k),
+            max_k=float(tamb_max_k),
+        )
     else:
         tamb_use = float(tamb_k)
+        tamb_source = "user"
     if (not np.isfinite(tamb_use)) or (tamb_use <= 0):
-        tamb_use = 300.0
+        tamb_use = float(tamb_default_k)
+        tamb_source = "default"
 
     if bool(chopper_wheel):
         ta_star, tp_hot_ref, tp_off_ref = chopper_wheel_tastar(
@@ -2799,14 +2980,15 @@ def build_dataframe(
 
 
     # altaz table (always needed for dlon/dlat and optional lon/lat)
-    alt_name = f"{str(db_namespace)}-{str(telescope)}-ctrl-antenna-altaz"
+    alt_name = altaz_table_resolved
     df_alt = _safe_read_table(db, alt_name)
     if df_alt is None:
         raise RuntimeError(f"cannot read altaz table: {alt_name}")
-    for k in ["time", "dlon", "dlat", "lon", "lat"]:
+    alt_tcol = _sanitize_time_col(altaz_time_col, label="altaz_time_col")
+    for k in [alt_tcol, "dlon", "dlat", "lon", "lat"]:
         if k not in df_alt.columns:
             raise RuntimeError(f"altaz table '{alt_name}' missing column '{k}'")
-    t_alt, alt = _dedup_mean(df_alt, "time", ["lon", "lat", "dlon", "dlat"])
+    t_alt, alt = _dedup_mean(df_alt, alt_tcol, ["lon", "lat", "dlon", "dlat"])
     t_alt, s_alt = _normalize_time_units(t_spec, t_alt, "altaz")
     if s_alt != 1.0:
         print(f"[info] altaz   time scaled by {s_alt} to match unix seconds")
@@ -2820,28 +3002,20 @@ def build_dataframe(
     az_enc_raw = np.full_like(t_spec, np.nan, dtype=float)
     el_enc_raw = np.full_like(t_spec, np.nan, dtype=float)
 
-    src = str(azel_source).lower().strip()
     if src == "altaz":
         # command stream
-        if altaz_apply == "plus":
-            az_true = (lon_alt + dlon) % 360.0
-            el_true = lat_alt + dlat
-        elif altaz_apply == "minus":
-            az_true = (lon_alt - dlon) % 360.0
-            el_true = lat_alt - dlat
-        else:
-            az_true = lon_alt % 360.0
-            el_true = lat_alt
+        az_true, el_true = _apply_azel_correction(lon_alt, lat_alt, dlon, dlat, azel_apply_mode)
     else:
-        # encoder stream (analysis definition: minus)
-        enc_name = f"{str(db_namespace)}-{str(telescope)}-ctrl-antenna-encoder"
+        # encoder stream
+        enc_name = encoder_table_resolved
         df_enc = _safe_read_table(db, enc_name)
         if df_enc is None:
             raise RuntimeError(f"cannot read encoder table: {enc_name}")
-        for k in ["time", "lon", "lat"]:
+        enc_tcol = _sanitize_time_col(encoder_time_col, label="encoder_time_col")
+        for k in [enc_tcol, "lon", "lat"]:
             if k not in df_enc.columns:
                 raise RuntimeError(f"encoder table '{enc_name}' missing column '{k}'")
-        t_enc, enc = _dedup_mean(df_enc, "time", ["lon", "lat"])
+        t_enc, enc = _dedup_mean(df_enc, enc_tcol, ["lon", "lat"])
         t_enc, s_enc = _normalize_time_units(t_spec, t_enc, "encoder")
         if s_enc != 1.0:
             print(f"[info] encoder time scaled by {s_enc} to match unix seconds")
@@ -2875,12 +3049,11 @@ def build_dataframe(
             az_enc = az_enc_raw
             el_enc = el_enc_raw
 
-        az_true = (az_enc - dlon) % 360.0
-        el_true = el_enc - dlat
+        az_true, el_true = _apply_azel_correction(az_enc, el_enc, dlon, dlat, azel_apply_mode)
 
 
     # Sun ephemeris at t_spec
-    az_sun, el_sun = sun_altaz_deg(t_spec, rawdata_path, planet=planet, weather_meteo=weather_meteo)
+    az_sun, el_sun = sun_altaz_deg(t_spec, rawdata_path, planet=planet, weather_meteo=weather_outside_meteo)
 
     # Sun-centered offsets
     off_az = _az_wrap_diff(az_true, az_sun)
@@ -2922,6 +3095,20 @@ def build_dataframe(
     # store Tamb used (scalar) for downstream reference
     try:
         df.attrs["Tamb_k"] = float(tamb_use)
+        df.attrs["tamb_source"] = str(tamb_source)
+        df.attrs["encoder_table_resolved"] = str(encoder_table_resolved)
+        df.attrs["altaz_table_resolved"] = str(altaz_table_resolved)
+        df.attrs["weather_inside_table_resolved"] = str(weather_inside_table_resolved)
+        df.attrs["weather_outside_table_resolved"] = str(weather_outside_table_resolved)
+        df.attrs["encoder_time_col"] = str(encoder_time_col)
+        df.attrs["altaz_time_col"] = str(altaz_time_col)
+        df.attrs["weather_inside_time_col"] = str(weather_inside_time_col)
+        df.attrs["weather_outside_time_col"] = str(weather_outside_time_col)
+        df.attrs["outside_meteo_source"] = str(weather_outside_meteo.get("source"))
+        df.attrs["outside_default_used_temperature"] = bool(weather_outside_meteo.get("used_default_temperature"))
+        df.attrs["outside_default_used_pressure"] = bool(weather_outside_meteo.get("used_default_pressure"))
+        df.attrs["outside_default_used_humidity"] = bool(weather_outside_meteo.get("used_default_humidity"))
+        df.attrs["azel_correction_apply"] = str(azel_apply_mode)
     except Exception:
         pass
     try:
@@ -2939,8 +3126,8 @@ def build_dataframe(
     az_scans, el_scans = build_scans_from_id(df, id_vals)
     print(
         f"[info] built df: N={len(df)} scans: az={len(az_scans)} el={len(el_scans)}  "
-        f"azel_source={src} altaz_apply={altaz_apply} encoder_vavg_sec={encoder_vavg_sec} "
-        f"chopper_wheel={chopper_wheel} Tamb={float(tamb_use):.3g}K"
+        f"azel_source={src} azel_correction_apply={azel_apply_mode} encoder_vavg_sec={encoder_vavg_sec} "
+        f"chopper_wheel={chopper_wheel} Tamb={float(tamb_use):.3g}K tamb_source={tamb_source}"
     )
     print(
         f"[info] spectral time basis: applied={spec_time_meta.get('applied')} "
@@ -2952,6 +3139,11 @@ def build_dataframe(
         f"encoder_common={float(encoder_shift_sec):+.6f}s "
         f"encoder_az={float(encoder_az_time_offset_sec):+.6f}s "
         f"encoder_el={float(encoder_el_time_offset_sec):+.6f}s"
+    )
+    print(
+        f"[info] tables: encoder={encoder_table_resolved} altaz={altaz_table_resolved} "
+        f"weather_inside={weather_inside_table_resolved} weather_outside={weather_outside_table_resolved} "
+        f"outside_source={weather_outside_meteo.get('source')}"
     )
     return df, az_scans, el_scans
 
@@ -3329,7 +3521,7 @@ def write_scan_summary_csv(out_csv: pathlib.Path, scan_ids: List[int], results: 
         "el_track_az_deg", "el_track_el_deg", "el_track_main_offset_deg", "el_track_cross_offset_deg",
         "data_tag", "y_axis",
         "spec_time_basis", "spec_time_suffix", "spec_time_fallback_field", "spec_time_example",
-        "azel_source", "altaz_apply",
+        "azel_source", "azel_correction_apply", "altaz_apply",
         "spectrometer_time_offset_sec",
         "encoder_shift_sec", "encoder_az_time_offset_sec", "encoder_el_time_offset_sec", "encoder_vavg_sec",
         "chopper_wheel",
@@ -3769,6 +3961,7 @@ def main() -> None:
     ap.add_argument("rawdata", help="RawData directory")
     ap.add_argument("--spectral", default=DEFAULT_SPECTRAL_NAME, help=f"Spectral name (default: {DEFAULT_SPECTRAL_NAME})")
     ap.add_argument("--db-namespace", default=DEFAULT_DB_NAMESPACE, help=f"Database namespace/prefix for NECST tables (default: {DEFAULT_DB_NAMESPACE})")
+    ap.add_argument("--telescope", default=TELESCOPE, help=f"Telescope name used in NECST DB table names (default: {TELESCOPE})")
     ap.add_argument("--outdir", default=DEFAULT_OUTDIR, help="Output directory for PNGs (default: current dir)")
 
     ap.add_argument("--debug-plot", action="store_true", default=DEFAULT_DEBUG_PLOT,
@@ -3779,8 +3972,16 @@ def main() -> None:
 
     ap.add_argument("--azel-source", choices=["encoder", "altaz"], default=DEFAULT_AZEL_SOURCE,
                     help="Az/El source. encoder uses encoder lon/lat; altaz uses altaz lon/lat (commands).")
-    ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default=DEFAULT_ALTAZ_APPLY,
-                    help="Only for --azel-source altaz: whether to apply dlon/dlat to lon/lat.")
+    ap.add_argument("--azel-correction-apply", choices=["none", "subtract", "add"], default=None,
+                    help="Apply dlon/dlat to the selected Az/El source. Works for both --azel-source encoder and altaz.")
+    ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default=None,
+                    help="Legacy alias for --azel-correction-apply.")
+    ap.add_argument("--encoder-table", default=None, help="Full encoder table name. If omitted, resolve from db_namespace/telescope and suffix.")
+    ap.add_argument("--encoder-table-suffix", default="ctrl-antenna-encoder", help="Encoder table suffix used with db_namespace/telescope when --encoder-table is omitted.")
+    ap.add_argument("--altaz-table", default=None, help="Full altaz/cmd table name. If omitted, resolve from db_namespace/telescope and suffix.")
+    ap.add_argument("--altaz-table-suffix", default="ctrl-antenna-altaz", help="Altaz/cmd table suffix used with db_namespace/telescope when --altaz-table is omitted.")
+    ap.add_argument("--encoder-time-col", default="time", help="Encoder time column (recommended: time).")
+    ap.add_argument("--altaz-time-col", default="time", help="Altaz/cmd time column (recommended: time).")
     ap.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0,
                     help="Time offset (sec) applied to spectral timestamps before interpolation. Corrected time = recorded spectral time + offset.")
     ap.add_argument("--encoder-shift-sec", type=float, default=DEFAULT_ENCODER_SHIFT_SEC,
@@ -3805,9 +4006,29 @@ def main() -> None:
         default=None,
         help=(
             "Ambient load temperature Tamb [K]. If omitted, estimate from necstdb weather/spectral data "
-            "(temperature/temp_k/Tamb) and use it if within 50..400 K; otherwise fallback to 300 K."
+            "(temperature/temp_k/Tamb) and use it if within configured limits; otherwise fallback to --tamb-default-k."
         ),
     )
+    ap.add_argument("--tamb-default-k", type=float, default=300.0, help="Fallback Tamb [K] used when inside weather/spectral temperature is missing or invalid.")
+    ap.add_argument("--tamb-min-k", type=float, default=250.0, help="Minimum allowed Tamb [K] before fallback is used.")
+    ap.add_argument("--tamb-max-k", type=float, default=330.0, help="Maximum allowed Tamb [K] before fallback is used.")
+    ap.add_argument("--weather-table", default=None, help="Legacy weather table alias applied to both inside/outside weather when specific tables are not set.")
+    ap.add_argument("--weather-time-col", default=None, help="Legacy weather time column alias applied to both inside/outside weather time columns.")
+    ap.add_argument("--weather-inside-table", default=None, help="Full inside-weather table name for Tamb estimation.")
+    ap.add_argument("--weather-inside-table-suffix", default="weather-ambient", help="Inside-weather table suffix used with db_namespace/telescope when --weather-inside-table is omitted.")
+    ap.add_argument("--weather-inside-time-col", default=None, help="Inside-weather time column.")
+    ap.add_argument("--weather-outside-table", default=None, help="Full outside-weather table name for refraction meteorology.")
+    ap.add_argument("--weather-outside-table-suffix", default="weather-ambient", help="Outside-weather table suffix used with db_namespace/telescope when --weather-outside-table is omitted.")
+    ap.add_argument("--weather-outside-time-col", default=None, help="Outside-weather time column.")
+    ap.add_argument("--outside-default-temperature-c", type=float, default=0.0, help="Fallback outside temperature [C] for refraction.")
+    ap.add_argument("--outside-default-pressure-hpa", type=float, default=760.0, help="Fallback outside pressure [hPa] for refraction.")
+    ap.add_argument("--outside-default-humidity-pct", type=float, default=30.0, help="Fallback outside relative humidity [%] for refraction.")
+    ap.add_argument("--outside-temperature-min-c", type=float, default=-50.0, help="Minimum allowed outside temperature [C] before fallback is used.")
+    ap.add_argument("--outside-temperature-max-c", type=float, default=50.0, help="Maximum allowed outside temperature [C] before fallback is used.")
+    ap.add_argument("--outside-pressure-min-hpa", type=float, default=400.0, help="Minimum allowed outside pressure [hPa] before fallback is used.")
+    ap.add_argument("--outside-pressure-max-hpa", type=float, default=1100.0, help="Maximum allowed outside pressure [hPa] before fallback is used.")
+    ap.add_argument("--outside-humidity-min-pct", type=float, default=0.0, help="Minimum allowed outside humidity [%] before fallback is used.")
+    ap.add_argument("--outside-humidity-max-pct", type=float, default=100.0, help="Maximum allowed outside humidity [%] before fallback is used.")
     # The following two options are kept only for backward compatibility; the current
     # 1-load chopper-wheel implementation uses direct np.interp(edge-hold) without smoothing.
     ap.add_argument("--chopper-win-sec", type=float, default=DEFAULT_CHOPPER_WIN_SEC,
@@ -3928,12 +4149,27 @@ def main() -> None:
     tag = rawdata_path.name
     outdir.mkdir(parents=True, exist_ok=True)
 
+    legacy_weather_table = args.weather_table
+    legacy_weather_time_col = args.weather_time_col or "time"
+    weather_inside_table = args.weather_inside_table if args.weather_inside_table is not None else legacy_weather_table
+    weather_outside_table = args.weather_outside_table if args.weather_outside_table is not None else legacy_weather_table
+    weather_inside_time_col = args.weather_inside_time_col if args.weather_inside_time_col is not None else legacy_weather_time_col
+    weather_outside_time_col = args.weather_outside_time_col if args.weather_outside_time_col is not None else legacy_weather_time_col
+
     df, az_scans, el_scans = build_dataframe(
         rawdata_path,
         args.spectral,
         db_namespace=args.db_namespace,
+        telescope=args.telescope,
         azel_source=args.azel_source,
+        azel_correction_apply=args.azel_correction_apply,
         altaz_apply=args.altaz_apply,
+        encoder_table=args.encoder_table,
+        encoder_table_suffix=args.encoder_table_suffix,
+        altaz_table=args.altaz_table,
+        altaz_table_suffix=args.altaz_table_suffix,
+        encoder_time_col=args.encoder_time_col,
+        altaz_time_col=args.altaz_time_col,
         spectrometer_time_offset_sec=args.spectrometer_time_offset_sec,
         encoder_shift_sec=args.encoder_shift_sec,
         encoder_az_time_offset_sec=args.encoder_az_time_offset_sec,
@@ -3941,6 +4177,24 @@ def main() -> None:
         encoder_vavg_sec=args.encoder_vavg_sec,
         chopper_wheel=bool(args.chopper_wheel),
         tamb_k=args.tamb_k,
+        weather_inside_table=weather_inside_table,
+        weather_inside_table_suffix=args.weather_inside_table_suffix,
+        weather_inside_time_col=weather_inside_time_col,
+        weather_outside_table=weather_outside_table,
+        weather_outside_table_suffix=args.weather_outside_table_suffix,
+        weather_outside_time_col=weather_outside_time_col,
+        tamb_default_k=float(args.tamb_default_k),
+        tamb_min_k=float(args.tamb_min_k),
+        tamb_max_k=float(args.tamb_max_k),
+        outside_default_temperature_c=float(args.outside_default_temperature_c),
+        outside_default_pressure_hpa=float(args.outside_default_pressure_hpa),
+        outside_default_humidity_pct=float(args.outside_default_humidity_pct),
+        outside_temperature_min_c=float(args.outside_temperature_min_c),
+        outside_temperature_max_c=float(args.outside_temperature_max_c),
+        outside_pressure_min_hpa=float(args.outside_pressure_min_hpa),
+        outside_pressure_max_hpa=float(args.outside_pressure_max_hpa),
+        outside_humidity_min_pct=float(args.outside_humidity_min_pct),
+        outside_humidity_max_pct=float(args.outside_humidity_max_pct),
         chopper_win_sec=float(args.chopper_win_sec),
         chopper_stat=str(args.chopper_stat),
     )

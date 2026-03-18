@@ -51,6 +51,47 @@ def _choose_str_setting(args: argparse.Namespace, argv: Optional[Sequence[str]],
         return str(getattr(args, attr, default))
     return str(global_cfg.get(global_key))
 
+def _choose_optional_str_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: Optional[str] = None) -> Optional[str]:
+    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt) or (global_cfg.get(global_key) is None):
+        value = getattr(args, attr, default)
+    else:
+        value = global_cfg.get(global_key)
+    if value is None:
+        return default
+    s = str(value).strip()
+    return s if s else default
+
+
+def _normalize_legacy_azel_correction_apply(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s == "minus":
+        return "subtract"
+    if s == "plus":
+        return "add"
+    if s in {"subtract", "add", "none"}:
+        return s
+    raise ValueError(f"unsupported azel correction mode: {value!r}")
+
+
+def _resolve_azel_correction_apply(args: argparse.Namespace, argv: Optional[Sequence[str]], global_cfg: Dict[str, Any], azel_source: str) -> str:
+    raw = None
+    if _argv_has_option(argv, "--azel-correction-apply"):
+        raw = getattr(args, "azel_correction_apply", None)
+    elif _argv_has_option(argv, "--altaz-apply"):
+        raw = getattr(args, "altaz_apply", None)
+    elif global_cfg.get("azel_correction_apply") is not None:
+        raw = global_cfg.get("azel_correction_apply")
+    elif global_cfg.get("altaz_apply") is not None:
+        raw = global_cfg.get("altaz_apply")
+    norm = _normalize_legacy_azel_correction_apply(raw)
+    if norm is not None:
+        return norm
+    return "subtract" if str(azel_source).strip().lower() == "encoder" else "none"
+
 
 
 def estimate_hpbw_init_arcsec(restfreq_hz: Optional[float], dish_diameter_m: float, hpbw_factor: float, fallback_arcsec: float) -> float:
@@ -136,13 +177,36 @@ def _write_config_snapshot(path: Path, *, base_config: SunScanAnalysisConfig, va
             "tel_loaddata": base_config.input.tel_loaddata,
             "planet": base_config.input.planet,
             "azel_source": base_config.input.azel_source,
+            "azel_correction_apply": base_config.input.azel_correction_apply,
             "altaz_apply": base_config.input.altaz_apply,
+            "encoder_table": base_config.input.encoder_table,
+            "encoder_table_suffix": base_config.input.encoder_table_suffix,
+            "altaz_table": base_config.input.altaz_table,
+            "altaz_table_suffix": base_config.input.altaz_table_suffix,
+            "weather_inside_table": base_config.calibration.weather_inside_table,
+            "weather_inside_table_suffix": base_config.calibration.weather_inside_table_suffix,
+            "weather_inside_time_col": base_config.calibration.weather_inside_time_col,
+            "weather_outside_table": base_config.refraction.weather_outside_table,
+            "weather_outside_table_suffix": base_config.refraction.weather_outside_table_suffix,
+            "weather_outside_time_col": base_config.refraction.weather_outside_time_col,
             "spectrometer_time_offset_sec": base_config.input.spectrometer_time_offset_sec,
             "encoder_shift_sec": base_config.input.encoder_shift_sec,
             "encoder_az_time_offset_sec": base_config.input.encoder_az_time_offset_sec,
             "encoder_el_time_offset_sec": base_config.input.encoder_el_time_offset_sec,
             "encoder_vavg_sec": base_config.input.encoder_vavg_sec,
             "chopper_wheel": base_config.calibration.chopper_wheel,
+            "tamb_default_k": base_config.calibration.tamb_default_k,
+            "tamb_min_k": base_config.calibration.tamb_min_k,
+            "tamb_max_k": base_config.calibration.tamb_max_k,
+            "outside_default_temperature_c": base_config.refraction.outside_default_temperature_c,
+            "outside_default_pressure_hpa": base_config.refraction.outside_default_pressure_hpa,
+            "outside_default_humidity_pct": base_config.refraction.outside_default_humidity_pct,
+            "outside_temperature_min_c": base_config.refraction.outside_temperature_min_c,
+            "outside_temperature_max_c": base_config.refraction.outside_temperature_max_c,
+            "outside_pressure_min_hpa": base_config.refraction.outside_pressure_min_hpa,
+            "outside_pressure_max_hpa": base_config.refraction.outside_pressure_max_hpa,
+            "outside_humidity_min_pct": base_config.refraction.outside_humidity_min_pct,
+            "outside_humidity_max_pct": base_config.refraction.outside_humidity_max_pct,
             "ripple_enabled": base_config.ripple.enabled,
             "trim_enabled": base_config.trim.enabled,
             "edge_fit_enabled": base_config.edge_fit.enabled,
@@ -312,17 +376,44 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--stream-name", dest="stream_names", action="append", default=None, help="Select a specific stream name (repeatable)")
 
     ap.add_argument("--azel-source", choices=["encoder", "altaz"], default="encoder")
-    ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default="none")
+    ap.add_argument("--azel-correction-apply", choices=["none", "subtract", "add"], default=None)
+    ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default=None, help="Legacy alias for --azel-correction-apply")
     ap.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-shift-sec", type=float, default=0.0)
     ap.add_argument("--encoder-az-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-el-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-vavg-sec", type=float, default=0.0)
+    ap.add_argument("--encoder-table", default=None)
+    ap.add_argument("--encoder-table-suffix", default=None)
+    ap.add_argument("--altaz-table", default=None)
+    ap.add_argument("--altaz-table-suffix", default=None)
+    ap.add_argument("--encoder-time-col", default="time")
+    ap.add_argument("--altaz-time-col", default="time")
+    ap.add_argument("--weather-inside-table", default=None)
+    ap.add_argument("--weather-inside-table-suffix", default=None)
+    ap.add_argument("--weather-inside-time-col", default=None)
+    ap.add_argument("--weather-outside-table", default=None)
+    ap.add_argument("--weather-outside-table-suffix", default=None)
+    ap.add_argument("--weather-outside-time-col", default=None)
+    ap.add_argument("--weather-table", default=None, help="Legacy alias applied to both inside/outside weather tables")
+    ap.add_argument("--weather-time-col", default=None, help="Legacy alias applied to both inside/outside weather time columns")
     ap.add_argument("--no-chopper-wheel", dest="chopper_wheel", action="store_false")
     ap.add_argument("--tamb-k", type=float, default=None)
     ap.add_argument("--chopper-win-sec", type=float, default=5.0)
     ap.add_argument("--chopper-stat", choices=["median", "mean"], default="median")
     ap.set_defaults(chopper_wheel=True)
+    ap.add_argument("--tamb-default-k", type=float, default=300.0)
+    ap.add_argument("--tamb-min-k", type=float, default=250.0)
+    ap.add_argument("--tamb-max-k", type=float, default=330.0)
+    ap.add_argument("--outside-default-temperature-c", type=float, default=0.0)
+    ap.add_argument("--outside-default-pressure-hpa", type=float, default=760.0)
+    ap.add_argument("--outside-default-humidity-pct", type=float, default=30.0)
+    ap.add_argument("--outside-temperature-min-c", type=float, default=-50.0)
+    ap.add_argument("--outside-temperature-max-c", type=float, default=50.0)
+    ap.add_argument("--outside-pressure-min-hpa", type=float, default=400.0)
+    ap.add_argument("--outside-pressure-max-hpa", type=float, default=1100.0)
+    ap.add_argument("--outside-humidity-min-pct", type=float, default=0.0)
+    ap.add_argument("--outside-humidity-max-pct", type=float, default=100.0)
 
     ap.add_argument("--profile-xlim-deg", type=float, default=1.0)
     ap.add_argument("--ripple-no-remove", dest="ripple_remove", action="store_false")
@@ -385,15 +476,54 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
     cfg.input.telescope = _choose_str_setting(args, argv, "--telescope", "telescope", global_cfg, "telescope", "OMU1P85M")
     cfg.input.tel_loaddata = _choose_str_setting(args, argv, "--tel-loaddata", "tel_loaddata", global_cfg, "tel_loaddata", "OMU1p85m")
     cfg.input.planet = _choose_str_setting(args, argv, "--planet", "planet", global_cfg, "planet", "sun")
-    cfg.input.azel_source = str(args.azel_source)
-    cfg.input.altaz_apply = str(args.altaz_apply)
+    cfg.input.azel_source = _choose_str_setting(args, argv, "--azel-source", "azel_source", global_cfg, "azel_source", "encoder")
+    cfg.input.azel_correction_apply = _resolve_azel_correction_apply(args, argv, global_cfg, cfg.input.azel_source)
+    cfg.input.altaz_apply = cfg.input.azel_correction_apply
+    cfg.input.encoder_table = _choose_optional_str_setting(args, argv, "--encoder-table", "encoder_table", global_cfg, "encoder_table", None)
+    cfg.input.encoder_table_suffix = _choose_optional_str_setting(args, argv, "--encoder-table-suffix", "encoder_table_suffix", global_cfg, "encoder_table_suffix", "ctrl-antenna-encoder") or "ctrl-antenna-encoder"
+    cfg.input.altaz_table = _choose_optional_str_setting(args, argv, "--altaz-table", "altaz_table", global_cfg, "altaz_table", None)
+    cfg.input.altaz_table_suffix = _choose_optional_str_setting(args, argv, "--altaz-table-suffix", "altaz_table_suffix", global_cfg, "altaz_table_suffix", "ctrl-antenna-altaz") or "ctrl-antenna-altaz"
+    cfg.input.encoder_time_col = _choose_str_setting(args, argv, "--encoder-time-col", "encoder_time_col", global_cfg, "encoder_time_col", "time")
+    cfg.input.altaz_time_col = _choose_str_setting(args, argv, "--altaz-time-col", "altaz_time_col", global_cfg, "altaz_time_col", "time")
     cfg.input.spectrometer_time_offset_sec = _choose_float_setting(args, argv, "--spectrometer-time-offset-sec", "spectrometer_time_offset_sec", global_cfg, "spectrometer_time_offset_sec", 0.0)
     cfg.input.encoder_shift_sec = _choose_float_setting(args, argv, "--encoder-shift-sec", "encoder_shift_sec", global_cfg, "encoder_shift_sec", 0.0)
     cfg.input.encoder_az_time_offset_sec = _choose_float_setting(args, argv, "--encoder-az-time-offset-sec", "encoder_az_time_offset_sec", global_cfg, "encoder_az_time_offset_sec", 0.0)
     cfg.input.encoder_el_time_offset_sec = _choose_float_setting(args, argv, "--encoder-el-time-offset-sec", "encoder_el_time_offset_sec", global_cfg, "encoder_el_time_offset_sec", 0.0)
-    cfg.input.encoder_vavg_sec = float(args.encoder_vavg_sec)
+    cfg.input.encoder_vavg_sec = _choose_float_setting(args, argv, "--encoder-vavg-sec", "encoder_vavg_sec", global_cfg, "encoder_vavg_sec", 0.0)
     cfg.calibration.chopper_wheel = bool(args.chopper_wheel)
     cfg.calibration.tamb_k = args.tamb_k
+    cfg.calibration.tamb_default_k = _choose_float_setting(args, argv, "--tamb-default-k", "tamb_default_k", global_cfg, "tamb_default_k", 300.0)
+    cfg.calibration.tamb_min_k = _choose_float_setting(args, argv, "--tamb-min-k", "tamb_min_k", global_cfg, "tamb_min_k", 250.0)
+    cfg.calibration.tamb_max_k = _choose_float_setting(args, argv, "--tamb-max-k", "tamb_max_k", global_cfg, "tamb_max_k", 330.0)
+    legacy_weather_table = _choose_optional_str_setting(args, argv, "--weather-table", "weather_table", global_cfg, "weather_table", None)
+    legacy_weather_time_col = _choose_optional_str_setting(args, argv, "--weather-time-col", "weather_time_col", global_cfg, "weather_time_col", None)
+    cfg.calibration.weather_inside_table = _choose_optional_str_setting(args, argv, "--weather-inside-table", "weather_inside_table", global_cfg, "weather_inside_table", legacy_weather_table)
+    cfg.calibration.weather_inside_table_suffix = _choose_optional_str_setting(args, argv, "--weather-inside-table-suffix", "weather_inside_table_suffix", global_cfg, "weather_inside_table_suffix", "weather-ambient") or "weather-ambient"
+    cfg.calibration.weather_inside_time_col = _choose_optional_str_setting(args, argv, "--weather-inside-time-col", "weather_inside_time_col", global_cfg, "weather_inside_time_col", legacy_weather_time_col or "time") or (legacy_weather_time_col or "time")
+    cfg.refraction.weather_outside_table = _choose_optional_str_setting(args, argv, "--weather-outside-table", "weather_outside_table", global_cfg, "weather_outside_table", legacy_weather_table)
+    cfg.refraction.weather_outside_table_suffix = _choose_optional_str_setting(args, argv, "--weather-outside-table-suffix", "weather_outside_table_suffix", global_cfg, "weather_outside_table_suffix", "weather-ambient") or "weather-ambient"
+    cfg.refraction.weather_outside_time_col = _choose_optional_str_setting(args, argv, "--weather-outside-time-col", "weather_outside_time_col", global_cfg, "weather_outside_time_col", legacy_weather_time_col or "time") or (legacy_weather_time_col or "time")
+    legacy_weather_table_cli = _argv_has_option(argv, "--weather-table")
+    legacy_weather_time_cli = _argv_has_option(argv, "--weather-time-col")
+    if legacy_weather_table_cli:
+        if not _argv_has_option(argv, "--weather-inside-table"):
+            cfg.calibration.weather_inside_table = legacy_weather_table
+        if not _argv_has_option(argv, "--weather-outside-table"):
+            cfg.refraction.weather_outside_table = legacy_weather_table
+    if legacy_weather_time_cli:
+        if not _argv_has_option(argv, "--weather-inside-time-col"):
+            cfg.calibration.weather_inside_time_col = legacy_weather_time_col or "time"
+        if not _argv_has_option(argv, "--weather-outside-time-col"):
+            cfg.refraction.weather_outside_time_col = legacy_weather_time_col or "time"
+    cfg.refraction.outside_default_temperature_c = _choose_float_setting(args, argv, "--outside-default-temperature-c", "outside_default_temperature_c", global_cfg, "outside_default_temperature_c", 0.0)
+    cfg.refraction.outside_default_pressure_hpa = _choose_float_setting(args, argv, "--outside-default-pressure-hpa", "outside_default_pressure_hpa", global_cfg, "outside_default_pressure_hpa", 760.0)
+    cfg.refraction.outside_default_humidity_pct = _choose_float_setting(args, argv, "--outside-default-humidity-pct", "outside_default_humidity_pct", global_cfg, "outside_default_humidity_pct", 30.0)
+    cfg.refraction.outside_temperature_min_c = _choose_float_setting(args, argv, "--outside-temperature-min-c", "outside_temperature_min_c", global_cfg, "outside_temperature_min_c", -50.0)
+    cfg.refraction.outside_temperature_max_c = _choose_float_setting(args, argv, "--outside-temperature-max-c", "outside_temperature_max_c", global_cfg, "outside_temperature_max_c", 50.0)
+    cfg.refraction.outside_pressure_min_hpa = _choose_float_setting(args, argv, "--outside-pressure-min-hpa", "outside_pressure_min_hpa", global_cfg, "outside_pressure_min_hpa", 400.0)
+    cfg.refraction.outside_pressure_max_hpa = _choose_float_setting(args, argv, "--outside-pressure-max-hpa", "outside_pressure_max_hpa", global_cfg, "outside_pressure_max_hpa", 1100.0)
+    cfg.refraction.outside_humidity_min_pct = _choose_float_setting(args, argv, "--outside-humidity-min-pct", "outside_humidity_min_pct", global_cfg, "outside_humidity_min_pct", 0.0)
+    cfg.refraction.outside_humidity_max_pct = _choose_float_setting(args, argv, "--outside-humidity-max-pct", "outside_humidity_max_pct", global_cfg, "outside_humidity_max_pct", 100.0)
     cfg.calibration.chopper_win_sec = float(args.chopper_win_sec)
     cfg.calibration.chopper_stat = str(args.chopper_stat)
     cfg.profile.profile_xlim_deg = float(args.profile_xlim_deg)

@@ -742,8 +742,10 @@ class CommonInputs:
     arr_enc: np.ndarray
     arr_alt: np.ndarray
     wcs_df: Optional[pd.DataFrame]
-    weather_table: str
-    weather_time_col: str
+    weather_inside_table: str
+    weather_inside_time_col: str
+    weather_outside_table: str
+    weather_outside_time_col: str
 
 
 @dataclass
@@ -805,6 +807,17 @@ def _nonempty_str(value, default=None):
     s = str(value).strip()
     return s if s else default
 
+
+def _normalize_table_suffix(value, default):
+    s = _nonempty_str(value, default=None)
+    return s if s is not None else str(default)
+
+
+def _resolve_prefixed_table_name(db_namespace, telescope, full_table, suffix, default_suffix):
+    full = _nonempty_str(full_table, default=None)
+    if full is not None:
+        return full
+    return _table_name(db_namespace, telescope, _normalize_table_suffix(suffix, default_suffix))
 
 def _table_name(*parts):
     cleaned = []
@@ -1352,7 +1365,9 @@ def build_legacy_single_stream_config(args):
 # -----------------------------------------------------------------------------
 # 2) Extract
 # -----------------------------------------------------------------------------
-def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table, weather_table, weather_time_col,
+def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
+                          weather_inside_table, weather_inside_time_col,
+                          weather_outside_table, weather_outside_time_col,
                           encoder_table=None, altaz_table=None):
     db = necstdb.opendb(str(rawdata_path))
     enc_table = _nonempty_str(encoder_table, default=_table_name(db_namespace, telescope, "ctrl", "antenna", "encoder"))
@@ -1365,8 +1380,10 @@ def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table, weat
         arr_enc=arr_enc,
         arr_alt=arr_alt,
         wcs_df=wcs_df,
-        weather_table=str(weather_table),
-        weather_time_col=str(weather_time_col),
+        weather_inside_table=str(weather_inside_table),
+        weather_inside_time_col=str(weather_inside_time_col),
+        weather_outside_table=str(weather_outside_table),
+        weather_outside_time_col=str(weather_outside_time_col),
     )
 
 
@@ -1460,36 +1477,56 @@ def _choose_meteo_array(met_source, weather_arr, spectral_arr):
 
 
 def resolve_stream_meteorology(common, stream_data, met_source, interp_extrap):
-    met_weather = None
+    inside_weather = None
+    outside_weather = None
     if met_source in ("auto", "weather"):
-        met_weather = _try_meteo_timeseries_from_weather_table(
+        inside_weather = _try_meteo_timeseries_from_weather_table(
             common.db,
-            common.weather_table,
+            common.weather_inside_table,
             stream_data.t_spec,
-            preferred_time_col=common.weather_time_col,
+            preferred_time_col=common.weather_inside_time_col,
             extrap=interp_extrap,
         )
-        if met_weather is not None:
-            print("[info] stream={} meteorology from weather table: {} (time_col={})".format(
-                stream_data.stream.name, met_weather.get("table"), met_weather.get("time_col")
+        if inside_weather is not None:
+            print("[info] stream={} inside meteorology from weather table: {} (time_col={})".format(
+                stream_data.stream.name, inside_weather.get("table"), inside_weather.get("time_col")
             ))
+        if (str(common.weather_outside_table) == str(common.weather_inside_table)) and (str(common.weather_outside_time_col) == str(common.weather_inside_time_col)):
+            outside_weather = inside_weather
+        else:
+            outside_weather = _try_meteo_timeseries_from_weather_table(
+                common.db,
+                common.weather_outside_table,
+                stream_data.t_spec,
+                preferred_time_col=common.weather_outside_time_col,
+                extrap=interp_extrap,
+            )
+            if outside_weather is not None:
+                print("[info] stream={} outside meteorology from weather table: {} (time_col={})".format(
+                    stream_data.stream.name, outside_weather.get("table"), outside_weather.get("time_col")
+                ))
 
+    tamb_c = _choose_meteo_array(
+        met_source,
+        inside_weather.get("temp_c") if inside_weather is not None else None,
+        stream_data.temp_c_spectral,
+    )
     temp_c = _choose_meteo_array(
         met_source,
-        met_weather.get("temp_c") if met_weather is not None else None,
+        outside_weather.get("temp_c") if outside_weather is not None else None,
         stream_data.temp_c_spectral,
     )
     press_hpa = _choose_meteo_array(
         met_source,
-        met_weather.get("press_hpa") if met_weather is not None else None,
+        outside_weather.get("press_hpa") if outside_weather is not None else None,
         stream_data.press_hpa_spectral,
     )
     humid_pct = _choose_meteo_array(
         met_source,
-        met_weather.get("humid_pct") if met_weather is not None else None,
+        outside_weather.get("humid_pct") if outside_weather is not None else None,
         stream_data.humid_pct_spectral,
     )
-    return temp_c, press_hpa, humid_pct, met_weather
+    return tamb_c, temp_c, press_hpa, humid_pct, inside_weather, outside_weather
 
 
 # -----------------------------------------------------------------------------
@@ -1803,13 +1840,44 @@ def _fill_with_fallback(arr, fallback):
     return out
 
 
+def finalize_inside_temperature_for_tamb(t_spec, tamb_c, args):
+    inside_default = getattr(args, "inside_default_temperature_c", None)
+    if inside_default is None:
+        inside_default = getattr(args, "met_temperature_c", 10.0)
+    temp_fb = float(inside_default)
+    out = _fill_with_fallback(tamb_c, np.full_like(t_spec, temp_fb, dtype=float))
+    tmin = float(getattr(args, "inside_temperature_min_c", -50.0))
+    tmax = float(getattr(args, "inside_temperature_max_c", 50.0))
+    bad = (~np.isfinite(out)) | (out < tmin) | (out > tmax)
+    out = np.where(bad, temp_fb, out)
+    return out
+
+
 def finalize_meteorology_for_refraction(t_spec, temp_c, press_hpa, humid_pct, args):
-    press_fb = float(args.met_pressure_hpa) if getattr(args, "met_pressure_hpa", None) is not None else _pressure_from_elev_hpa(float(args.site_elev))
-    temp_fb = float(args.met_temperature_c)
-    humid_fb = float(args.met_humidity_pct)
+    outside_press_default = getattr(args, "outside_default_pressure_hpa", None)
+    if outside_press_default is None:
+        outside_press_default = float(args.met_pressure_hpa) if getattr(args, "met_pressure_hpa", None) is not None else _pressure_from_elev_hpa(float(args.site_elev))
+    outside_temp_default = getattr(args, "outside_default_temperature_c", None)
+    if outside_temp_default is None:
+        outside_temp_default = getattr(args, "met_temperature_c", 10.0)
+    outside_humid_default = getattr(args, "outside_default_humidity_pct", None)
+    if outside_humid_default is None:
+        outside_humid_default = getattr(args, "met_humidity_pct", 50.0)
+    press_fb = float(outside_press_default)
+    temp_fb = float(outside_temp_default)
+    humid_fb = float(outside_humid_default)
     press = _fill_with_fallback(press_hpa, np.full_like(t_spec, press_fb, dtype=float))
     temp = _fill_with_fallback(temp_c, np.full_like(t_spec, temp_fb, dtype=float))
     humid = _fill_with_fallback(humid_pct, np.full_like(t_spec, humid_fb, dtype=float))
+    pmin = float(getattr(args, "outside_pressure_min_hpa", 400.0))
+    pmax = float(getattr(args, "outside_pressure_max_hpa", 1100.0))
+    tmin = float(getattr(args, "outside_temperature_min_c", -50.0))
+    tmax = float(getattr(args, "outside_temperature_max_c", 50.0))
+    hmin = float(getattr(args, "outside_humidity_min_pct", 0.0))
+    hmax = float(getattr(args, "outside_humidity_max_pct", 100.0))
+    press = np.where((~np.isfinite(press)) | (press < pmin) | (press > pmax), press_fb, press)
+    temp = np.where((~np.isfinite(temp)) | (temp < tmin) | (temp > tmax), temp_fb, temp)
+    humid = np.where((~np.isfinite(humid)) | (humid < hmin) | (humid > hmax), humid_fb, humid)
     return temp, press, humid
 
 
@@ -2253,8 +2321,30 @@ def parse_args(argv):
     p.add_argument("--met-obswl-um", type=float, default=None)
 
     p.add_argument("--met-source", default="auto", choices=["auto", "weather", "spectral", "fallback"])
+    p.add_argument("--encoder-table", default=None)
+    p.add_argument("--encoder-table-suffix", default=None)
+    p.add_argument("--altaz-table", default=None)
+    p.add_argument("--altaz-table-suffix", default=None)
+    p.add_argument("--weather-inside-table", default=None)
+    p.add_argument("--weather-inside-table-suffix", default=None)
+    p.add_argument("--weather-inside-time-col", default=None)
+    p.add_argument("--weather-outside-table", default=None)
+    p.add_argument("--weather-outside-table-suffix", default=None)
+    p.add_argument("--weather-outside-time-col", default=None)
     p.add_argument("--weather-table", default="auto")
     p.add_argument("--weather-time-col", default="time")
+    p.add_argument("--inside-default-temperature-c", type=float, default=None)
+    p.add_argument("--inside-temperature-min-c", type=float, default=None)
+    p.add_argument("--inside-temperature-max-c", type=float, default=None)
+    p.add_argument("--outside-default-temperature-c", type=float, default=None)
+    p.add_argument("--outside-default-pressure-hpa", type=float, default=None)
+    p.add_argument("--outside-default-humidity-pct", type=float, default=None)
+    p.add_argument("--outside-temperature-min-c", type=float, default=None)
+    p.add_argument("--outside-temperature-max-c", type=float, default=None)
+    p.add_argument("--outside-pressure-min-hpa", type=float, default=None)
+    p.add_argument("--outside-pressure-max-hpa", type=float, default=None)
+    p.add_argument("--outside-humidity-min-pct", type=float, default=None)
+    p.add_argument("--outside-humidity-max-pct", type=float, default=None)
 
     p.add_argument("--collapse", action="store_true")
     p.add_argument("--pe-cor", action="store_true", help="legacy compatibility; unused")
@@ -2298,9 +2388,55 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     if (not args.spectrometer_config) or _argv_has_option(argv, "--telescope") or (telescope_cfg is None):
         telescope = str(args.telescope)
 
-    encoder_table = _nonempty_str(global_cfg.get("encoder_table"), default=None)
-    altaz_table = _nonempty_str(global_cfg.get("altaz_table"), default=None)
+    encoder_table = _nonempty_str(getattr(args, "encoder_table", None), default=None)
+    if encoder_table is None:
+        encoder_table = _nonempty_str(global_cfg.get("encoder_table"), default=None)
+    encoder_table_suffix = _nonempty_str(getattr(args, "encoder_table_suffix", None), default=_nonempty_str(global_cfg.get("encoder_table_suffix"), default="ctrl-antenna-encoder"))
+    encoder_time_col_cfg = _nonempty_str(global_cfg.get("encoder_time_col"), default=None)
+    if (not args.spectrometer_config) or _argv_has_option(argv, "--encoder-time-col") or (encoder_time_col_cfg is None):
+        encoder_time_col = str(getattr(args, "encoder_time_col", "time"))
+    else:
+        encoder_time_col = str(encoder_time_col_cfg)
+    altaz_table = _nonempty_str(getattr(args, "altaz_table", None), default=None)
+    if altaz_table is None:
+        altaz_table = _nonempty_str(global_cfg.get("altaz_table"), default=None)
+    altaz_table_suffix = _nonempty_str(getattr(args, "altaz_table_suffix", None), default=_nonempty_str(global_cfg.get("altaz_table_suffix"), default="ctrl-antenna-altaz"))
+    altaz_time_col_cfg = _nonempty_str(global_cfg.get("altaz_time_col"), default=None)
+    if (not args.spectrometer_config) or _argv_has_option(argv, "--altaz-time-col") or (altaz_time_col_cfg is None):
+        altaz_time_col = str(getattr(args, "altaz_time_col", "time"))
+    else:
+        altaz_time_col = str(altaz_time_col_cfg)
     weather_table_cfg = _nonempty_str(global_cfg.get("weather_table"), default=None)
+    legacy_weather_time_col_cfg = _nonempty_str(global_cfg.get("weather_time_col"), default=None)
+    weather_inside_table = _nonempty_str(getattr(args, "weather_inside_table", None), default=_nonempty_str(global_cfg.get("weather_inside_table"), default=None))
+    weather_inside_table_suffix = _nonempty_str(getattr(args, "weather_inside_table_suffix", None), default=_nonempty_str(global_cfg.get("weather_inside_table_suffix"), default="weather-ambient"))
+    weather_outside_table = _nonempty_str(getattr(args, "weather_outside_table", None), default=_nonempty_str(global_cfg.get("weather_outside_table"), default=None))
+    weather_outside_table_suffix = _nonempty_str(getattr(args, "weather_outside_table_suffix", None), default=_nonempty_str(global_cfg.get("weather_outside_table_suffix"), default="weather-ambient"))
+
+    weather_inside_time_col = _nonempty_str(getattr(args, "weather_inside_time_col", None), default=_nonempty_str(global_cfg.get("weather_inside_time_col"), default=legacy_weather_time_col_cfg))
+    weather_outside_time_col = _nonempty_str(getattr(args, "weather_outside_time_col", None), default=_nonempty_str(global_cfg.get("weather_outside_time_col"), default=legacy_weather_time_col_cfg))
+
+    def _choose_float_runtime(cli_attr, global_key, default):
+        cli_val = getattr(args, cli_attr, None)
+        if cli_val is not None:
+            return float(cli_val)
+        gval = global_cfg.get(global_key, None)
+        if gval is not None:
+            return float(gval)
+        return float(default)
+
+    inside_default_temperature_c = _choose_float_runtime("inside_default_temperature_c", "inside_default_temperature_c", getattr(args, "met_temperature_c", 10.0))
+    inside_temperature_min_c = _choose_float_runtime("inside_temperature_min_c", "inside_temperature_min_c", -50.0)
+    inside_temperature_max_c = _choose_float_runtime("inside_temperature_max_c", "inside_temperature_max_c", 50.0)
+    outside_default_temperature_c = _choose_float_runtime("outside_default_temperature_c", "outside_default_temperature_c", getattr(args, "met_temperature_c", 10.0))
+    outside_default_pressure_hpa = _choose_float_runtime("outside_default_pressure_hpa", "outside_default_pressure_hpa", getattr(args, "met_pressure_hpa", None) if getattr(args, "met_pressure_hpa", None) is not None else _pressure_from_elev_hpa(float(args.site_elev)))
+    outside_default_humidity_pct = _choose_float_runtime("outside_default_humidity_pct", "outside_default_humidity_pct", getattr(args, "met_humidity_pct", 50.0))
+    outside_temperature_min_c = _choose_float_runtime("outside_temperature_min_c", "outside_temperature_min_c", -50.0)
+    outside_temperature_max_c = _choose_float_runtime("outside_temperature_max_c", "outside_temperature_max_c", 50.0)
+    outside_pressure_min_hpa = _choose_float_runtime("outside_pressure_min_hpa", "outside_pressure_min_hpa", 400.0)
+    outside_pressure_max_hpa = _choose_float_runtime("outside_pressure_max_hpa", "outside_pressure_max_hpa", 1100.0)
+    outside_humidity_min_pct = _choose_float_runtime("outside_humidity_min_pct", "outside_humidity_min_pct", 0.0)
+    outside_humidity_max_pct = _choose_float_runtime("outside_humidity_max_pct", "outside_humidity_max_pct", 100.0)
 
     encoder_shift_sec_cfg = global_cfg.get("encoder_shift_sec", None)
     if (not args.spectrometer_config) or _argv_has_option(argv, "--encoder-shift-sec") or (encoder_shift_sec_cfg is None):
@@ -2312,8 +2448,30 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
         "db_namespace": db_namespace,
         "telescope": telescope,
         "encoder_table": encoder_table,
+        "encoder_table_suffix": encoder_table_suffix,
+        "encoder_time_col": encoder_time_col,
         "altaz_table": altaz_table,
+        "altaz_table_suffix": altaz_table_suffix,
+        "altaz_time_col": altaz_time_col,
         "weather_table_cfg": weather_table_cfg,
+        "weather_inside_table": weather_inside_table,
+        "weather_inside_table_suffix": weather_inside_table_suffix,
+        "weather_outside_table": weather_outside_table,
+        "weather_outside_table_suffix": weather_outside_table_suffix,
+        "weather_inside_time_col": weather_inside_time_col,
+        "weather_outside_time_col": weather_outside_time_col,
+        "inside_default_temperature_c": inside_default_temperature_c,
+        "inside_temperature_min_c": inside_temperature_min_c,
+        "inside_temperature_max_c": inside_temperature_max_c,
+        "outside_default_temperature_c": outside_default_temperature_c,
+        "outside_default_pressure_hpa": outside_default_pressure_hpa,
+        "outside_default_humidity_pct": outside_default_humidity_pct,
+        "outside_temperature_min_c": outside_temperature_min_c,
+        "outside_temperature_max_c": outside_temperature_max_c,
+        "outside_pressure_min_hpa": outside_pressure_min_hpa,
+        "outside_pressure_max_hpa": outside_pressure_max_hpa,
+        "outside_humidity_min_pct": outside_humidity_min_pct,
+        "outside_humidity_max_pct": outside_humidity_max_pct,
         "encoder_shift_sec": encoder_shift_sec,
     }
 
@@ -2323,8 +2481,11 @@ def main(argv=None):
         argv = sys.argv[1:]
     args = parse_args(argv)
 
-    for attr in ("encoder_time_col", "altaz_time_col", "weather_time_col"):
-        if str(getattr(args, attr, "time")).strip().lower() == "recorded_time":
+    for attr in ("encoder_time_col", "altaz_time_col", "weather_time_col", "weather_inside_time_col", "weather_outside_time_col"):
+        cur = getattr(args, attr, None)
+        if cur is None:
+            continue
+        if str(cur).strip().lower() == "recorded_time":
             print("[warn] {}=recorded_time is not supported; forcing to 'time'".format(attr))
             setattr(args, attr, "time")
 
@@ -2350,6 +2511,18 @@ def main(argv=None):
     db_namespace = runtime_naming["db_namespace"]
     telescope_name = runtime_naming["telescope"]
     args.encoder_shift_sec = float(runtime_naming.get("encoder_shift_sec", getattr(args, "encoder_shift_sec", 0.0)))
+    args.encoder_time_col = str(runtime_naming.get("encoder_time_col", getattr(args, "encoder_time_col", "time")))
+    args.altaz_time_col = str(runtime_naming.get("altaz_time_col", getattr(args, "altaz_time_col", "time")))
+    for attr in ("encoder_time_col", "altaz_time_col", "weather_inside_time_col", "weather_outside_time_col"):
+        cur = runtime_naming.get(attr, getattr(args, attr, None))
+        if cur is None:
+            continue
+        if str(cur).strip().lower() == "recorded_time":
+            label = attr if attr not in ("weather_inside_time_col", "weather_outside_time_col") else "weather_time_col"
+            print("[warn] {}=recorded_time is not supported; forcing to 'time'".format(label))
+            runtime_naming[attr] = "time"
+    args.encoder_time_col = str(runtime_naming.get("encoder_time_col", getattr(args, "encoder_time_col", "time")))
+    args.altaz_time_col = str(runtime_naming.get("altaz_time_col", getattr(args, "altaz_time_col", "time")))
     if float(args.encoder_shift_sec) != 0.0:
         print("[info] encoder_shift_sec = {} s (applied as t_enc <- t_enc + shift before interpolation to spectral time)".format(float(args.encoder_shift_sec)))
     apply_channel_slice_config(config_dict["streams"], global_cfg, cli_channel_slice=getattr(args, "channel_slice", None))
@@ -2362,16 +2535,56 @@ def main(argv=None):
     out_fits = _default_outfile(rawbase, config_dict, args)
 
     w_table_arg = str(getattr(args, "weather_table", "auto")).strip()
-    weather_table = (_nonempty_str(runtime_naming.get("weather_table_cfg"), default=_table_name(db_namespace, telescope_name, "weather", "ambient")) if w_table_arg.lower() == "auto" else w_table_arg)
+    encoder_table_resolved = _resolve_prefixed_table_name(db_namespace, telescope_name, runtime_naming.get("encoder_table"), runtime_naming.get("encoder_table_suffix"), "ctrl-antenna-encoder")
+    altaz_table_resolved = _resolve_prefixed_table_name(db_namespace, telescope_name, runtime_naming.get("altaz_table"), runtime_naming.get("altaz_table_suffix"), "ctrl-antenna-altaz")
+    weather_inside_table = _nonempty_str(runtime_naming.get("weather_inside_table"), default=None)
+    weather_outside_table = _nonempty_str(runtime_naming.get("weather_outside_table"), default=None)
+    legacy_weather_auto = _nonempty_str(runtime_naming.get("weather_table_cfg"), default=None)
+    legacy_weather_table_cli = _argv_has_option(argv, "--weather-table") and (w_table_arg.lower() != "auto")
+    weather_inside_table_cli = _argv_has_option(argv, "--weather-inside-table")
+    weather_outside_table_cli = _argv_has_option(argv, "--weather-outside-table")
+    if legacy_weather_table_cli:
+        legacy_weather_auto = w_table_arg
+        if not weather_inside_table_cli:
+            weather_inside_table = w_table_arg
+        if not weather_outside_table_cli:
+            weather_outside_table = w_table_arg
+    weather_inside_table_resolved = _resolve_prefixed_table_name(db_namespace, telescope_name, weather_inside_table or legacy_weather_auto, runtime_naming.get("weather_inside_table_suffix"), "weather-ambient")
+    weather_outside_table_resolved = _resolve_prefixed_table_name(db_namespace, telescope_name, weather_outside_table or legacy_weather_auto, runtime_naming.get("weather_outside_table_suffix"), "weather-ambient")
+    legacy_weather_time_cli = _argv_has_option(argv, "--weather-time-col")
+    weather_inside_time_col_cli = _argv_has_option(argv, "--weather-inside-time-col")
+    weather_outside_time_col_cli = _argv_has_option(argv, "--weather-outside-time-col")
+    legacy_weather_time = _nonempty_str(getattr(args, "weather_time_col", None), default="time")
+    weather_inside_time_col = _nonempty_str(runtime_naming.get("weather_inside_time_col"), default=legacy_weather_time)
+    weather_outside_time_col = _nonempty_str(runtime_naming.get("weather_outside_time_col"), default=legacy_weather_time)
+    if legacy_weather_time_cli:
+        if not weather_inside_time_col_cli:
+            weather_inside_time_col = legacy_weather_time
+        if not weather_outside_time_col_cli:
+            weather_outside_time_col = legacy_weather_time
+    args.inside_default_temperature_c = float(runtime_naming.get("inside_default_temperature_c"))
+    args.inside_temperature_min_c = float(runtime_naming.get("inside_temperature_min_c"))
+    args.inside_temperature_max_c = float(runtime_naming.get("inside_temperature_max_c"))
+    args.outside_default_temperature_c = float(runtime_naming.get("outside_default_temperature_c"))
+    args.outside_default_pressure_hpa = float(runtime_naming.get("outside_default_pressure_hpa"))
+    args.outside_default_humidity_pct = float(runtime_naming.get("outside_default_humidity_pct"))
+    args.outside_temperature_min_c = float(runtime_naming.get("outside_temperature_min_c"))
+    args.outside_temperature_max_c = float(runtime_naming.get("outside_temperature_max_c"))
+    args.outside_pressure_min_hpa = float(runtime_naming.get("outside_pressure_min_hpa"))
+    args.outside_pressure_max_hpa = float(runtime_naming.get("outside_pressure_max_hpa"))
+    args.outside_humidity_min_pct = float(runtime_naming.get("outside_humidity_min_pct"))
+    args.outside_humidity_max_pct = float(runtime_naming.get("outside_humidity_max_pct"))
     common = extract_common_inputs(
         rawdata_path=rawdata_path,
         db_namespace=str(db_namespace),
         telescope=str(telescope_name),
         wcs_table=str(args.wcs_table),
-        weather_table=weather_table,
-        weather_time_col=str(args.weather_time_col),
-        encoder_table=runtime_naming.get("encoder_table"),
-        altaz_table=runtime_naming.get("altaz_table"),
+        weather_inside_table=weather_inside_table_resolved,
+        weather_inside_time_col=str(weather_inside_time_col),
+        weather_outside_table=weather_outside_table_resolved,
+        weather_outside_time_col=str(weather_outside_time_col),
+        encoder_table=encoder_table_resolved,
+        altaz_table=altaz_table_resolved,
     )
 
     site = Site(lat_deg=float(args.site_lat), lon_deg=float(args.site_lon), elev_m=float(args.site_elev))
@@ -2403,14 +2616,19 @@ def main(argv=None):
     writer.add_history("azimuth_meaning", "AZIMUTH/ELEVATIO=beam-center Az/El")
     writer.add_history("az_enc_meaning", "AZ_ENC/EL_ENC=measured encoder Az/El interpolated to t_spec")
     writer.add_history("encoder_shift_sec", float(getattr(args, "encoder_shift_sec", 0.0)))
+    writer.add_history("encoder_time_col", str(getattr(args, "encoder_time_col", "time")))
+    writer.add_history("altaz_time_col", str(getattr(args, "altaz_time_col", "time")))
     writer.add_history("bore_meaning", "BORE_AZ/BORE_EL=boresight Az/El = encoder - correction")
     writer.add_history("az_cmd_meaning", "AZ_CMD/EL_CMD=commanded altaz interpolated to t_spec")
     writer.add_history("corr_meaning", "CORR_AZ/CORR_EL=dlon/dlat")
     writer.add_history("beam_model_columns", "BEAMXOFF/BEAMYOFF[arcsec],BEAMROT[deg]=applied beam model")
     writer.add_history("galactic_columns", "GLON/GLAT=galactic longitude/latitude derived from ICRS RA/DEC in converter")
-    writer.add_history("encoder_table", _nonempty_str(runtime_naming.get("encoder_table"), default=_table_name(db_namespace, telescope_name, "ctrl", "antenna", "encoder")))
-    writer.add_history("altaz_table", _nonempty_str(runtime_naming.get("altaz_table"), default=_table_name(db_namespace, telescope_name, "ctrl", "antenna", "altaz")))
-    writer.add_history("weather_table", str(weather_table))
+    writer.add_history("encoder_table", str(encoder_table_resolved))
+    writer.add_history("altaz_table", str(altaz_table_resolved))
+    writer.add_history("weather_inside_table", str(weather_inside_table_resolved))
+    writer.add_history("weather_outside_table", str(weather_outside_table_resolved))
+    writer.add_history("weather_inside_time_col", str(weather_inside_time_col))
+    writer.add_history("weather_outside_time_col", str(weather_outside_time_col))
     writer.add_history("source_block", "omitted unless true source coordinates become available")
     writer.add_history("scan_block", "omitted unless true scan offsets become available")
 
@@ -2455,9 +2673,10 @@ def main(argv=None):
                 )
             )
 
-        temp_c, press_hpa, humid_pct, met_weather = resolve_stream_meteorology(
+        tamb_c, temp_c, press_hpa, humid_pct, inside_weather, outside_weather = resolve_stream_meteorology(
             common, stream_data, str(args.met_source).strip().lower(), str(args.interp_extrap)
         )
+        tamb_c_use = finalize_inside_temperature_for_tamb(stream_data.t_spec, tamb_c, args)
 
         apply_refraction = (str(getattr(args, "refraction", "on")).strip().lower() == "on")
         if apply_refraction:
@@ -2492,9 +2711,11 @@ def main(argv=None):
         else:
             calc_refr_deg = np.full_like(stream_data.t_spec, np.nan, dtype=float)
 
-        temp_out, press_out, humid_out = temp_c, press_hpa, humid_pct
-        if str(args.met_source).strip().lower() == "fallback":
-            temp_out, press_out, humid_out = temp_use, press_use, humid_use
+        temp_out = tamb_c_use
+        if apply_refraction:
+            press_out, humid_out = press_use, humid_use
+        else:
+            press_out, humid_out = press_hpa, humid_pct
 
         rows = build_rows_for_stream(
             stream_data=stream_data,

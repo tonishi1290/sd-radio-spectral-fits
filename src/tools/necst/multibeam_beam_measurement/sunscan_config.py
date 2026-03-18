@@ -14,7 +14,13 @@ DEFAULT_PLANET = "sun"
 DEFAULT_SPECTRAL_NAME = "xffts-board1"
 DEFAULT_OUTDIR = "."
 DEFAULT_AZEL_SOURCE = "encoder"
-DEFAULT_ALTAZ_APPLY = "none"
+DEFAULT_AZEL_CORRECTION_APPLY = None
+DEFAULT_ALTAZ_APPLY = DEFAULT_AZEL_CORRECTION_APPLY
+DEFAULT_ENCODER_TABLE_SUFFIX = "ctrl-antenna-encoder"
+DEFAULT_ALTAZ_TABLE_SUFFIX = "ctrl-antenna-altaz"
+DEFAULT_WEATHER_INSIDE_TABLE_SUFFIX = "weather-ambient"
+DEFAULT_WEATHER_OUTSIDE_TABLE_SUFFIX = "weather-ambient"
+DEFAULT_TIME_COL = "time"
 DEFAULT_SPECTROMETER_TIME_OFFSET_SEC = 0.0
 DEFAULT_ENCODER_SHIFT_SEC = 0.0
 DEFAULT_ENCODER_AZ_TIME_OFFSET_SEC = 0.0
@@ -72,7 +78,14 @@ class InputConfig:
     planet: str = DEFAULT_PLANET
     spectral_name: str = DEFAULT_SPECTRAL_NAME
     azel_source: str = DEFAULT_AZEL_SOURCE
-    altaz_apply: str = DEFAULT_ALTAZ_APPLY
+    azel_correction_apply: Optional[str] = DEFAULT_AZEL_CORRECTION_APPLY
+    altaz_apply: Optional[str] = DEFAULT_ALTAZ_APPLY
+    encoder_table: Optional[str] = None
+    encoder_table_suffix: str = DEFAULT_ENCODER_TABLE_SUFFIX
+    altaz_table: Optional[str] = None
+    altaz_table_suffix: str = DEFAULT_ALTAZ_TABLE_SUFFIX
+    encoder_time_col: str = DEFAULT_TIME_COL
+    altaz_time_col: str = DEFAULT_TIME_COL
     spectrometer_time_offset_sec: float = DEFAULT_SPECTROMETER_TIME_OFFSET_SEC
     encoder_shift_sec: float = DEFAULT_ENCODER_SHIFT_SEC
     encoder_az_time_offset_sec: float = DEFAULT_ENCODER_AZ_TIME_OFFSET_SEC
@@ -84,8 +97,30 @@ class InputConfig:
 class CalibrationConfig:
     chopper_wheel: bool = DEFAULT_CHOPPER_WHEEL
     tamb_k: Optional[float] = None
+    tamb_default_k: float = DEFAULT_TAMB_FALLBACK_K
+    tamb_min_k: float = 250.0
+    tamb_max_k: float = 330.0
+    weather_inside_table: Optional[str] = None
+    weather_inside_table_suffix: str = DEFAULT_WEATHER_INSIDE_TABLE_SUFFIX
+    weather_inside_time_col: str = DEFAULT_TIME_COL
     chopper_win_sec: float = DEFAULT_CHOPPER_WIN_SEC
     chopper_stat: str = DEFAULT_CHOPPER_STAT
+
+
+@dataclass
+class RefractionConfig:
+    weather_outside_table: Optional[str] = None
+    weather_outside_table_suffix: str = DEFAULT_WEATHER_OUTSIDE_TABLE_SUFFIX
+    weather_outside_time_col: str = DEFAULT_TIME_COL
+    outside_default_temperature_c: float = 0.0
+    outside_default_pressure_hpa: float = 760.0
+    outside_default_humidity_pct: float = 30.0
+    outside_temperature_min_c: float = -50.0
+    outside_temperature_max_c: float = 50.0
+    outside_pressure_min_hpa: float = 400.0
+    outside_pressure_max_hpa: float = 1100.0
+    outside_humidity_min_pct: float = 0.0
+    outside_humidity_max_pct: float = 100.0
 
 
 @dataclass
@@ -166,6 +201,7 @@ class BeamOverride:
 class SunScanAnalysisConfig:
     input: InputConfig
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
+    refraction: RefractionConfig = field(default_factory=RefractionConfig)
     ripple: RippleConfig = field(default_factory=RippleConfig)
     profile: ProfileConfig = field(default_factory=ProfileConfig)
     trim: TrimConfig = field(default_factory=TrimConfig)

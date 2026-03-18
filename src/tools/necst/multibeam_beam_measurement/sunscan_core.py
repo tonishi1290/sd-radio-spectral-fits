@@ -59,7 +59,14 @@ def _annotate_results_metadata(results: Dict[int, dict], config: SunScanAnalysis
         row.setdefault("spec_time_fallback_field", df_attrs.get("spec_time_fallback_field"))
         row.setdefault("spec_time_example", df_attrs.get("spec_time_example"))
         row.setdefault("azel_source", config.input.azel_source)
-        row.setdefault("altaz_apply", config.input.altaz_apply)
+        resolved_azel_apply = df_attrs.get("azel_correction_apply")
+        if resolved_azel_apply is None:
+            resolved_azel_apply = config.input.azel_correction_apply
+        row.setdefault("azel_correction_apply", resolved_azel_apply)
+        resolved_altaz_apply = df_attrs.get("azel_correction_apply")
+        if resolved_altaz_apply is None:
+            resolved_altaz_apply = config.input.altaz_apply
+        row.setdefault("altaz_apply", resolved_altaz_apply)
         row.setdefault("spectrometer_time_offset_sec", float(config.input.spectrometer_time_offset_sec))
         row.setdefault("encoder_shift_sec", float(config.input.encoder_shift_sec))
         row.setdefault("encoder_az_time_offset_sec", float(config.input.encoder_az_time_offset_sec))
@@ -77,6 +84,19 @@ def _annotate_results_metadata(results: Dict[int, dict], config: SunScanAnalysis
         row.setdefault("telescope", str(config.input.telescope))
         row.setdefault("tel_loaddata", str(config.input.tel_loaddata))
         row.setdefault("planet", str(config.input.planet))
+        row.setdefault("encoder_table_resolved", df_attrs.get("encoder_table_resolved"))
+        row.setdefault("altaz_table_resolved", df_attrs.get("altaz_table_resolved"))
+        row.setdefault("weather_inside_table_resolved", df_attrs.get("weather_inside_table_resolved"))
+        row.setdefault("weather_outside_table_resolved", df_attrs.get("weather_outside_table_resolved"))
+        row.setdefault("encoder_time_col", df_attrs.get("encoder_time_col"))
+        row.setdefault("altaz_time_col", df_attrs.get("altaz_time_col"))
+        row.setdefault("weather_inside_time_col", df_attrs.get("weather_inside_time_col"))
+        row.setdefault("weather_outside_time_col", df_attrs.get("weather_outside_time_col"))
+        row.setdefault("tamb_source", df_attrs.get("tamb_source"))
+        row.setdefault("outside_meteo_source", df_attrs.get("outside_meteo_source"))
+        row.setdefault("outside_default_used_temperature", df_attrs.get("outside_default_used_temperature"))
+        row.setdefault("outside_default_used_pressure", df_attrs.get("outside_default_used_pressure"))
+        row.setdefault("outside_default_used_humidity", df_attrs.get("outside_default_used_humidity"))
 
 
 def run_debug_plots(config: SunScanAnalysisConfig, az_scans: Dict[int, object], el_scans: Dict[int, object], trim_params: Dict[str, object]) -> List[Path]:
