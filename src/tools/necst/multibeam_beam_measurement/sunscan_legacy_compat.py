@@ -492,6 +492,12 @@ def _extract_spectral_from_structured(arr):
     else:
         spec2d = spec.astype(np.float32, copy=False)
 
+    # 1-channel spectra may be stored as a scalar numeric field per row, which
+    # appears here as shape (N,) instead of (N, 1). Treat that as a valid single-
+    # channel spectrum table rather than rejecting it.
+    if spec2d.ndim == 1:
+        spec2d = spec2d.reshape(-1, 1)
+
     if spec2d.ndim != 2:
         raise RuntimeError(f"spectrum array must be 2D. got {spec2d.shape}")
 

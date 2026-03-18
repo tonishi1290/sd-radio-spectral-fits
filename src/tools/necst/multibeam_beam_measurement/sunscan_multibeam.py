@@ -17,6 +17,9 @@ from .public_api import (
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
+    if argv is None:
+        import sys
+        argv = list(sys.argv[1:])
     ap = argparse.ArgumentParser(description="Multi-beam sun_scan-compatible extraction, dry-run generation, and beam fitting.")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -36,7 +39,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     args = ap.parse_args(argv)
     if args.cmd == "extract":
-        cfg = extract_mod.config_from_args(args)
+        cfg = extract_mod.config_from_args(args, argv=argv)
         outputs = run_multibeam_extract(
             rawdata_path=cfg.input.rawdata_path,
             spectrometer_config=Path(args.spectrometer_config).expanduser().resolve(),

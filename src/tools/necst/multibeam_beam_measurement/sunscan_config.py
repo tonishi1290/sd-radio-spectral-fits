@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
+import copy
 from pathlib import Path
 from typing import Any, Dict, Optional
 import hashlib
@@ -182,6 +183,9 @@ class ReportConfig:
 @dataclass
 class RuntimeConfig:
     continue_on_error: bool = DEFAULT_CONTINUE_ON_ERROR
+    hpbw_init_explicit: bool = False
+    azel_source_explicit: bool = False
+    azel_correction_apply_explicit: bool = False
 
 
 @dataclass
@@ -243,22 +247,33 @@ class SunScanAnalysisConfig:
         outdir: Optional[Path] = None,
         tag: Optional[str] = None,
     ) -> "SunScanAnalysisConfig":
-        new_input = replace(self.input, spectral_name=spectral_name or self.input.spectral_name)
-        new_report = replace(self.report, outdir=Path(outdir) if outdir is not None else self.report.outdir, tag=tag if tag is not None else self.report.tag)
-        new_edge_fit = replace(self.edge_fit, hpbw_init_arcsec=float(hpbw_init_arcsec) if hpbw_init_arcsec is not None else self.edge_fit.hpbw_init_arcsec)
-        new_override = replace(
-            self.beam_override,
-            stream_name=stream_name if stream_name is not None else self.beam_override.stream_name,
-            beam_id=beam_id if beam_id is not None else self.beam_override.beam_id,
-            restfreq_hz=restfreq_hz if restfreq_hz is not None else self.beam_override.restfreq_hz,
-            hpbw_init_arcsec=hpbw_init_arcsec if hpbw_init_arcsec is not None else self.beam_override.hpbw_init_arcsec,
-            polariza=polariza if polariza is not None else self.beam_override.polariza,
-            fdnum=fdnum if fdnum is not None else self.beam_override.fdnum,
-            ifnum=ifnum if ifnum is not None else self.beam_override.ifnum,
-            plnum=plnum if plnum is not None else self.beam_override.plnum,
-            sampler=sampler if sampler is not None else self.beam_override.sampler,
-        )
-        return replace(self, input=new_input, report=new_report, edge_fit=new_edge_fit, beam_override=new_override)
+        new_cfg = copy.deepcopy(self)
+        if spectral_name is not None:
+            new_cfg.input.spectral_name = spectral_name
+        if outdir is not None:
+            new_cfg.report.outdir = Path(outdir)
+        if tag is not None:
+            new_cfg.report.tag = tag
+        if hpbw_init_arcsec is not None:
+            new_cfg.edge_fit.hpbw_init_arcsec = float(hpbw_init_arcsec)
+            new_cfg.beam_override.hpbw_init_arcsec = hpbw_init_arcsec
+        if stream_name is not None:
+            new_cfg.beam_override.stream_name = stream_name
+        if beam_id is not None:
+            new_cfg.beam_override.beam_id = beam_id
+        if restfreq_hz is not None:
+            new_cfg.beam_override.restfreq_hz = restfreq_hz
+        if polariza is not None:
+            new_cfg.beam_override.polariza = polariza
+        if fdnum is not None:
+            new_cfg.beam_override.fdnum = fdnum
+        if ifnum is not None:
+            new_cfg.beam_override.ifnum = ifnum
+        if plnum is not None:
+            new_cfg.beam_override.plnum = plnum
+        if sampler is not None:
+            new_cfg.beam_override.sampler = sampler
+        return new_cfg
 
     def config_digest(self) -> str:
         def _normalize(value: Any) -> Any:
