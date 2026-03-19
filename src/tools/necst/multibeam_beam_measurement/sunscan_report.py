@@ -17,6 +17,7 @@ CANONICAL_SUMMARY_COLUMNS = [
     "hpbw_az_arcsec", "hpbw_el_arcsec",
     "sun_az_deg", "sun_el_deg",
     "speed_az_arcsec_s", "speed_el_arcsec_s",
+    "scan_dir_az", "scan_dir_el",
     "fit_ok_az", "fit_ok_el",
     "az_error", "el_error",
     "n_az", "n_az_used", "n_el", "n_el_used",
@@ -124,8 +125,8 @@ def build_summary_lines(tag: str, ytitle: str, config: SunScanAnalysisConfig, sc
         faz = "Y" if rr.get("fit_ok_az", False) else "N"
         fel = "Y" if rr.get("fit_ok_el", False) else "N"
         lines.append(
-            f"  {sid:4d}  {raz:7.3f}  {rel:7.3f} | {caz:9.1f}  {haz:7.1f}  {vaz:4.0f} | "
-            f"{cel:9.1f}  {hel:7.1f}  {vel:4.0f} |   {faz}     {fel}"
+            f"  {sid:4d}  {raz:7.3f}  {rel:7.3f} | {caz:9.1f}  {haz:7.1f}  {vaz:+4.0f} | "
+            f"{cel:9.1f}  {hel:7.1f}  {vel:+4.0f} |   {faz}     {fel}"
         )
 
     def _nanmedian(key: str) -> float:

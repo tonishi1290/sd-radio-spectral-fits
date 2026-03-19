@@ -59,7 +59,7 @@ import builtins
 import os
 import pathlib
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -233,7 +233,7 @@ DEFAULT_ENCODER_VAVG_SEC = 0.0           # 0 disables smoothing (safe default)
 DEFAULT_CHOPPER_WHEEL = True
 DEFAULT_TAMB_FALLBACK_K = 300.0
 DEFAULT_CHOPPER_WIN_SEC = 5.0            # deprecated; kept for backward compatibility
-DEFAULT_CHOPPER_STAT = "median"          # deprecated; kept for backward compatibility
+DEFAULT_CHOPPER_STAT = "mean"          # deprecated; kept for backward compatibility
 
 # Ripple (notch) removal
 DEFAULT_RIPPLE_REMOVE = True
@@ -1919,68 +1919,209 @@ def _infer_obsmode_from_db(
     )
 
 
+def _chopper_reduce_stat(values: np.ndarray, stat: str = "median") -> float:
+    arr = np.asarray(values, dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    s = str(stat).strip().lower()
+    if s in {"mean", "avg", "average"}:
+        return float(np.nanmean(arr))
+    return float(np.nanmedian(arr))
+
+
+def _normalize_scan_group_key(v):
+    if v is None:
+        return None
+    try:
+        if isinstance(v, np.generic):
+            v = v.item()
+    except Exception:
+        pass
+    if isinstance(v, (bytes, bytearray)):
+        s = v.decode(errors="ignore").strip()
+        return s if s else None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else None
+    try:
+        if pd.isna(v):
+            return None
+    except Exception:
+        pass
+    try:
+        s = str(v).strip()
+        return s if s else None
+    except Exception:
+        return None
+
+
+def _group_calibration_blocks(
+    t_spec: np.ndarray,
+    tp: np.ndarray,
+    position: np.ndarray,
+    *,
+    scan_key: Optional[np.ndarray] = None,
+    stat: str = "median",
+) -> Dict[str, np.ndarray]:
+    """Aggregate HOT/OFF samples into calibration blocks.
+
+    Preferred behavior is to group HOT/OFF rows by (mode, scan_key) when a usable
+    scan_key exists. This matches the common necstdb layout where one scan id
+    labels all HOT/OFF rows belonging to the same calibration step. Rows without a
+    usable scan key fall back to contiguous mode blocks.
+    """
+    t_spec = np.asarray(t_spec, dtype=float)
+    tp = np.asarray(tp, dtype=float)
+    pos = np.asarray(position, dtype=object)
+    key_arr = None if scan_key is None else np.asarray(scan_key, dtype=object)
+    if key_arr is not None and key_arr.size != t_spec.size:
+        raise ValueError("scan_key must have the same length as t_spec.")
+
+    groups: Dict[Tuple[str, str, object], Dict[str, list]] = {}
+    block_counter = 0
+    prev_mode = None
+    prev_missing = False
+    prev_index = -99
+    prev_block_key = None
+
+    for i, (t, y, p) in enumerate(zip(t_spec, tp, pos)):
+        if not (np.isfinite(t) and np.isfinite(y)):
+            continue
+        mode = str(p)
+        if mode not in {"HOT", "OFF"}:
+            prev_mode = None
+            prev_missing = False
+            prev_block_key = None
+            prev_index = i
+            continue
+
+        scan_norm = _normalize_scan_group_key(key_arr[i]) if key_arr is not None else None
+        if scan_norm is not None:
+            gkey = (mode, "scan", scan_norm)
+            prev_missing = False
+        else:
+            if prev_missing and prev_mode == mode and (i == prev_index + 1) and (prev_block_key is not None):
+                gkey = prev_block_key
+            else:
+                block_counter += 1
+                gkey = (mode, "block", block_counter)
+            prev_missing = True
+        prev_mode = mode
+        prev_block_key = gkey
+        prev_index = i
+
+        slot = groups.setdefault(gkey, {"t": [], "y": [], "mode": mode})
+        slot["t"].append(float(t))
+        slot["y"].append(float(y))
+
+    out = {"hot_t": [], "hot_y": [], "off_t": [], "off_y": []}
+    for (_mode, _kind, _key), vals in groups.items():
+        t_rep = float(np.nanmean(np.asarray(vals["t"], dtype=float)))
+        y_rep = _chopper_reduce_stat(np.asarray(vals["y"], dtype=float), stat=stat)
+        if not (np.isfinite(t_rep) and np.isfinite(y_rep)):
+            continue
+        if vals["mode"] == "HOT":
+            out["hot_t"].append(t_rep)
+            out["hot_y"].append(y_rep)
+        elif vals["mode"] == "OFF":
+            out["off_t"].append(t_rep)
+            out["off_y"].append(y_rep)
+
+    for side in ("hot", "off"):
+        tt = np.asarray(out[f"{side}_t"], dtype=float)
+        yy = np.asarray(out[f"{side}_y"], dtype=float)
+        if tt.size:
+            o = np.argsort(tt)
+            tt = tt[o]
+            yy = yy[o]
+        out[f"{side}_t"] = tt
+        out[f"{side}_y"] = yy
+    return out
+
+
+def _interp_or_edge_constant(t_known: np.ndarray, y_known: np.ndarray, t_dst: np.ndarray) -> np.ndarray:
+    t_known = np.asarray(t_known, dtype=float)
+    y_known = np.asarray(y_known, dtype=float)
+    t_dst = np.asarray(t_dst, dtype=float)
+    m = np.isfinite(t_known) & np.isfinite(y_known)
+    if np.count_nonzero(m) == 0:
+        return np.full_like(t_dst, np.nan, dtype=float)
+    tt = t_known[m]
+    yy = y_known[m]
+    if tt.size == 1:
+        return np.full_like(t_dst, float(yy[0]), dtype=float)
+    return _interp_edge_hold(tt, yy, t_dst)
+
+
 def chopper_wheel_tastar(
     t_spec: np.ndarray,
     tp: np.ndarray,
     position: np.ndarray,
     *,
     tamb_k: float,
+    scan_key: Optional[np.ndarray] = None,
+    chopper_stat: str = "mean",
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """1-temperature chopper-wheel calibration (1-load method): tp -> Ta* [K].
 
-    User requirements (summary):
-      - Identify HOT/OFF by *exact* matches on decoded position labels.
-      - Compute total power tp (already given).
-      - Interpolate HOT/OFF references to all t_spec using np.interp with edge-hold.
-      - Ta* = Tamb * (tp - tp_off) / (tp_hot - tp_off)
-      - If denom is non-finite or <=0, treat denom as NaN (avoid zero division).
-
-    Returns
-    -------
-    ta_star : np.ndarray
-        Ta* [K] aligned to t_spec.
-    tp_hot_ref : np.ndarray
-        Interpolated HOT reference total power aligned to t_spec.
-    tp_off_ref : np.ndarray
-        Interpolated OFF reference total power aligned to t_spec.
+    HOT/OFF rows are first averaged per scan id when a usable scan_key exists.
+    OFF reference is obtained from the OFF-group means by linear interpolation
+    with edge hold. The temperature scale is defined per HOT group against the
+    temporally nearest OFF-group mean, and that gain is then interpolated in time
+    (again with edge hold).
     """
     t_spec = np.asarray(t_spec, dtype=float)
     tp = np.asarray(tp, dtype=float)
     if t_spec.ndim != 1 or tp.ndim != 1 or t_spec.size != tp.size:
         raise ValueError("t_spec and tp must be 1D and same length.")
-    if t_spec.size < 8:
+    if t_spec.size < 2:
         raise RuntimeError("Not enough samples for chopper-wheel calibration.")
 
     pos = np.asarray(position, dtype=object)
     if pos.size != t_spec.size:
         raise ValueError("position must have the same length as t_spec.")
 
-    is_hot = np.array([p == "HOT" for p in pos], dtype=bool)
-    is_off = np.array([p == "OFF" for p in pos], dtype=bool)
-    n_hot = int(np.sum(is_hot))
-    n_off = int(np.sum(is_off))
-    if n_hot < 2 or n_off < 2:
-        raise RuntimeError(f"Chopper-wheel needs >=2 HOT and >=2 OFF samples (got HOT={n_hot}, OFF={n_off}).")
-
-    t_hot = t_spec[is_hot]
-    tp_hot = tp[is_hot]
-    t_off = t_spec[is_off]
-    tp_off = tp[is_off]
-
-    tp_hot_ref = _interp_edge_hold(t_hot, tp_hot, t_spec)
-    tp_off_ref = _interp_edge_hold(t_off, tp_off, t_spec)
-
-    denom = tp_hot_ref - tp_off_ref
-    denom_bad = (~np.isfinite(denom)) | (denom <= 0)
-    denom = denom.astype(float)
-    denom[denom_bad] = np.nan
-
     tamb = float(tamb_k)
     if not np.isfinite(tamb) or tamb <= 0:
         raise ValueError("Tamb must be positive and finite.")
 
-    ta_star = tamb * (tp - tp_off_ref) / denom
+    groups = _group_calibration_blocks(
+        t_spec,
+        tp,
+        pos,
+        scan_key=scan_key,
+        stat=chopper_stat,
+    )
+    t_hot = np.asarray(groups["hot_t"], dtype=float)
+    tp_hot = np.asarray(groups["hot_y"], dtype=float)
+    t_off = np.asarray(groups["off_t"], dtype=float)
+    tp_off = np.asarray(groups["off_y"], dtype=float)
+
+    if t_hot.size < 1 or t_off.size < 1:
+        raise RuntimeError(
+            f"Chopper-wheel needs >=1 HOT group and >=1 OFF group (got HOT={t_hot.size}, OFF={t_off.size})."
+        )
+
+    tp_off_ref = _interp_or_edge_constant(t_off, tp_off, t_spec)
+
+    # Temperature scale (gain) is defined against the nearest OFF group for each HOT.
+    tp_off_nearest_to_hot = _nearest_by_time(t_off, tp_off, t_hot)
+    denom_hot = tp_hot - tp_off_nearest_to_hot
+    gain_hot = np.full_like(tp_hot, np.nan, dtype=float)
+    good = np.isfinite(denom_hot) & (denom_hot > 0)
+    gain_hot[good] = tamb / denom_hot[good]
+    gain_ref = _interp_or_edge_constant(t_hot, gain_hot, t_spec)
+
+    bad_gain = (~np.isfinite(gain_ref)) | (gain_ref <= 0)
+    gain_ref = gain_ref.astype(float)
+    gain_ref[bad_gain] = np.nan
+
+    ta_star = gain_ref * (tp - tp_off_ref)
+    tp_hot_ref = tp_off_ref + (tamb / gain_ref)
+    tp_hot_ref[bad_gain] = np.nan
     return ta_star.astype(float), tp_hot_ref.astype(float), tp_off_ref.astype(float)
+
 
 
 
@@ -2891,7 +3032,7 @@ def build_dataframe(
     outside_humidity_min_pct: float = 0.0,
     outside_humidity_max_pct: float = 100.0,
     chopper_win_sec: float = 5.0,
-    chopper_stat: str = "median",
+    chopper_stat: str = "mean",
 ) -> Tuple[pd.DataFrame, Dict[int, pd.DataFrame], Dict[int, pd.DataFrame]]:
     ensure_obs_and_config_files(rawdata_path)
 
@@ -2978,6 +3119,8 @@ def build_dataframe(
             tp1,
             position_str,
             tamb_k=float(tamb_use),
+            scan_key=(id_vals if id_valid else None),
+            chopper_stat=str(chopper_stat),
         )
     else:
         ta_star = tp1.copy().astype(float)
@@ -3076,6 +3219,7 @@ def build_dataframe(
             "obsmode": position_str,
             "tp_hot": tp_hot_ref.astype(float),
             "tp_off": tp_off_ref.astype(float),
+            "cw_gain_k_per_tp": np.where(np.isfinite(tp_hot_ref - tp_off_ref) & ((tp_hot_ref - tp_off_ref) > 0), float(tamb_use) / (tp_hot_ref - tp_off_ref), np.nan).astype(float),
             "daz": daz.astype(float),
             "d_el": d_el.astype(float),
             "az_true": az_true.astype(float),
@@ -3102,6 +3246,10 @@ def build_dataframe(
     try:
         df.attrs["Tamb_k"] = float(tamb_use)
         df.attrs["tamb_source"] = str(tamb_source)
+        try:
+            df.attrs["chopper_stat"] = str(chopper_stat)
+        except Exception:
+            pass
         df.attrs["encoder_table_resolved"] = str(encoder_table_resolved)
         df.attrs["altaz_table_resolved"] = str(altaz_table_resolved)
         df.attrs["weather_inside_table_resolved"] = str(weather_inside_table_resolved)
@@ -3277,14 +3425,15 @@ def fit_two_sides_edge(
 
 
 def estimate_scan_speed_deg_s(seg: pd.DataFrame, xcol: str) -> float:
-    """Estimate scan speed (deg/s) using the near-disk region around x≈0.
+    """Estimate *signed* scan speed (deg/s) using the near-disk region around x≈0.
 
-    This mimics the 'practical' method: fit a line x(t) in the region where
-    the telescope is approximately in constant speed and crossing the solar disk.
+    This mimics the practical method: fit a line x(t) in the region where the
+    telescope is approximately in constant speed and crossing the solar disk.
 
     Notes
     -----
     - For daz (which already includes cos(el_ref)), this gives the *projected* sky speed.
+    - The sign reflects scan direction in the chosen main-axis coordinate.
     - If too few points are available in the default window, the window is widened.
     """
     if seg is None or len(seg) < 5 or (xcol not in seg.columns):
@@ -3311,9 +3460,23 @@ def estimate_scan_speed_deg_s(seg: pd.DataFrame, xcol: str) -> float:
 
     try:
         p = np.polyfit(t_center - t_center[0], x_center, 1)
-        return abs(float(p[0]))
+        return float(p[0])
     except Exception:
         return float("nan")
+
+
+def _speed_direction_label(v: Any) -> str:
+    try:
+        vf = float(v)
+    except Exception:
+        return "unknown"
+    if not np.isfinite(vf):
+        return "unknown"
+    if vf > 0:
+        return "positive"
+    if vf < 0:
+        return "negative"
+    return "zero"
 
 
 def save_text_summary(text: str, out_png: pathlib.Path) -> None:
@@ -3405,7 +3568,7 @@ def _plot_profile_and_derivative_panel(
             f" repEl={result_row.get('rep_el_deg', float('nan')):.3f}"
             f"  center={result_row.get('center_' + axis_key + '_deg', float('nan')) * 3600.0:.1f} arcsec"
             f"  HPBW={result_row.get('hpbw_' + axis_key + '_arcsec', float('nan')):.1f}"
-            f"  v={result_row.get('speed_' + axis_key + '_arcsec_s', float('nan')):.0f}"
+            f"  v={result_row.get('speed_' + axis_key + '_arcsec_s', float('nan')):+.0f}"
         )
     ax_prof.set_title(title)
 
@@ -3514,6 +3677,7 @@ def write_scan_summary_csv(out_csv: pathlib.Path, scan_ids: List[int], results: 
         "hpbw_az_arcsec", "hpbw_el_arcsec",
         "sun_az_deg", "sun_el_deg",
         "speed_az_arcsec_s", "speed_el_arcsec_s",
+        "scan_dir_az", "scan_dir_el",
         "fit_ok_az", "fit_ok_el",
         "az_error", "el_error",
         "n_az", "n_az_used", "n_el", "n_el_used",
@@ -3638,6 +3802,7 @@ def run_edge_fits_and_summarize(
                     rr["sigma_az_deg"] = sigma
                     rr["hpbw_az_arcsec"] = hpbw
                 rr["speed_az_arcsec_s"] = estimate_scan_speed_deg_s(seg2, "daz") * 3600.0
+                rr["scan_dir_az"] = _speed_direction_label(rr["speed_az_arcsec_s"])
             except Exception as e:
                 rr.setdefault("fit_ok_az", False)
                 rr["az_error"] = str(e)
@@ -3704,6 +3869,7 @@ def run_edge_fits_and_summarize(
                     rr["sigma_el_deg"] = sigma
                     rr["hpbw_el_arcsec"] = hpbw
                 rr["speed_el_arcsec_s"] = estimate_scan_speed_deg_s(seg2, "d_el") * 3600.0
+                rr["scan_dir_el"] = _speed_direction_label(rr["speed_el_arcsec_s"])
             except Exception as e:
                 rr.setdefault("fit_ok_el", False)
                 rr["el_error"] = str(e)
@@ -4301,7 +4467,7 @@ def main() -> None:
                 rel = rr.get("rep_el_deg", float("nan"))
                 faz = "Y" if rr.get("fit_ok_az", False) else "N"
                 fel = "Y" if rr.get("fit_ok_el", False) else "N"
-                lines.append(f"  {sid:4d}  {raz:7.3f}  {rel:7.3f} | {caz:9.1f}  {haz:7.1f}  {vaz:4.0f} | {cel:9.1f}  {hel:7.1f}  {vel:4.0f} |   {faz}     {fel}")
+                lines.append(f"  {sid:4d}  {raz:7.3f}  {rel:7.3f} | {caz:9.1f}  {haz:7.1f}  {vaz:+4.0f} | {cel:9.1f}  {hel:7.1f}  {vel:+4.0f} |   {faz}     {fel}")
 
             def _nanmedian_from_keys(key):
                 vals = [results.get(s, {}).get(key, float("nan")) for s in scan_ids]
