@@ -29,7 +29,9 @@ __all__ = [
     "RuntimeConfig",
     "SunScanAnalysisConfig",
     "run_singlebeam",
+    "run_singlebeam_many",
     "run_multibeam_extract",
+    "run_multibeam_extract_many",
     "run_multibeam_fit",
     "run_pseudo_multibeam",
     "check_spectrometer_config",
@@ -41,21 +43,27 @@ __version__ = "v3.8"
 def __getattr__(name):
     if name in {
         "run_singlebeam",
+        "run_singlebeam_many",
         "run_multibeam_extract",
+        "run_multibeam_extract_many",
         "run_multibeam_fit",
         "run_pseudo_multibeam",
         "check_spectrometer_config",
     }:
         from .public_api import (
             run_singlebeam,
+            run_singlebeam_many,
             run_multibeam_extract,
+            run_multibeam_extract_many,
             run_multibeam_fit,
             run_pseudo_multibeam,
             check_spectrometer_config,
         )
         return {
             "run_singlebeam": run_singlebeam,
+            "run_singlebeam_many": run_singlebeam_many,
             "run_multibeam_extract": run_multibeam_extract,
+            "run_multibeam_extract_many": run_multibeam_extract_many,
             "run_multibeam_fit": run_multibeam_fit,
             "run_pseudo_multibeam": run_pseudo_multibeam,
             "check_spectrometer_config": check_spectrometer_config,

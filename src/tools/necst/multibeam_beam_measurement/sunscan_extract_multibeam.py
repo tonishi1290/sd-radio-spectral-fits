@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 import json
 import math
 import traceback
 import sys
+import re
 
 import pandas as pd
 
@@ -215,6 +217,66 @@ def stream_output_tag(base_tag: str, stream_name: str) -> str:
 
 
 
+def _sanitize_path_tag_component(value: Any) -> str:
+    text = str(value).strip()
+    if not text:
+        return "unnamed"
+    safe = re.sub(r"[^0-9A-Za-z._-]+", "_", text)
+    safe = safe.strip("._-")
+    return safe or "unnamed"
+
+
+
+def _default_multi_base_tag(rawdata_path: Path) -> str:
+    name = _sanitize_path_tag_component(rawdata_path.name)
+    parent = _sanitize_path_tag_component(rawdata_path.parent.name)
+    if parent and parent != "unnamed" and parent != name:
+        return f"{parent}__{name}"
+    return name
+
+
+
+def _deduplicate_tags(tags: Sequence[str]) -> List[str]:
+    counts: Dict[str, int] = {}
+    unique: List[str] = []
+    for tag in tags:
+        base = _sanitize_path_tag_component(tag)
+        n = counts.get(base, 0) + 1
+        counts[base] = n
+        unique.append(base if n == 1 else f"{base}__{n:02d}")
+    return unique
+
+
+
+def _prepare_multi_run_entries(rawdata_paths: Sequence[Path], run_ids: Optional[Sequence[Optional[str]]] = None) -> List[Dict[str, Any]]:
+    normalized_paths = [Path(p).expanduser().resolve() for p in rawdata_paths]
+    if run_ids is not None and len(run_ids) != len(normalized_paths):
+        raise ValueError("run_ids must have the same length as rawdata_paths")
+    name_counts: Dict[str, int] = {}
+    for path in normalized_paths:
+        key = str(path.name)
+        name_counts[key] = name_counts.get(key, 0) + 1
+    candidate_tags: List[str] = []
+    for idx, path in enumerate(normalized_paths):
+        explicit_run_id = None if run_ids is None else run_ids[idx]
+        if explicit_run_id is not None and str(explicit_run_id).strip():
+            candidate_tags.append(str(explicit_run_id))
+        elif name_counts.get(str(path.name), 0) > 1:
+            candidate_tags.append(_default_multi_base_tag(path))
+        else:
+            candidate_tags.append(_sanitize_path_tag_component(path.name))
+    unique_tags = _deduplicate_tags(candidate_tags)
+    entries: List[Dict[str, Any]] = []
+    for path, tag in zip(normalized_paths, unique_tags):
+        entries.append({
+            "rawdata_path": path,
+            "base_tag": tag,
+            "run_id": tag,
+        })
+    return entries
+
+
+
 def _collect_singlebeam_rows(result, run_id: str, source_db_path: Path, stream: Any) -> pd.DataFrame:
     df = results_to_summary_dataframe(result.scan_ids, result.results)
     if df.empty:
@@ -341,6 +403,7 @@ def run_extract(
     outdir: Path,
     run_id: Optional[str] = None,
     stream_names: Optional[Sequence[str]] = None,
+    base_tag: Optional[str] = None,
 ) -> Dict[str, Any]:
     config = load_spectrometer_config(spectrometer_config)
     validation = validate_spectrometer_config(spectrometer_config, explicit_stream_names=stream_names)
@@ -350,7 +413,7 @@ def run_extract(
     if not streams:
         raise ValueError("no streams selected for extraction")
 
-    base_tag = rawdata_path.name
+    base_tag = str(base_tag or rawdata_path.name)
     run_id = str(run_id or rawdata_path.name)
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
@@ -589,11 +652,150 @@ def run_extract(
 
 
 
+def run_extract_many(
+    rawdata_paths: Sequence[Path],
+    spectrometer_config: Path,
+    base_config: SunScanAnalysisConfig,
+    *,
+    outdir: Path,
+    run_ids: Optional[Sequence[Optional[str]]] = None,
+    stream_names: Optional[Sequence[str]] = None,
+    merged_tag: Optional[str] = None,
+) -> Dict[str, Any]:
+    entries = _prepare_multi_run_entries(rawdata_paths, run_ids=run_ids)
+    if not entries:
+        raise ValueError("rawdata_paths must not be empty")
+
+    outdir = Path(outdir).expanduser().resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
+    per_run_root = outdir / "per_run"
+    merged_root = outdir / "merged"
+    per_run_root.mkdir(parents=True, exist_ok=True)
+    merged_root.mkdir(parents=True, exist_ok=True)
+
+    merged_label = _sanitize_path_tag_component(merged_tag or "all")
+    all_rows: List[pd.DataFrame] = []
+    manifest_rows: List[pd.DataFrame] = []
+    run_rows: List[Dict[str, Any]] = []
+    per_run_outputs: List[Dict[str, Any]] = []
+
+    for seq, entry in enumerate(entries, start=1):
+        rawdata_path = Path(entry["rawdata_path"]).expanduser().resolve()
+        base_tag = str(entry["base_tag"])
+        run_id = str(entry["run_id"])
+        per_run_outdir = per_run_root / base_tag
+        per_run_outdir.mkdir(parents=True, exist_ok=True)
+        cfg_run = copy.deepcopy(base_config)
+        cfg_run.input.rawdata_path = rawdata_path
+        cfg_run.report.outdir = per_run_outdir
+        try:
+            outputs = run_extract(
+                rawdata_path=rawdata_path,
+                spectrometer_config=Path(spectrometer_config).expanduser().resolve(),
+                base_config=cfg_run,
+                outdir=per_run_outdir,
+                run_id=run_id,
+                stream_names=stream_names,
+                base_tag=base_tag,
+            )
+            all_df = outputs.get("all_df", pd.DataFrame()).copy()
+            if not all_df.empty:
+                if "rawdata_path" not in all_df.columns:
+                    all_df.insert(0, "rawdata_path", str(rawdata_path))
+                if "base_tag" not in all_df.columns:
+                    all_df.insert(0, "base_tag", base_tag)
+                if "run_id" not in all_df.columns:
+                    all_df.insert(0, "run_id", run_id)
+            manifest_df = outputs.get("manifest_df", pd.DataFrame()).copy()
+            if manifest_df.empty:
+                manifest_df = pd.DataFrame()
+            if "rawdata_path" not in manifest_df.columns:
+                manifest_df.insert(0, "rawdata_path", str(rawdata_path))
+            if "base_tag" not in manifest_df.columns:
+                manifest_df.insert(0, "base_tag", base_tag)
+            if "run_id" not in manifest_df.columns:
+                manifest_df.insert(0, "run_id", run_id)
+            all_rows.append(all_df)
+            manifest_rows.append(manifest_df)
+            outputs["base_tag"] = base_tag
+            outputs["run_id"] = run_id
+            outputs["rawdata_path"] = rawdata_path
+            outputs["per_run_outdir"] = per_run_outdir
+            per_run_outputs.append(outputs)
+            run_rows.append({
+                "sequence_index": seq,
+                "run_id": run_id,
+                "base_tag": base_tag,
+                "rawdata_path": str(rawdata_path),
+                "per_run_outdir": str(per_run_outdir),
+                "status": "ok",
+                "error": None,
+                "all_summary_csv": str(outputs.get("all_summary_csv")) if outputs.get("all_summary_csv") is not None else None,
+                "manifest_csv": str(outputs.get("manifest_csv")) if outputs.get("manifest_csv") is not None else None,
+                "stream_table_csv": str(outputs.get("stream_table_csv")) if outputs.get("stream_table_csv") is not None else None,
+                "config_snapshot_json": str(outputs.get("config_snapshot_json")) if outputs.get("config_snapshot_json") is not None else None,
+                "n_summary_rows": int(len(all_df)),
+                "n_manifest_rows": int(len(manifest_df)),
+            })
+        except Exception as exc:
+            run_rows.append({
+                "sequence_index": seq,
+                "run_id": run_id,
+                "base_tag": base_tag,
+                "rawdata_path": str(rawdata_path),
+                "per_run_outdir": str(per_run_outdir),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+                "all_summary_csv": None,
+                "manifest_csv": None,
+                "stream_table_csv": None,
+                "config_snapshot_json": None,
+                "n_summary_rows": 0,
+                "n_manifest_rows": 0,
+            })
+            (per_run_outdir / "run_extract_many_error.txt").write_text(traceback.format_exc(), encoding="utf-8")
+            if not base_config.runtime.continue_on_error:
+                raise
+
+    merged_all_df = pd.concat(all_rows, axis=0, ignore_index=True) if all_rows else pd.DataFrame()
+    preferred_prefix = [
+        "run_id", "base_tag", "rawdata_path", "tag", "stream_name", "beam_id", "scan_id",
+        "x_arcsec", "y_arcsec",
+        "source_db_path", "spectral_name", "db_stream_name", "restfreq_hz", "analysis_config_digest",
+        "polariza", "fdnum", "ifnum", "plnum", "sampler",
+    ]
+    ordered_cols = [c for c in preferred_prefix if c in merged_all_df.columns] + [c for c in merged_all_df.columns if c not in preferred_prefix]
+    if ordered_cols:
+        merged_all_df = merged_all_df.loc[:, ordered_cols]
+    merged_manifest_df = pd.concat(manifest_rows, axis=0, ignore_index=True) if manifest_rows else pd.DataFrame()
+    run_table_df = pd.DataFrame(run_rows)
+
+    all_csv = merged_root / f"sunscan_multibeam_scan_summary_{merged_label}.csv"
+    manifest_csv = merged_root / f"sunscan_multibeam_manifest_{merged_label}.csv"
+    run_table_csv = merged_root / f"sunscan_multibeam_run_table_{merged_label}.csv"
+    merged_all_df.to_csv(all_csv, index=False)
+    merged_manifest_df.to_csv(manifest_csv, index=False)
+    run_table_df.to_csv(run_table_csv, index=False)
+
+    return {
+        "all_summary_csv": all_csv,
+        "manifest_csv": manifest_csv,
+        "run_table_csv": run_table_csv,
+        "merged_outdir": merged_root,
+        "per_run_root": per_run_root,
+        "all_df": merged_all_df,
+        "manifest_df": merged_manifest_df,
+        "run_table_df": run_table_df,
+        "per_run_outputs": per_run_outputs,
+    }
+
+
+
 def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
-    ap.add_argument("rawdata", help="RawData directory containing the NECST database")
+    ap.add_argument("rawdata", nargs="+", help="One or more RawData directories containing the NECST database")
     ap.add_argument("--spectrometer-config", required=True, help="converter-compatible spectrometer config TOML")
     ap.add_argument("--outdir", default=".", help="Output directory")
-    ap.add_argument("--run-id", default=None, help="Override run_id (default: rawdata directory name)")
+    ap.add_argument("--run-id", default=None, help="Override run_id for a single RawData input. When multiple RawData directories are given, this value is used as the merged output tag.")
     ap.add_argument("--db-namespace", default="necst", help="Database namespace/prefix used in NECST DB table names")
     ap.add_argument("--telescope", default="OMU1P85M", help="Telescope name used in NECST DB table names")
     ap.add_argument("--tel-loaddata", default="OMU1p85m", help="Telescope name passed to nercst loaddb()")
@@ -702,7 +904,8 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
 
 
 def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> SunScanAnalysisConfig:
-    cfg = SunScanAnalysisConfig.default(rawdata_path=Path(args.rawdata).expanduser().resolve(), spectral_name="__unused__", outdir=Path(args.outdir).expanduser().resolve())
+    rawdata_value = args.rawdata[0] if isinstance(args.rawdata, (list, tuple)) else args.rawdata
+    cfg = SunScanAnalysisConfig.default(rawdata_path=Path(rawdata_value).expanduser().resolve(), spectral_name="__unused__", outdir=Path(args.outdir).expanduser().resolve())
     global_cfg = _load_global_cfg(getattr(args, "spectrometer_config", None))
 
     cfg.input.db_namespace = _choose_str_setting(args, argv, "--db-namespace", "db_namespace", global_cfg, "db_namespace", "necst")
@@ -809,22 +1012,37 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
 def main(argv: Optional[Sequence[str]] = None) -> None:
     if argv is None:
         argv = list(sys.argv[1:])
-    ap = argparse.ArgumentParser(description="Run sun_scan-compatible analysis for every configured stream in a RawData directory.")
+    ap = argparse.ArgumentParser(description="Run sun_scan-compatible analysis for every configured stream in one or more RawData directories.")
     add_extract_arguments(ap)
     args = ap.parse_args(argv)
     cfg = config_from_args(args, argv=argv)
-    outputs = run_extract(
-        rawdata_path=Path(args.rawdata).expanduser().resolve(),
+    rawdata_paths = [Path(p).expanduser().resolve() for p in args.rawdata]
+    if len(rawdata_paths) == 1:
+        outputs = run_extract(
+            rawdata_path=rawdata_paths[0],
+            spectrometer_config=Path(args.spectrometer_config).expanduser().resolve(),
+            base_config=cfg,
+            outdir=Path(args.outdir).expanduser().resolve(),
+            run_id=args.run_id,
+            stream_names=args.stream_names,
+        )
+        print(f"[done] wrote {outputs['all_summary_csv']}")
+        print(f"[done] wrote {outputs['manifest_csv']}")
+        print(f"[done] wrote {outputs['stream_table_csv']}")
+        print(f"[done] wrote {outputs['config_snapshot_json']}")
+        return
+    outputs = run_extract_many(
+        rawdata_paths=rawdata_paths,
         spectrometer_config=Path(args.spectrometer_config).expanduser().resolve(),
         base_config=cfg,
         outdir=Path(args.outdir).expanduser().resolve(),
-        run_id=args.run_id,
+        run_ids=None,
         stream_names=args.stream_names,
+        merged_tag=args.run_id,
     )
     print(f"[done] wrote {outputs['all_summary_csv']}")
     print(f"[done] wrote {outputs['manifest_csv']}")
-    print(f"[done] wrote {outputs['stream_table_csv']}")
-    print(f"[done] wrote {outputs['config_snapshot_json']}")
+    print(f"[done] wrote {outputs['run_table_csv']}")
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ from . import synthetic_multibeam as pseudo_mod
 from .public_api import (
     check_spectrometer_config,
     run_multibeam_extract,
+    run_multibeam_extract_many,
     run_multibeam_fit,
     run_pseudo_multibeam,
 )
@@ -40,15 +41,29 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = ap.parse_args(argv)
     if args.cmd == "extract":
         cfg = extract_mod.config_from_args(args, argv=argv)
-        outputs = run_multibeam_extract(
-            rawdata_path=cfg.input.rawdata_path,
+        rawdata_paths = [Path(p).expanduser().resolve() for p in args.rawdata]
+        if len(rawdata_paths) == 1:
+            outputs = run_multibeam_extract(
+                rawdata_path=cfg.input.rawdata_path,
+                spectrometer_config=Path(args.spectrometer_config).expanduser().resolve(),
+                base_config=cfg,
+                outdir=cfg.report.outdir,
+                run_id=args.run_id,
+                stream_names=args.stream_names,
+            )
+            for key in ["all_summary_csv", "manifest_csv", "stream_table_csv", "config_snapshot_json"]:
+                print(f"[done] {key}: {outputs[key]}")
+            return
+        outputs = run_multibeam_extract_many(
+            rawdata_paths=rawdata_paths,
             spectrometer_config=Path(args.spectrometer_config).expanduser().resolve(),
             base_config=cfg,
             outdir=cfg.report.outdir,
-            run_id=args.run_id,
+            run_ids=None,
             stream_names=args.stream_names,
+            merged_tag=args.run_id,
         )
-        for key in ["all_summary_csv", "manifest_csv", "stream_table_csv", "config_snapshot_json"]:
+        for key in ["all_summary_csv", "manifest_csv", "run_table_csv"]:
             print(f"[done] {key}: {outputs[key]}")
         return
     if args.cmd == "fit":
@@ -77,6 +92,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             noise_arcsec=float(args.noise_arcsec),
             seed=int(args.seed),
             tag=args.tag,
+            rep_el_degs=args.rep_el_degs,
         )
         for key, path in outputs.items():
             print(f"[done] {key}: {path}")

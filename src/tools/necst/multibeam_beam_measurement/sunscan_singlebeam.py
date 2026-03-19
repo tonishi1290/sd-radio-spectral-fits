@@ -7,7 +7,7 @@ import math
 import sys
 
 from .config_io import load_spectrometer_config, resolve_stream_usage_policy, restfreq_hz_for_stream, stream_extras_by_name
-from .public_api import run_singlebeam
+from .public_api import run_singlebeam, run_singlebeam_many
 from .sunscan_config import SunScanAnalysisConfig
 from .sunscan_report import build_summary_lines
 
@@ -213,9 +213,10 @@ def _select_stream_from_config(config_dict: Dict[str, Any], *, stream_name: Opti
 
 
 def add_singlebeam_arguments(ap: argparse.ArgumentParser) -> None:
-    ap.add_argument("rawdata", help="RawData directory containing the NECST database")
+    ap.add_argument("rawdata", nargs="+", help="One or more RawData directories containing the NECST database")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--spectrometer-config", default=None, help="converter-compatible spectrometer config TOML")
+    ap.add_argument("--run-id", default=None, help="Merged output tag for multi-run mode; also used as output tag in single-run mode when explicitly set")
     ap.add_argument("--stream-name", default=None, help="Select one stream from --spectrometer-config")
     ap.add_argument("--db-namespace", default="necst", help="Database namespace/prefix used in NECST DB table names")
     ap.add_argument("--telescope", default="OMU1P85M", help="Telescope name used in NECST DB table names")
@@ -349,7 +350,9 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
                     "Pass --stream-name explicitly if you intentionally want to override this for a one-off run."
                 )
 
-    cfg = SunScanAnalysisConfig.default(rawdata_path=Path(args.rawdata).expanduser().resolve(), spectral_name=(resolved_spectral_name or args.spectral_name), outdir=Path(args.outdir).expanduser().resolve())
+    rawdata_values = list(args.rawdata) if isinstance(args.rawdata, (list, tuple)) else [args.rawdata]
+    first_rawdata = Path(rawdata_values[0]).expanduser().resolve()
+    cfg = SunScanAnalysisConfig.default(rawdata_path=first_rawdata, spectral_name=(resolved_spectral_name or args.spectral_name), outdir=Path(args.outdir).expanduser().resolve())
 
     cfg.input.db_namespace = _choose_str_setting(args, argv, "--db-namespace", "db_namespace", global_cfg, "db_namespace", "necst")
     cfg.input.telescope = _choose_str_setting(args, argv, "--telescope", "telescope", global_cfg, "telescope", "OMU1P85M")
@@ -480,6 +483,9 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
     cfg.dish_diameter_m = _choose_float_setting(args, argv, "--dish-diameter-m", "dish_diameter_m", global_cfg, "dish_diameter_m", 1.85, stream_cfg=stream_cfg)
     cfg.hpbw_factor = _choose_float_setting(args, argv, "--hpbw-factor", "hpbw_factor", global_cfg, "hpbw_factor", 1.2, stream_cfg=stream_cfg)
 
+    if getattr(args, "run_id", None) and len(rawdata_values) == 1:
+        cfg.report.tag = str(args.run_id).strip() or None
+
     if selected_stream is not None and not cfg.runtime.hpbw_init_explicit:
         cfg.edge_fit.hpbw_init_arcsec = _estimate_hpbw_init_arcsec(
             restfreq_hz=cfg.beam_override.restfreq_hz,
@@ -497,27 +503,46 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     add_singlebeam_arguments(ap)
     args = ap.parse_args(argv)
     cfg = config_from_args(args, argv=argv)
-    result = run_singlebeam(cfg)
+    rawdata_paths = [Path(p).expanduser().resolve() for p in args.rawdata]
 
-    if bool(result.config.edge_fit.enabled) and result.results:
-        lines = build_summary_lines(
-            result.config.resolved_tag(),
-            result.ytitle,
-            result.config,
-            result.scan_ids,
-            result.results,
-        )
-        print("\n".join(lines))
+    if len(rawdata_paths) == 1:
+        result = run_singlebeam(cfg)
 
-    if result.report_paths.derivative_pngs:
-        page_pat = f"sun_scan_derivative_fits_{result.config.resolved_tag()}_pXXX.png"
-        print(f"[fit] wrote {len(result.report_paths.derivative_pngs)} page(s) of {page_pat}")
-    if result.report_paths.summary_csv:
-        print(f"[fit] wrote {result.report_paths.summary_csv.name}")
+        if bool(result.config.edge_fit.enabled) and result.results:
+            lines = build_summary_lines(
+                result.config.resolved_tag(),
+                result.ytitle,
+                result.config,
+                result.scan_ids,
+                result.results,
+            )
+            print("\n".join(lines))
 
-    print("[done]")
-    print(f"  outputs in: {result.config.report.outdir}")
-    print(f"  df rows: {len(result.df)}  az_scans: {len(result.az_scans)}  el_scans: {len(result.el_scans)}")
+        if result.report_paths.derivative_pngs:
+            page_pat = f"sun_scan_derivative_fits_{result.config.resolved_tag()}_pXXX.png"
+            print(f"[fit] wrote {len(result.report_paths.derivative_pngs)} page(s) of {page_pat}")
+        if result.report_paths.summary_csv:
+            print(f"[fit] wrote {result.report_paths.summary_csv.name}")
+
+        print("[done]")
+        print(f"  outputs in: {result.config.report.outdir}")
+        print(f"  df rows: {len(result.df)}  az_scans: {len(result.az_scans)}  el_scans: {len(result.el_scans)}")
+        return
+
+    outputs = run_singlebeam_many(
+        rawdata_paths=rawdata_paths,
+        base_config=cfg,
+        outdir=Path(args.outdir).expanduser().resolve(),
+        run_id=getattr(args, "run_id", None),
+    )
+    run_table_df = outputs["run_table_df"]
+    success_count = int((run_table_df["status"] == "success").sum()) if (not run_table_df.empty and "status" in run_table_df.columns) else 0
+    error_count = int((run_table_df["status"] == "error").sum()) if (not run_table_df.empty and "status" in run_table_df.columns) else 0
+    if outputs.get("merged_summary_csv") is not None:
+        print(f"[fit] wrote {Path(outputs['merged_summary_csv']).name}")
+    print(f"[done] wrote {Path(outputs['run_table_csv']).name}")
+    print(f"  outputs in: {Path(args.outdir).expanduser().resolve()}")
+    print(f"  runs: total={len(rawdata_paths)} success={success_count} error={error_count}")
 
 
 if __name__ == "__main__":
