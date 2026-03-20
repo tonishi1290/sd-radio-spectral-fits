@@ -726,6 +726,8 @@ class StreamConfig:
     plnum: int
     polariza: str
     beam: BeamConfig
+    enabled: bool = True
+    use_for_convert: bool = True
     frontend: Optional[str] = None
     backend: Optional[str] = None
     sampler: Optional[str] = None
@@ -805,6 +807,17 @@ def _as_bool(v, default=False):
     return bool(default)
 
 
+def _coerce_optional_bool(v):
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return bool(v)
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return None
 
 
 def _nonempty_str(value, default=None):
@@ -812,6 +825,107 @@ def _nonempty_str(value, default=None):
         return default
     s = str(value).strip()
     return s if s else default
+
+def _normalize_legacy_correction_mode(value):
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s == "minus":
+        return "subtract"
+    if s == "plus":
+        return "add"
+    if s in ("subtract", "add", "none"):
+        return s
+    raise ValueError("unsupported azel correction mode={!r}".format(value))
+
+def _normalize_output_azel_source(value):
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    aliases = {
+        "beam": "beam",
+        "boresight": "boresight",
+        "true": "boresight",
+        "raw_encoder": "raw_encoder",
+        "encoder": "raw_encoder",
+        "raw_altaz": "raw_altaz",
+        "altaz": "raw_altaz",
+        "corrected_cmd": "corrected_cmd",
+        "cmd": "corrected_cmd",
+    }
+    if s not in aliases:
+        raise ValueError("unsupported output_azel_source={!r}".format(value))
+    return aliases[s]
+
+
+def _canonicalize_global_coordinate_settings(global_cfg):
+    d = dict(global_cfg or {})
+    if d.get("azel_correction_apply") is None and d.get("boresight_correction_apply") is not None:
+        d["azel_correction_apply"] = d.get("boresight_correction_apply")
+    if d.get("radec_method") is None and d.get("skycoord_method") is not None:
+        d["radec_method"] = d.get("skycoord_method")
+    if d.get("radec_azel_source") is None and d.get("output_azel_source") is not None:
+        d["radec_azel_source"] = d.get("output_azel_source")
+    return d
+
+
+def _resolve_convert_usage(enabled_raw, use_for_convert_raw):
+    enabled_opt = _coerce_optional_bool(enabled_raw)
+    enabled = True if enabled_opt is None else bool(enabled_opt)
+    use_opt = _coerce_optional_bool(use_for_convert_raw)
+    use_for_convert = enabled if use_opt is None else (enabled and bool(use_opt))
+    return bool(enabled), bool(use_for_convert)
+
+
+def _select_streams_for_convert(streams, explicit_stream_names=None):
+    streams = list(streams or [])
+    if explicit_stream_names:
+        wanted = [str(s) for s in explicit_stream_names]
+        wanted_set = set(wanted)
+        selected = [stream for stream in streams if str(getattr(stream, "name", "")) in wanted_set]
+        found = {str(getattr(stream, "name", "")) for stream in selected}
+        missing = [name for name in wanted if name not in found]
+        if missing:
+            raise ValueError("stream(s) not found in spectrometer config: {}".format(missing))
+        return selected
+    return [stream for stream in streams if bool(getattr(stream, "use_for_convert", True))]
+
+
+def _resolve_cli_or_global_choice(args, argv, global_cfg, *, attr, cli_opts, global_keys, default=None, normalize=None):
+    if _argv_has_option(argv, *cli_opts):
+        value = getattr(args, attr, None)
+    else:
+        value = None
+        for key in global_keys:
+            if global_cfg.get(key) is not None:
+                value = global_cfg.get(key)
+                break
+        if value is None:
+            value = getattr(args, attr, None)
+    if value is None:
+        value = default
+    if normalize is not None:
+        value = normalize(value)
+    return value
+
+
+def apply_azel_correction(az_deg, el_deg, corr_az_deg, corr_el_deg, apply_mode):
+    mode = str(apply_mode if apply_mode is not None else "subtract").strip().lower()
+    az = np.asarray(az_deg, dtype=float)
+    el = np.asarray(el_deg, dtype=float)
+    caz = np.asarray(corr_az_deg, dtype=float)
+    cel = np.asarray(corr_el_deg, dtype=float)
+    if mode == "subtract":
+        return (az - caz) % 360.0, el - cel
+    if mode == "add":
+        return (az + caz) % 360.0, el + cel
+    if mode == "none":
+        return az % 360.0, el
+    raise ValueError("unsupported azel_correction_apply={!r}".format(apply_mode))
 
 
 def _normalize_table_suffix(value, default):
@@ -1260,6 +1374,8 @@ def _normalize_stream_block(block, stream_index):
     if channel_slice_spec is None and "channel_slice" in frequency_axis:
         channel_slice_spec = frequency_axis.pop("channel_slice")
 
+    enabled, use_for_convert = _resolve_convert_usage(block.get("enabled", None), block.get("use_for_convert", None))
+
     stream = StreamConfig(
         name=name,
         fdnum=fdnum,
@@ -1267,6 +1383,8 @@ def _normalize_stream_block(block, stream_index):
         plnum=plnum,
         polariza=polariza,
         beam=beam,
+        enabled=enabled,
+        use_for_convert=use_for_convert,
         frontend=(str(block.get("frontend")).strip() if block.get("frontend") is not None else None),
         backend=(str(block.get("backend")).strip() if block.get("backend") is not None else None),
         sampler=(str(block.get("sampler")).strip() if block.get("sampler") is not None else None),
@@ -1305,7 +1423,7 @@ def load_spectrometer_config(config_path):
             raise ValueError("duplicate (fdnum, ifnum, plnum, polariza, sampler) combination: {}".format(key))
         seen_key.add(key)
 
-    global_cfg = dict(cfg.get("global", {}) or {})
+    global_cfg = _canonicalize_global_coordinate_settings(dict(cfg.get("global", {}) or {}))
     provenance = dict(cfg.get("provenance", {}) or {})
     return {
         "schema_version": schema_version,
@@ -1362,7 +1480,7 @@ def build_legacy_single_stream_config(args):
         "schema_version": 1,
         "config_name": "legacy_single_stream",
         "config_description": "Auto-generated from legacy CLI arguments",
-        "global": {"output_layout": "merged", "time_sort": True, "db_namespace": "necst", "telescope": str(args.telescope), "encoder_shift_sec": float(args.encoder_shift_sec)},
+        "global": {"output_layout": "merged", "time_sort": True, "db_namespace": "necst", "telescope": str(args.telescope), "encoder_shift_sec": float(args.encoder_shift_sec), "radec_method": "azel", "radec_azel_source": "beam", "azel_correction_apply": "subtract"},
         "provenance": {},
         "streams": [stream],
     }
@@ -1538,7 +1656,7 @@ def resolve_stream_meteorology(common, stream_data, met_source, interp_extrap):
 # -----------------------------------------------------------------------------
 # 3) Normalize
 # -----------------------------------------------------------------------------
-def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_col, extrap, encoder_shift_sec=0.0):
+def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_col, extrap, encoder_shift_sec=0.0, azel_correction_apply="subtract"):
     enc_names = list(arr_enc.dtype.names or [])
     alt_names = list(arr_alt.dtype.names or [])
 
@@ -1596,8 +1714,7 @@ def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_co
         az_cmd_t = np.full_like(t_spec, np.nan, dtype=float)
         el_cmd_t = np.full_like(t_spec, np.nan, dtype=float)
 
-    boresight_az = (az_enc_t - dlon_t) % 360.0
-    boresight_el = el_enc_t - dlat_t
+    boresight_az, boresight_el = apply_azel_correction(az_enc_t, el_enc_t, dlon_t, dlat_t, azel_correction_apply)
 
     d_az = _wrap180_deg(az_enc_t - az_cmd_t)
     d_el = (el_enc_t - el_cmd_t)
@@ -1615,6 +1732,7 @@ def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_co
         "dlat_t": dlat_t,
         "boresight_az": boresight_az,
         "boresight_el": boresight_el,
+        "azel_correction_apply": str(azel_correction_apply),
         "pe_x_arcsec": pe_x_arcsec,
         "pe_y_arcsec": pe_y_arcsec,
         "pe_r_arcsec": pe_r_arcsec,
@@ -1667,52 +1785,57 @@ def apply_beam_offset(boresight_az_deg, boresight_el_deg, beam):
     }
 
 
-def select_radec_azel_source(pointing, beam, radec_azel_source):
-    source = str(radec_azel_source if radec_azel_source is not None else "beam").strip().lower()
+def select_radec_azel_source(pointing, beam, radec_azel_source, azel_correction_apply="subtract"):
+    source = _normalize_output_azel_source(radec_azel_source if radec_azel_source is not None else "beam")
 
     if source == "beam":
         return {
             "source": "beam",
             "az_deg": np.asarray(pointing["beam_az_deg"], dtype=float),
             "el_deg": np.asarray(pointing["beam_el_deg"], dtype=float),
-            "meaning": "beam-center Az/El from (encoder - correction) boresight + beam offset",
+            "meaning": "beam-center Az/El from corrected boresight + beam offset",
         }
 
-    if source == "true":
+    if source == "boresight":
         return {
-            "source": "true",
+            "source": "boresight",
             "az_deg": np.asarray(pointing["boresight_az"], dtype=float),
             "el_deg": np.asarray(pointing["boresight_el"], dtype=float),
-            "meaning": "boresight Az/El from encoder - correction (no beam offset)",
+            "meaning": "corrected boresight Az/El without beam offset",
         }
 
-    if source == "encoder":
+    if source == "raw_encoder":
         applied = apply_beam_offset(pointing["az_enc_t"], pointing["el_enc_t"], beam)
         return {
-            "source": "encoder",
+            "source": "raw_encoder",
             "az_deg": np.asarray(applied["beam_az_deg"], dtype=float),
             "el_deg": np.asarray(applied["beam_el_deg"], dtype=float),
-            "meaning": "beam-offset Az/El from measured encoder lon/lat",
+            "meaning": "beam-offset Az/El from raw encoder lon/lat",
         }
 
-    if source == "altaz":
+    if source == "raw_altaz":
         applied = apply_beam_offset(pointing["az_cmd_t"], pointing["el_cmd_t"], beam)
         return {
-            "source": "altaz",
+            "source": "raw_altaz",
             "az_deg": np.asarray(applied["beam_az_deg"], dtype=float),
             "el_deg": np.asarray(applied["beam_el_deg"], dtype=float),
             "meaning": "beam-offset Az/El from raw altaz/cmd lon/lat",
         }
 
-    if source == "cmd":
-        cmd_boresight_az = (np.asarray(pointing["az_cmd_t"], dtype=float) - np.asarray(pointing["dlon_t"], dtype=float)) % 360.0
-        cmd_boresight_el = np.asarray(pointing["el_cmd_t"], dtype=float) - np.asarray(pointing["dlat_t"], dtype=float)
+    if source == "corrected_cmd":
+        cmd_boresight_az, cmd_boresight_el = apply_azel_correction(
+            np.asarray(pointing["az_cmd_t"], dtype=float),
+            np.asarray(pointing["el_cmd_t"], dtype=float),
+            np.asarray(pointing["dlon_t"], dtype=float),
+            np.asarray(pointing["dlat_t"], dtype=float),
+            azel_correction_apply,
+        )
         applied = apply_beam_offset(cmd_boresight_az, cmd_boresight_el, beam)
         return {
-            "source": "cmd",
+            "source": "corrected_cmd",
             "az_deg": np.asarray(applied["beam_az_deg"], dtype=float),
             "el_deg": np.asarray(applied["beam_el_deg"], dtype=float),
-            "meaning": "beam-offset Az/El from (altaz/cmd - correction) boresight",
+            "meaning": "beam-offset Az/El from corrected altaz/cmd boresight",
         }
 
     raise ValueError("unsupported radec_azel_source={!r}".format(radec_azel_source))
@@ -1846,17 +1969,74 @@ def _fill_with_fallback(arr, fallback):
     return out
 
 
-def finalize_inside_temperature_for_tamb(t_spec, tamb_c, args):
-    inside_default = getattr(args, "inside_default_temperature_c", None)
-    if inside_default is None:
-        inside_default = getattr(args, "met_temperature_c", 10.0)
-    temp_fb = float(inside_default)
-    out = _fill_with_fallback(tamb_c, np.full_like(t_spec, temp_fb, dtype=float))
-    tmin = float(getattr(args, "inside_temperature_min_c", -50.0))
-    tmax = float(getattr(args, "inside_temperature_max_c", 50.0))
-    bad = (~np.isfinite(out)) | (out < tmin) | (out > tmax)
-    out = np.where(bad, temp_fb, out)
+def _temperature_c_to_k_array(temp_c):
+    if temp_c is None:
+        return None
+    x = np.asarray(temp_c, dtype=float)
+    out = np.full_like(x, np.nan, dtype=float)
+    good = np.isfinite(x)
+    out[good] = x[good] + 273.15
     return out
+
+
+def finalize_temperature_output_k(
+    t_spec,
+    temp_c,
+    args,
+    *,
+    fixed_attr,
+    default_attr,
+    min_attr,
+    max_attr,
+    default_k,
+    min_k,
+    max_k,
+):
+    fixed_k = getattr(args, fixed_attr, None)
+    fallback_k = getattr(args, default_attr, None)
+    if fallback_k is None:
+        fallback_k = default_k
+    fallback_k = float(fallback_k)
+    if fixed_k is not None:
+        out = np.full_like(t_spec, float(fixed_k), dtype=float)
+    else:
+        temp_k = _temperature_c_to_k_array(temp_c)
+        out = _fill_with_fallback(temp_k, np.full_like(t_spec, fallback_k, dtype=float))
+    tmin_k = float(getattr(args, min_attr, min_k))
+    tmax_k = float(getattr(args, max_attr, max_k))
+    bad = (~np.isfinite(out)) | (out < tmin_k) | (out > tmax_k)
+    out = np.where(bad, fallback_k, out)
+    return out
+
+
+def finalize_hot_temperature_k(t_spec, hot_temp_c, args):
+    return finalize_temperature_output_k(
+        t_spec,
+        hot_temp_c,
+        args,
+        fixed_attr="thot_k",
+        default_attr="thot_default_k",
+        min_attr="thot_min_k",
+        max_attr="thot_max_k",
+        default_k=293.15,
+        min_k=250.0,
+        max_k=330.0,
+    )
+
+
+def finalize_ambient_temperature_k(t_spec, ambient_temp_c, args):
+    return finalize_temperature_output_k(
+        t_spec,
+        ambient_temp_c,
+        args,
+        fixed_attr="tamb_k",
+        default_attr="tamb_default_k",
+        min_attr="tamb_min_k",
+        max_attr="tamb_max_k",
+        default_k=290.0,
+        min_k=250.0,
+        max_k=330.0,
+    )
 
 
 def finalize_meteorology_for_refraction(t_spec, temp_c, press_hpa, humid_pct, args):
@@ -1908,7 +2088,7 @@ def iter_scan_blocks_indices(idx, id_str, mode_str, scan_key):
     yield (k0, idx.size)
 
 
-def build_rows_for_stream(stream_data, pointing, radec, calc_refr_deg, temp_c, press_hpa, humid_pct,
+def build_rows_for_stream(stream_data, pointing, radec, calc_refr_deg, tamb_k, thot_k, press_hpa, humid_pct,
                           collapse, scan_key, skip_nonstandard_position, use_modes_csv, include_unknown,
                           pe_rms_warn_arcsec, pe_max_warn_arcsec, verbose_scan_pe):
     t_spec = stream_data.t_spec
@@ -2035,7 +2215,8 @@ def build_rows_for_stream(stream_data, pointing, radec, calc_refr_deg, temp_c, p
                     "corr_az_deg": float(pointing["dlon_t"][rep]),
                     "corr_el_deg": float(pointing["dlat_t"][rep]),
                     "calc_refr_deg": float(calc_refr_deg[rep]) if calc_refr_deg is not None else np.nan,
-                    "tamb_c": float(temp_c[rep]) if temp_c is not None else np.nan,
+                    "tamb_k": float(tamb_k[rep]) if tamb_k is not None else np.nan,
+                    "thot_k": float(thot_k[rep]) if thot_k is not None else np.nan,
                     "pressure_hpa": float(press_hpa[rep]) if press_hpa is not None else np.nan,
                     "humidity_pct": float(humid_pct[rep]) if humid_pct is not None else np.nan,
                     "pe_x_arcsec": float(pointing["pe_x_arcsec"][rep]),
@@ -2076,7 +2257,8 @@ def build_rows_for_stream(stream_data, pointing, radec, calc_refr_deg, temp_c, p
                     "corr_az_deg": float(pointing["dlon_t"][i]),
                     "corr_el_deg": float(pointing["dlat_t"][i]),
                     "calc_refr_deg": float(calc_refr_deg[i]) if calc_refr_deg is not None else np.nan,
-                    "tamb_c": float(temp_c[i]) if temp_c is not None else np.nan,
+                    "tamb_k": float(tamb_k[i]) if tamb_k is not None else np.nan,
+                    "thot_k": float(thot_k[i]) if thot_k is not None else np.nan,
                     "pressure_hpa": float(press_hpa[i]) if press_hpa is not None else np.nan,
                     "humidity_pct": float(humid_pct[i]) if humid_pct is not None else np.nan,
                     "pe_x_arcsec": float(pointing["pe_x_arcsec"][i]),
@@ -2224,7 +2406,8 @@ def write_sdfits(out_fits, writer, rows):
             beam_xoff_arcsec=float(row["beam_xoff_arcsec"]),
             beam_yoff_arcsec=float(row["beam_yoff_arcsec"]),
             beam_rot_deg=float(row["beam_rot_deg"]),
-            tamb_c=float(row["tamb_c"]) if np.isfinite(row["tamb_c"]) else np.nan,
+            t_hot_k=float(row["thot_k"]) if np.isfinite(row["thot_k"]) else np.nan,
+            tamb_c=(float(row["tamb_k"]) - 273.15) if np.isfinite(row["tamb_k"]) else np.nan,
             pressure_hpa=float(row["pressure_hpa"]) if np.isfinite(row["pressure_hpa"]) else np.nan,
             humidity_pct=float(row["humidity_pct"]) if np.isfinite(row["humidity_pct"]) else np.nan,
             restfreq_hz=(float(sw.restfreq_hz) if np.isfinite(sw.restfreq_hz) else None),
@@ -2274,6 +2457,7 @@ def parse_args(argv):
     )
     p.add_argument("rawdata", help="RawData folder path (necstdb + nercst)")
     p.add_argument("--spectrometer-config", default=None, help="TOML file describing spectrometers / beams / LO / WCS")
+    p.add_argument("--stream-name", "--convert-stream-name", dest="stream_names", action="append", default=None, help="Convert only the named stream(s). When omitted, enabled/use_for_convert in the spectrometer config select the streams.")
     p.add_argument("--strict-config", action="store_true", help="Treat stream mismatches as errors.")
     p.add_argument("--spectral", default="xffts-board1", help="Legacy single-stream spectral name")
     p.add_argument("--telescope", default="OMU1P85M", help="Telescope name used in table names")
@@ -2309,17 +2493,21 @@ def parse_args(argv):
     p.add_argument("--skip-nonstandard-position", action="store_true")
     p.add_argument("--wcs-table", default="necst-telescope-coordinate-wcs", help="WCS table name for RA/DEC time series")
 
-    p.add_argument("--radec-method", default="wcs_first", choices=["wcs_first", "azel"])
+    p.add_argument("--radec-method", "--skycoord-method", dest="radec_method", default=None, choices=["wcs_first", "azel"], help="Method used to obtain sky coordinates. Default is azel (standard path) unless overridden in config.")
     p.add_argument(
-        "--radec-azel-source",
-        default="beam",
-        choices=["beam", "true", "encoder", "altaz", "cmd"],
+        "--radec-azel-source", "--output-azel-source",
+        dest="radec_azel_source",
+        default=None,
+        choices=["beam", "boresight", "raw_encoder", "raw_altaz", "corrected_cmd", "true", "encoder", "altaz", "cmd"],
         help=(
-            "Az/El source used when RA/DEC is derived from Az/El (wcs_first fallback or --radec-method azel). "
-            "beam=current beam-center; true=encoder-corrected boresight; encoder=measured encoder with beam offset; "
-            "altaz=raw altaz/cmd with beam offset; cmd=(altaz/cmd - dlon/dlat) with beam offset."
+            "Az/El source used when sky coordinates are derived from Az/El. "
+            "Official names: beam=current beam center; boresight=corrected boresight without beam offset; "
+            "raw_encoder=raw encoder with beam offset; raw_altaz=raw altaz/cmd with beam offset; "
+            "corrected_cmd=corrected altaz/cmd boresight with beam offset. "
+            "Legacy aliases true/encoder/altaz/cmd are also accepted."
         ),
     )
+    p.add_argument("--azel-correction-apply", "--boresight-correction-apply", dest="azel_correction_apply", default=None, choices=["none", "subtract", "add"], help="How to combine raw encoder/altaz with dlon/dlat when constructing corrected boresight")
     p.add_argument("--refraction", default="on", choices=["on", "off"])
     p.add_argument("--met-pressure-hpa", type=float, default=None)
     p.add_argument("--met-temperature-c", type=float, default=10.0)
@@ -2342,6 +2530,10 @@ def parse_args(argv):
     p.add_argument("--inside-default-temperature-c", type=float, default=None)
     p.add_argument("--inside-temperature-min-c", type=float, default=None)
     p.add_argument("--inside-temperature-max-c", type=float, default=None)
+    p.add_argument("--thot-k", type=float, default=None, help="Fixed THOT [K]. When set, inside weather temperature is ignored for THOT output.")
+    p.add_argument("--thot-default-k", type=float, default=None, help="Fallback THOT [K] when inside weather temperature is missing/invalid.")
+    p.add_argument("--thot-min-k", type=float, default=None, help="Minimum accepted THOT [K].")
+    p.add_argument("--thot-max-k", type=float, default=None, help="Maximum accepted THOT [K].")
     p.add_argument("--outside-default-temperature-c", type=float, default=None)
     p.add_argument("--outside-default-pressure-hpa", type=float, default=None)
     p.add_argument("--outside-default-humidity-pct", type=float, default=None)
@@ -2351,6 +2543,10 @@ def parse_args(argv):
     p.add_argument("--outside-pressure-max-hpa", type=float, default=None)
     p.add_argument("--outside-humidity-min-pct", type=float, default=None)
     p.add_argument("--outside-humidity-max-pct", type=float, default=None)
+    p.add_argument("--tamb-k", type=float, default=None, help="Fixed TAMBIENT [K]. When set, outside weather temperature is ignored for TAMBIENT output.")
+    p.add_argument("--tamb-default-k", type=float, default=None, help="Fallback TAMBIENT [K] when outside weather temperature is missing/invalid.")
+    p.add_argument("--tamb-min-k", type=float, default=None, help="Minimum accepted TAMBIENT [K].")
+    p.add_argument("--tamb-max-k", type=float, default=None, help="Maximum accepted TAMBIENT [K].")
 
     p.add_argument("--collapse", action="store_true")
     p.add_argument("--pe-cor", action="store_true", help="legacy compatibility; unused")
@@ -2431,9 +2627,37 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
             return float(gval)
         return float(default)
 
+    def _choose_float_runtime_multi(cli_attrs, global_keys, default):
+        for cli_attr in cli_attrs:
+            cli_val = getattr(args, cli_attr, None)
+            if cli_val is not None:
+                return float(cli_val)
+        for global_key in global_keys:
+            gval = global_cfg.get(global_key, None)
+            if gval is not None:
+                return float(gval)
+        return float(default)
+
+    def _choose_optional_float_runtime_multi(cli_attrs, global_keys, default=None):
+        for cli_attr in cli_attrs:
+            cli_val = getattr(args, cli_attr, None)
+            if cli_val is not None:
+                return float(cli_val)
+        for global_key in global_keys:
+            gval = global_cfg.get(global_key, None)
+            if gval is not None:
+                return float(gval)
+        if default is None:
+            return None
+        return float(default)
+
     inside_default_temperature_c = _choose_float_runtime("inside_default_temperature_c", "inside_default_temperature_c", getattr(args, "met_temperature_c", 10.0))
     inside_temperature_min_c = _choose_float_runtime("inside_temperature_min_c", "inside_temperature_min_c", -50.0)
     inside_temperature_max_c = _choose_float_runtime("inside_temperature_max_c", "inside_temperature_max_c", 50.0)
+    thot_k = _choose_optional_float_runtime_multi(["thot_k"], ["thot_k"], None)
+    thot_default_k = _choose_float_runtime_multi(["thot_default_k"], ["thot_default_k"], inside_default_temperature_c + 273.15)
+    thot_min_k = _choose_float_runtime_multi(["thot_min_k"], ["thot_min_k"], inside_temperature_min_c + 273.15)
+    thot_max_k = _choose_float_runtime_multi(["thot_max_k"], ["thot_max_k"], inside_temperature_max_c + 273.15)
     outside_default_temperature_c = _choose_float_runtime("outside_default_temperature_c", "outside_default_temperature_c", getattr(args, "met_temperature_c", 10.0))
     outside_default_pressure_hpa = _choose_float_runtime("outside_default_pressure_hpa", "outside_default_pressure_hpa", getattr(args, "met_pressure_hpa", None) if getattr(args, "met_pressure_hpa", None) is not None else _pressure_from_elev_hpa(float(args.site_elev)))
     outside_default_humidity_pct = _choose_float_runtime("outside_default_humidity_pct", "outside_default_humidity_pct", getattr(args, "met_humidity_pct", 50.0))
@@ -2443,6 +2667,10 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     outside_pressure_max_hpa = _choose_float_runtime("outside_pressure_max_hpa", "outside_pressure_max_hpa", 1100.0)
     outside_humidity_min_pct = _choose_float_runtime("outside_humidity_min_pct", "outside_humidity_min_pct", 0.0)
     outside_humidity_max_pct = _choose_float_runtime("outside_humidity_max_pct", "outside_humidity_max_pct", 100.0)
+    tamb_k = _choose_optional_float_runtime_multi(["tamb_k"], ["tamb_k"], None)
+    tamb_default_k = _choose_float_runtime_multi(["tamb_default_k"], ["tamb_default_k"], outside_default_temperature_c + 273.15)
+    tamb_min_k = _choose_float_runtime_multi(["tamb_min_k"], ["tamb_min_k"], outside_temperature_min_c + 273.15)
+    tamb_max_k = _choose_float_runtime_multi(["tamb_max_k"], ["tamb_max_k"], outside_temperature_max_c + 273.15)
 
     encoder_shift_sec_cfg = global_cfg.get("encoder_shift_sec", None)
     if (not args.spectrometer_config) or _argv_has_option(argv, "--encoder-shift-sec") or (encoder_shift_sec_cfg is None):
@@ -2469,6 +2697,10 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
         "inside_default_temperature_c": inside_default_temperature_c,
         "inside_temperature_min_c": inside_temperature_min_c,
         "inside_temperature_max_c": inside_temperature_max_c,
+        "thot_k": thot_k,
+        "thot_default_k": thot_default_k,
+        "thot_min_k": thot_min_k,
+        "thot_max_k": thot_max_k,
         "outside_default_temperature_c": outside_default_temperature_c,
         "outside_default_pressure_hpa": outside_default_pressure_hpa,
         "outside_default_humidity_pct": outside_default_humidity_pct,
@@ -2478,6 +2710,10 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
         "outside_pressure_max_hpa": outside_pressure_max_hpa,
         "outside_humidity_min_pct": outside_humidity_min_pct,
         "outside_humidity_max_pct": outside_humidity_max_pct,
+        "tamb_k": tamb_k,
+        "tamb_default_k": tamb_default_k,
+        "tamb_min_k": tamb_min_k,
+        "tamb_max_k": tamb_max_k,
         "encoder_shift_sec": encoder_shift_sec,
     }
 
@@ -2495,11 +2731,7 @@ def main(argv=None):
             print("[warn] {}=recorded_time is not supported; forcing to 'time'".format(attr))
             setattr(args, attr, "time")
 
-    radec_azel_source_now = str(getattr(args, "radec_azel_source", "beam")).strip().lower()
-    if radec_azel_source_now not in ("beam", "true", "encoder", "altaz", "cmd"):
-        raise ValueError("unsupported --radec-azel-source={!r}".format(radec_azel_source_now))
-    if radec_azel_source_now != "beam":
-        print("[info] using --radec-azel-source={} for Az/El-derived RA/DEC".format(radec_azel_source_now))
+    # Coordinate-method options are finalized after loading config because config may override defaults.
     if bool(getattr(args, "strict_config", False)):
         print("[warn] --strict-config is reserved in v1_40 and is not yet enforced beyond current validation.")
 
@@ -2512,7 +2744,32 @@ def main(argv=None):
     else:
         config_dict = build_legacy_single_stream_config(args)
 
-    global_cfg = dict(config_dict.get("global", {}) or {})
+    global_cfg = _canonicalize_global_coordinate_settings(dict(config_dict.get("global", {}) or {}))
+    config_dict["global"] = global_cfg
+    args.radec_method = _resolve_cli_or_global_choice(
+        args, argv, global_cfg,
+        attr="radec_method",
+        cli_opts=("--radec-method", "--skycoord-method"),
+        global_keys=("radec_method", "skycoord_method"),
+        default="azel",
+        normalize=lambda v: str(v).strip().lower(),
+    )
+    args.radec_azel_source = _resolve_cli_or_global_choice(
+        args, argv, global_cfg,
+        attr="radec_azel_source",
+        cli_opts=("--radec-azel-source", "--output-azel-source"),
+        global_keys=("radec_azel_source", "output_azel_source"),
+        default="beam",
+        normalize=_normalize_output_azel_source,
+    )
+    args.azel_correction_apply = _resolve_cli_or_global_choice(
+        args, argv, global_cfg,
+        attr="azel_correction_apply",
+        cli_opts=("--azel-correction-apply", "--boresight-correction-apply"),
+        global_keys=("azel_correction_apply", "boresight_correction_apply", "altaz_apply"),
+        default="subtract",
+        normalize=_normalize_legacy_correction_mode,
+    )
     runtime_naming = _resolve_runtime_naming(args, config_dict, argv=argv)
     db_namespace = runtime_naming["db_namespace"]
     telescope_name = runtime_naming["telescope"]
@@ -2529,6 +2786,16 @@ def main(argv=None):
             runtime_naming[attr] = "time"
     args.encoder_time_col = str(runtime_naming.get("encoder_time_col", getattr(args, "encoder_time_col", "time")))
     args.altaz_time_col = str(runtime_naming.get("altaz_time_col", getattr(args, "altaz_time_col", "time")))
+    if str(args.radec_method) not in ("wcs_first", "azel"):
+        raise ValueError("unsupported --radec-method={!r}".format(args.radec_method))
+    if str(args.radec_azel_source) not in ("beam", "boresight", "raw_encoder", "raw_altaz", "corrected_cmd"):
+        raise ValueError("unsupported --output-azel-source={!r}".format(args.radec_azel_source))
+    if str(args.radec_method) != "azel":
+        print("[info] using --radec-method={} for sky coordinates".format(args.radec_method))
+    if str(args.radec_azel_source) != "beam":
+        print("[info] using --output-azel-source={} for Az/El-derived RA/DEC".format(args.radec_azel_source))
+    if str(args.azel_correction_apply) != "subtract":
+        print("[info] using azel_correction_apply={} when forming corrected boresight".format(args.azel_correction_apply))
     if float(args.encoder_shift_sec) != 0.0:
         print("[info] encoder_shift_sec = {} s (applied as t_enc <- t_enc + shift before interpolation to spectral time)".format(float(args.encoder_shift_sec)))
     apply_channel_slice_config(config_dict["streams"], global_cfg, cli_channel_slice=getattr(args, "channel_slice", None))
@@ -2537,7 +2804,17 @@ def main(argv=None):
         raise RuntimeError("Only merged/merged_time output_layout is supported in v1_40")
     if layout in ("merged", "merged_time") and not _as_bool(global_cfg.get("time_sort", True), True):
         raise RuntimeError("merged/merged_time output_layout requires global.time_sort=true in v1_40")
-    streams = list(config_dict["streams"])
+    all_streams = list(config_dict["streams"])
+    streams = _select_streams_for_convert(all_streams, explicit_stream_names=getattr(args, "stream_names", None))
+    if not streams:
+        if getattr(args, "stream_names", None):
+            raise ValueError("no streams selected for conversion after applying --stream-name")
+        raise ValueError("no streams selected for conversion; check enabled/use_for_convert flags or --stream-name")
+    skipped_stream_names = [str(stream.name) for stream in all_streams if str(stream.name) not in {str(s.name) for s in streams}]
+    if getattr(args, "stream_names", None):
+        print("[info] selected {} stream(s) by --stream-name: {}".format(len(streams), [str(s.name) for s in streams]))
+    elif skipped_stream_names:
+        print("[info] selected {} stream(s) for conversion via enabled/use_for_convert flags; skipped {}".format(len(streams), skipped_stream_names))
     out_fits = _default_outfile(rawbase, config_dict, args)
 
     w_table_arg = str(getattr(args, "weather_table", "auto")).strip()
@@ -2571,6 +2848,10 @@ def main(argv=None):
     args.inside_default_temperature_c = float(runtime_naming.get("inside_default_temperature_c"))
     args.inside_temperature_min_c = float(runtime_naming.get("inside_temperature_min_c"))
     args.inside_temperature_max_c = float(runtime_naming.get("inside_temperature_max_c"))
+    args.thot_k = runtime_naming.get("thot_k")
+    args.thot_default_k = float(runtime_naming.get("thot_default_k"))
+    args.thot_min_k = float(runtime_naming.get("thot_min_k"))
+    args.thot_max_k = float(runtime_naming.get("thot_max_k"))
     args.outside_default_temperature_c = float(runtime_naming.get("outside_default_temperature_c"))
     args.outside_default_pressure_hpa = float(runtime_naming.get("outside_default_pressure_hpa"))
     args.outside_default_humidity_pct = float(runtime_naming.get("outside_default_humidity_pct"))
@@ -2580,6 +2861,10 @@ def main(argv=None):
     args.outside_pressure_max_hpa = float(runtime_naming.get("outside_pressure_max_hpa"))
     args.outside_humidity_min_pct = float(runtime_naming.get("outside_humidity_min_pct"))
     args.outside_humidity_max_pct = float(runtime_naming.get("outside_humidity_max_pct"))
+    args.tamb_k = runtime_naming.get("tamb_k")
+    args.tamb_default_k = float(runtime_naming.get("tamb_default_k"))
+    args.tamb_min_k = float(runtime_naming.get("tamb_min_k"))
+    args.tamb_max_k = float(runtime_naming.get("tamb_max_k"))
     common = extract_common_inputs(
         rawdata_path=rawdata_path,
         db_namespace=str(db_namespace),
@@ -2624,9 +2909,12 @@ def main(argv=None):
     writer.add_history("encoder_shift_sec", float(getattr(args, "encoder_shift_sec", 0.0)))
     writer.add_history("encoder_time_col", str(getattr(args, "encoder_time_col", "time")))
     writer.add_history("altaz_time_col", str(getattr(args, "altaz_time_col", "time")))
-    writer.add_history("bore_meaning", "BORE_AZ/BORE_EL=boresight Az/El = encoder - correction")
+    writer.add_history("azel_correction_apply", str(args.azel_correction_apply))
+    writer.add_history("bore_meaning", "BORE_AZ/BORE_EL=corrected boresight Az/El from encoder and dlon/dlat")
     writer.add_history("az_cmd_meaning", "AZ_CMD/EL_CMD=commanded altaz interpolated to t_spec")
-    writer.add_history("corr_meaning", "CORR_AZ/CORR_EL=dlon/dlat")
+    writer.add_history("corr_meaning", "CORR_AZ/CORR_EL=dlon/dlat from altaz/control table")
+    writer.add_history("radec_method", str(args.radec_method))
+    writer.add_history("radec_azel_source", str(args.radec_azel_source))
     writer.add_history("beam_model_columns", "BEAMXOFF/BEAMYOFF[arcsec],BEAMROT[deg]=applied beam model")
     writer.add_history("galactic_columns", "GLON/GLAT=galactic longitude/latitude derived from ICRS RA/DEC in converter")
     writer.add_history("encoder_table", str(encoder_table_resolved))
@@ -2635,6 +2923,8 @@ def main(argv=None):
     writer.add_history("weather_outside_table", str(weather_outside_table_resolved))
     writer.add_history("weather_inside_time_col", str(weather_inside_time_col))
     writer.add_history("weather_outside_time_col", str(weather_outside_time_col))
+    writer.add_history("thot_meaning", "THOT=inside weather / hot-load temperature [K] after validation/fallback")
+    writer.add_history("tamb_meaning", "TAMBIENT=outside weather temperature [K] after validation/fallback")
     writer.add_history("source_block", "omitted unless true source coordinates become available")
     writer.add_history("scan_block", "omitted unless true scan offsets become available")
 
@@ -2661,6 +2951,7 @@ def main(argv=None):
             str(args.altaz_time_col),
             str(args.interp_extrap),
             float(args.encoder_shift_sec),
+            str(args.azel_correction_apply),
         )
         beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
         pointing.update(beam_applied)
@@ -2670,7 +2961,7 @@ def main(argv=None):
                 "Beam-center Az/El contains NaN after applying beam offset/rotation for stream '{}'. Check beam offsets and elevations near the pole.".format(stream.name)
             )
 
-        radec_azel = select_radec_azel_source(pointing, stream.beam, str(args.radec_azel_source))
+        radec_azel = select_radec_azel_source(pointing, stream.beam, str(args.radec_azel_source), str(args.azel_correction_apply))
         if np.any(~np.isfinite(radec_azel["az_deg"])) or np.any(~np.isfinite(radec_azel["el_deg"])):
             nbad = int(np.count_nonzero(~np.isfinite(radec_azel["az_deg"])) + np.count_nonzero(~np.isfinite(radec_azel["el_deg"])))
             raise RuntimeError(
@@ -2679,16 +2970,17 @@ def main(argv=None):
                 )
             )
 
-        tamb_c, temp_c, press_hpa, humid_pct, inside_weather, outside_weather = resolve_stream_meteorology(
+        inside_temp_c, outside_temp_c, press_hpa, humid_pct, inside_weather, outside_weather = resolve_stream_meteorology(
             common, stream_data, str(args.met_source).strip().lower(), str(args.interp_extrap)
         )
-        tamb_c_use = finalize_inside_temperature_for_tamb(stream_data.t_spec, tamb_c, args)
+        thot_k_use = finalize_hot_temperature_k(stream_data.t_spec, inside_temp_c, args)
+        tamb_k_use = finalize_ambient_temperature_k(stream_data.t_spec, outside_temp_c, args)
 
         apply_refraction = (str(getattr(args, "refraction", "on")).strip().lower() == "on")
         if apply_refraction:
-            temp_use, press_use, humid_use = finalize_meteorology_for_refraction(stream_data.t_spec, temp_c, press_hpa, humid_pct, args)
+            temp_use, press_use, humid_use = finalize_meteorology_for_refraction(stream_data.t_spec, outside_temp_c, press_hpa, humid_pct, args)
         else:
-            temp_use, press_use, humid_use = temp_c, press_hpa, humid_pct
+            temp_use, press_use, humid_use = outside_temp_c, press_hpa, humid_pct
 
         obswl_um = _obswl_um_from_stream_or_args(stream.wcs, args)
         radec = normalize_radec(
@@ -2717,7 +3009,6 @@ def main(argv=None):
         else:
             calc_refr_deg = np.full_like(stream_data.t_spec, np.nan, dtype=float)
 
-        temp_out = tamb_c_use
         if apply_refraction:
             press_out, humid_out = press_use, humid_use
         else:
@@ -2728,7 +3019,8 @@ def main(argv=None):
             pointing=pointing,
             radec=radec,
             calc_refr_deg=calc_refr_deg,
-            temp_c=temp_out,
+            tamb_k=tamb_k_use,
+            thot_k=thot_k_use,
             press_hpa=press_out,
             humid_pct=humid_out,
             collapse=bool(args.collapse),

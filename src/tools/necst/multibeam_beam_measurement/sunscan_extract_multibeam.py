@@ -39,7 +39,7 @@ def _load_global_cfg(spectrometer_config: Optional[str]) -> Dict[str, Any]:
     if not spectrometer_config:
         return {}
     cfg = load_spectrometer_config(Path(spectrometer_config).expanduser().resolve())
-    return dict(cfg.get("global", {}) or {})
+    return _canonicalize_boresight_settings(dict(cfg.get("global", {}) or {}))
 
 
 def _choose_float_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: float = 0.0, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> float:
@@ -97,6 +97,14 @@ def _coerce_bool(value: Any) -> bool:
     raise ValueError(f"cannot coerce to bool: {value!r}")
 
 
+def _canonicalize_boresight_settings(d: Dict[str, Any]) -> Dict[str, Any]:
+    if d.get("azel_source") is None and d.get("boresight_source") is not None:
+        d["azel_source"] = d.get("boresight_source")
+    if d.get("azel_correction_apply") is None and d.get("boresight_correction_apply") is not None:
+        d["azel_correction_apply"] = d.get("boresight_correction_apply")
+    return d
+
+
 def _stream_override_dict(stream: Any) -> Dict[str, Any]:
     raw = getattr(stream, "override", None)
     override: Dict[str, Any] = {}
@@ -107,7 +115,7 @@ def _stream_override_dict(stream: Any) -> Dict[str, Any]:
             override.update(dict(raw))
         except Exception:
             pass
-    return override
+    return _canonicalize_boresight_settings(override)
 
 
 def _choose_bool_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: Any, attr: str, global_cfg: Dict[str, Any], global_key: str, default: bool = False, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> bool:
@@ -184,16 +192,20 @@ def _normalize_legacy_azel_correction_apply(value: Optional[str]) -> Optional[st
 
 def _resolve_azel_correction_apply(args: argparse.Namespace, argv: Optional[Sequence[str]], global_cfg: Dict[str, Any], azel_source: str, *, stream_cfg: Optional[Dict[str, Any]] = None) -> str:
     raw = None
-    if _argv_has_option(argv, "--azel-correction-apply"):
+    if _argv_has_option(argv, "--azel-correction-apply", "--boresight-correction-apply"):
         raw = getattr(args, "azel_correction_apply", None)
     elif _argv_has_option(argv, "--altaz-apply"):
         raw = getattr(args, "altaz_apply", None)
     elif stream_cfg is not None and stream_cfg.get("azel_correction_apply") is not None:
         raw = stream_cfg.get("azel_correction_apply")
+    elif stream_cfg is not None and stream_cfg.get("boresight_correction_apply") is not None:
+        raw = stream_cfg.get("boresight_correction_apply")
     elif stream_cfg is not None and stream_cfg.get("altaz_apply") is not None:
         raw = stream_cfg.get("altaz_apply")
     elif global_cfg.get("azel_correction_apply") is not None:
         raw = global_cfg.get("azel_correction_apply")
+    elif global_cfg.get("boresight_correction_apply") is not None:
+        raw = global_cfg.get("boresight_correction_apply")
     elif global_cfg.get("altaz_apply") is not None:
         raw = global_cfg.get("altaz_apply")
     norm = _normalize_legacy_azel_correction_apply(raw)
@@ -479,7 +491,7 @@ def run_extract(
         )
         cfg_stream.dish_diameter_m = dish_diameter_m
         cfg_stream.hpbw_factor = hpbw_factor
-        stream_azel_source = str(stream_cfg.get("azel_source", base_config.input.azel_source))
+        stream_azel_source = str(stream_cfg.get("azel_source", stream_cfg.get("boresight_source", base_config.input.azel_source)))
         stream_corr_raw = None
         if stream_cfg.get("azel_correction_apply") is not None:
             stream_corr_raw = stream_cfg.get("azel_correction_apply")
@@ -802,8 +814,8 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--planet", default="sun", help="Target body name passed to astropy.get_body()")
     ap.add_argument("--stream-name", dest="stream_names", action="append", default=None, help="Select a specific stream name (repeatable)")
 
-    ap.add_argument("--azel-source", choices=["encoder", "altaz"], default="encoder")
-    ap.add_argument("--azel-correction-apply", choices=["none", "subtract", "add"], default=None)
+    ap.add_argument("--azel-source", "--boresight-source", dest="azel_source", choices=["encoder", "altaz"], default="encoder", help="Raw Az/El source used to construct boresight before sunscan fitting")
+    ap.add_argument("--azel-correction-apply", "--boresight-correction-apply", dest="azel_correction_apply", choices=["none", "subtract", "add"], default=None, help="How to combine raw boresight Az/El with dlon/dlat when constructing corrected boresight")
     ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default=None, help="Legacy alias for --azel-correction-apply")
     ap.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-shift-sec", type=float, default=0.0)
@@ -912,11 +924,17 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
     cfg.input.telescope = _choose_str_setting(args, argv, "--telescope", "telescope", global_cfg, "telescope", "OMU1P85M")
     cfg.input.tel_loaddata = _choose_str_setting(args, argv, "--tel-loaddata", "tel_loaddata", global_cfg, "tel_loaddata", "OMU1p85m")
     cfg.input.planet = _choose_str_setting(args, argv, "--planet", "planet", global_cfg, "planet", "sun")
-    cfg.runtime.azel_source_explicit = bool(_argv_has_option(argv, "--azel-source") or (global_cfg.get("azel_source") is not None))
-    cfg.input.azel_source = _choose_str_setting(args, argv, "--azel-source", "azel_source", global_cfg, "azel_source", "encoder")
+    cfg.runtime.azel_source_explicit = bool(_argv_has_option(argv, "--azel-source", "--boresight-source") or (global_cfg.get("azel_source") is not None) or (global_cfg.get("boresight_source") is not None))
+    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, "--azel-source", "--boresight-source"):
+        cfg.input.azel_source = str(getattr(args, "azel_source", "encoder"))
+    elif global_cfg.get("azel_source") is not None:
+        cfg.input.azel_source = str(global_cfg.get("azel_source"))
+    else:
+        cfg.input.azel_source = str(getattr(args, "azel_source", "encoder"))
     cfg.runtime.azel_correction_apply_explicit = bool(
-        _argv_has_option(argv, "--azel-correction-apply", "--altaz-apply")
+        _argv_has_option(argv, "--azel-correction-apply", "--boresight-correction-apply", "--altaz-apply")
         or (global_cfg.get("azel_correction_apply") is not None)
+        or (global_cfg.get("boresight_correction_apply") is not None)
         or (global_cfg.get("altaz_apply") is not None)
     )
     cfg.input.azel_correction_apply = _resolve_azel_correction_apply(args, argv, global_cfg, cfg.input.azel_source)
