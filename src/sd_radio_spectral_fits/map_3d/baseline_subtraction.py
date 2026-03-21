@@ -1700,6 +1700,31 @@ def _strip_checksum_all_hdus(hdul: fits.HDUList) -> None:
                 del hdr[key]
 
 
+
+def _resolve_exclude_v_windows_aliases(
+    manual_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]],
+    exclude_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]],
+    signal_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]],
+) -> Optional[Sequence[Union[str, Tuple[float, float]]]]:
+    """Resolve backward-compatible aliases for velocity windows excluded from baseline fitting."""
+    def _norm(x: Optional[Sequence[Union[str, Tuple[float, float]]]]) -> Optional[Sequence[Union[str, Tuple[float, float]]]]:
+        return None if x is None or len(x) == 0 else x
+
+    manual_v_windows = _norm(manual_v_windows)
+    exclude_v_windows = _norm(exclude_v_windows)
+    signal_v_windows = _norm(signal_v_windows)
+
+    n_specified = sum(x is not None for x in (manual_v_windows, exclude_v_windows, signal_v_windows))
+    if n_specified > 1:
+        raise ValueError(
+            "Specify only one of manual_v_windows, exclude_v_windows, signal_v_windows."
+        )
+    if exclude_v_windows is not None:
+        return exclude_v_windows
+    if signal_v_windows is not None:
+        return signal_v_windows
+    return manual_v_windows
+
 def subtract_baseline_from_fits(
     input_fits: str,
     output_fits: str,
@@ -1709,6 +1734,8 @@ def subtract_baseline_from_fits(
     linefree_cfg: LineFreeConfig = LineFreeConfig(),
     linefree_mask: Optional[np.ndarray] = None,
     manual_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]] = None,
+    exclude_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]] = None,
+    signal_v_windows: Optional[Sequence[Union[str, Tuple[float, float]]]] = None,
     linefree_mode: str = "auto",
     load_prior_from_input: bool = True,
     # ripple
@@ -1769,6 +1796,12 @@ def subtract_baseline_from_fits(
                     return [float(v) for v in arr]
         return None
 
+    manual_v_windows = _resolve_exclude_v_windows_aliases(
+        manual_v_windows=manual_v_windows,
+        exclude_v_windows=exclude_v_windows,
+        signal_v_windows=signal_v_windows,
+    )
+
     with fits.open(input_fits, mode="readonly", memmap=True) as hdul_in:
         idx, hdu_cube = _get_cube_hdu(hdul_in, cube_ext)
         data_raw = np.asarray(hdu_cube.data, dtype=np.float32)
@@ -1814,14 +1847,14 @@ def subtract_baseline_from_fits(
                 raise ValueError(f"Unknown linefree_mode: {linefree_mode}")
         if manual_v_windows:
             if SpectralCube is None:
-                raise ValueError("manual_v_windows requires spectral_cube to read the spectral axis in km/s.")
+                raise ValueError("exclude_v_windows/manual_v_windows requires spectral_cube to read the spectral axis in km/s.")
             sc = SpectralCube.read(input_fits, hdu=(cube_ext if cube_ext is not None else idx))
             try:
                 v_axis = np.asarray(sc.with_spectral_unit(u.km / u.s, velocity_convention="radio").spectral_axis.value, dtype=float)
             except Exception:
                 v_axis = np.asarray(sc.spectral_axis.to(u.km / u.s).value, dtype=float)
             if v_axis.shape != (nchan,):
-                raise ValueError(f"manual_v_windows spectral axis shape mismatch: {v_axis.shape} vs ({nchan},)")
+                raise ValueError(f"exclude_v_windows/manual_v_windows spectral axis shape mismatch: {v_axis.shape} vs ({nchan},)")
             manual_signal = _manual_signal_mask_from_axis(v_axis, manual_v_windows)
             lf = np.asarray(lf, dtype=bool) & (~manual_signal)
 
@@ -1968,6 +2001,7 @@ def subtract_baseline_from_fits(
                 "cube_ext": cube_ext,
                 "linefree_mode": linefree_mode,
                 "ripple_mode": ripple_mode,
+                "exclude_v_windows": list(manual_v_windows) if manual_v_windows is not None else None,
                 "manual_v_windows": list(manual_v_windows) if manual_v_windows is not None else None,
                 "baseline_cfg": baseline_cfg.__dict__,
                 "linefree_cfg": linefree_cfg.__dict__,

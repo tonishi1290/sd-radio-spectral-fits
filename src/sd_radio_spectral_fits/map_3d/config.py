@@ -10,6 +10,16 @@ class MapConfig:
     """
     画像化(Gridding)およびマップ解析の統合設定クラス。
     旧 GridConfig の全機能を包含し、解析用パラメータを追加。
+
+    Notes
+    -----
+    既定の kernel_preset='mangum2007' は、single-dish OTF gridding の
+    文献・実務で広く使われる Bessel×Gauss / Gaussian の既定値に合わせて、
+    beam FWHM から kernel 幅を自動生成する。
+    kernel_sign='auto' のときは、mangum2007 では signed、legacy では
+    positive_only を既定として解決する。
+    明示的な *_pix / *_beam / support_radius_* が与えられた場合は、
+    それらを最優先する。
     """
 
     # --- 1. 空間グリッド定義 (Geometry) ---
@@ -22,19 +32,41 @@ class MapConfig:
 
     # --- 2. グリッディング・カーネル設定 ---
     kernel: Literal['gjinc', 'gauss'] = 'gjinc'
-    gwidth_pix: Optional[float] = 2.10
+    kernel_preset: Literal['mangum2007', 'legacy'] = 'mangum2007'
+    kernel_sign: Literal['auto', 'signed', 'positive_only'] = 'auto'
+
+    # kernel_sign は GJINC/GAUSS の負重みをどう扱うかを表す。
+    #   auto          : mangum2007 -> signed, legacy -> positive_only
+    #   signed        : 有限な符号付き重みをそのまま使う
+    #   positive_only : 正の重みだけを使う
+    # 明示指定がある場合は *_pix > *_beam > preset default の順で解決する
+    gwidth_pix: Optional[float] = None
     gwidth_beam: Optional[float] = None
     jwidth_pix: Optional[float] = None
     jwidth_beam: Optional[float] = None
-    truncate: Union[Literal['first_null'], float] = 'first_null'
+
+    # support は kernel をどの半径で打ち切るかを表す cutoff radius。
+    # pix / beam / truncate の順で解決する。
+    # truncate=None のときは preset default を用いる。
+    #   mangum2007 + gjinc : support = beam FWHM
+    #   mangum2007 + gauss : support = 3a = 3 * gwidth / sqrt(log(2))
+    #   legacy     + gjinc : support = first null of resolved jinc width
+    #   legacy     + gauss : support = 3 * gwidth (3 * HWHM)
+    truncate: Optional[Union[Literal['first_null'], float]] = None
     support_radius_pix: Optional[float] = None
+    support_radius_beam: Optional[float] = None
+
     chunk_ch: int = 256      # メモリ節約のためのチャンネル分割処理（デフォルト256）
     dtype: str = "float32"
 
     # --- 3. 重み付け・品質管理 ---
-    alpha_rms: float = 0.5
+    # 論文向けの既定: RMS が信頼できる場合の逆分散重みを既定にする。
+    # q *= (1 / rms^2)^alpha_rms なので、alpha_rms=1.0 -> q \propto 1/rms^2。
+    # beta_tint は RMS に積分時間の効果がすでに入っている前提で既定 0.0 とする。
+    # weight_clip_quantile は既定では無効化し、必要時のみ明示指定で使う。
+    alpha_rms: float = 1.0
     beta_tint: float = 0.0
-    weight_clip_quantile: Optional[float] = 0.95
+    weight_clip_quantile: Optional[float] = None
     weight_clip_max: Optional[float] = None
     exclude_turnaround: bool = True
 
@@ -46,6 +78,18 @@ class MapConfig:
     dr_eff_warn_pix: float = 0.2
     eps_u0: float = 0.01
     eps_weight_sum: float = 1e-8
+
+    # 追加の post-gridding 妥当性判定
+    # min_abs_weight_ratio > 0 のとき、|WEIGHT| / median(|WEIGHT|) が
+    # この値未満の画素を無効化する。CASA minweight と同趣旨。
+    min_abs_weight_ratio: float = 0.0
+    # min_cancel_ratio > 0 のとき、|WSUM| / WABS がこの値未満の
+    # 画素を無効化する。signed kernel の強い相殺を検出する。
+    min_cancel_ratio: float = 0.0
+
+    # beam / sampling に関する補助
+    warn_if_cell_coarse: bool = True       # cell > beam/3 のとき warning
+    estimate_effective_beam: bool = True   # nominal / empirical beam を推定
 
     # --- 5. 出力マップ制御 (core.py が要求するフラグ群) ---
     fill_nan_for_invalid: bool = True
@@ -118,8 +162,13 @@ class GridResult:
     """出力データ構造"""
     cube: np.ndarray
     weight_map: np.ndarray
-    hit_map: np.ndarray
-    mask_map: np.ndarray
+    hit_map: np.ndarray   # 実際に gridding 分母に使ったサンプル数（sign filter 後）
+    mask_map: np.ndarray  # 空間的な分母有効性（channel ごとの NaN マスク前）
+    nsamp_map: Optional[np.ndarray] = None  # support 内の有限サンプル数（sign filter 前）
+    wsum_map: Optional[np.ndarray] = None
+    wabs_map: Optional[np.ndarray] = None
+    cancel_map: Optional[np.ndarray] = None  # |WSUM| / WABS
+    weight_rel_map: Optional[np.ndarray] = None  # |WEIGHT| / median(|WEIGHT|)
     # 診断用マップ群
     xeff_map: Optional[np.ndarray] = None
     yeff_map: Optional[np.ndarray] = None

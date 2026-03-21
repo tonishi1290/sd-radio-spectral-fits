@@ -26,6 +26,31 @@ from .session import BaselineSession
 from .engine import fit_cube_baseline
 
 
+
+def _resolve_exclude_v_windows_aliases(
+    manual_v_windows: Optional[Union[List[str], List[Tuple[float, float]]]],
+    exclude_v_windows: Optional[Union[List[str], List[Tuple[float, float]]]],
+    signal_v_windows: Optional[Union[List[str], List[Tuple[float, float]]]],
+) -> Optional[Union[List[str], List[Tuple[float, float]]]]:
+    """Resolve backward-compatible aliases for velocity windows excluded from baseline fitting."""
+    def _norm(x: Optional[Union[List[str], List[Tuple[float, float]]]]) -> Optional[Union[List[str], List[Tuple[float, float]]]]:
+        return None if x is None or len(x) == 0 else x
+
+    manual_v_windows = _norm(manual_v_windows)
+    exclude_v_windows = _norm(exclude_v_windows)
+    signal_v_windows = _norm(signal_v_windows)
+
+    n_specified = sum(x is not None for x in (manual_v_windows, exclude_v_windows, signal_v_windows))
+    if n_specified > 1:
+        raise ValueError(
+            "Specify only one of manual_v_windows, exclude_v_windows, signal_v_windows."
+        )
+    if exclude_v_windows is not None:
+        return exclude_v_windows
+    if signal_v_windows is not None:
+        return signal_v_windows
+    return manual_v_windows
+
 def create_manual_signal_mask_1d(
     v_axis: np.ndarray,
     v_windows: Union[List[str], List[Tuple[float, float]]],
@@ -232,6 +257,8 @@ def run_one_iteration(
     auto_linefree: bool = True,
     linefree_cfg: LineFreeConfig = LineFreeConfig(),
     manual_v_windows: Optional[Union[List[str], List[Tuple[float, float]]]] = None,
+    exclude_v_windows: Optional[Union[List[str], List[Tuple[float, float]]]] = None,
+    signal_v_windows: Optional[Union[List[str], List[Tuple[float, float]]]] = None,
     linefree_mode: str = "auto",
     linefree_scope: str = "global",
     # ripple
@@ -253,6 +280,12 @@ def run_one_iteration(
         target_mask_2d = np.asarray(target_mask_2d, dtype=bool)
         if target_mask_2d.shape != (session.ny, session.nx):
             raise ValueError(f"target_mask_2d shape mismatch: {target_mask_2d.shape} vs {(session.ny, session.nx)}")
+
+    manual_v_windows = _resolve_exclude_v_windows_aliases(
+        manual_v_windows=manual_v_windows,
+        exclude_v_windows=exclude_v_windows,
+        signal_v_windows=signal_v_windows,
+    )
 
     if reproducible_mode:
         linefree_cfg = replace(
@@ -322,6 +355,7 @@ def run_one_iteration(
         chunk_pix=int(chunk_pix),
         auto_linefree=bool(auto_linefree),
         linefree_cfg=linefree_cfg.__dict__,
+        exclude_v_windows=manual_v_windows,
         manual_v_windows=manual_v_windows,
         linefree_mode=str(linefree_mode),
         linefree_scope=str(linefree_scope),

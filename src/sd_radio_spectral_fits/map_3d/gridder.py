@@ -137,6 +137,17 @@ def _safe_meta_value(meta: dict, key: str):
         return None
 
 
+def _nanmean_no_warn(arr: np.ndarray, axis=None) -> np.ndarray:
+    """nanmean without RuntimeWarning on all-NaN slices."""
+    a = np.asarray(arr, dtype=np.float64)
+    finite = np.isfinite(a)
+    cnt = np.sum(finite, axis=axis)
+    summed = np.sum(np.where(finite, a, 0.0), axis=axis, dtype=np.float64)
+    out = np.full(np.shape(cnt), np.nan, dtype=np.float64)
+    np.divide(summed, cnt, out=out, where=(cnt > 0))
+    return out
+
+
 def _collect_otf_diagnostics(
     *,
     scantable,
@@ -166,8 +177,8 @@ def _collect_otf_diagnostics(
 
     meta = getattr(scantable, "meta", {}) or {}
     spec_in = np.asarray(scantable.data)
-    agg_in = np.nanmean(np.asarray(full_matrix, dtype=np.float64), axis=0)
-    agg_out = np.nanmean(np.asarray(grid_res.cube, dtype=np.float64), axis=(0, 1))
+    agg_in = _nanmean_no_warn(np.asarray(full_matrix, dtype=np.float64), axis=0)
+    agg_out = _nanmean_no_warn(np.asarray(grid_res.cube, dtype=np.float64), axis=(0, 1))
 
     diag = {
         "schema": "otf_diag_v1",
@@ -193,6 +204,8 @@ def _collect_otf_diagnostics(
             "cell_arcsec": float(config.cell_arcsec),
             "beam_fwhm_arcsec": float(config.beam_fwhm_arcsec),
             "kernel": str(config.kernel),
+            "kernel_preset": str(getattr(config, "kernel_preset", "mangum2007")),
+            "kernel_sign": str(getattr(config, "kernel_sign", "auto")),
             "dtype": str(config.dtype),
             "backend": str(config.backend),
             "chunk_ch": int(config.chunk_ch),
@@ -253,6 +266,9 @@ def _collect_otf_diagnostics(
             "agg_spec_stats": _nan_stats(agg_out),
             "weight_stats": _nan_stats(grid_res.weight_map),
             "hit_stats": _nan_stats(grid_res.hit_map),
+            "nsamp_stats": None if getattr(grid_res, "nsamp_map", None) is None else _nan_stats(grid_res.nsamp_map),
+            "wsum_stats": None if getattr(grid_res, "wsum_map", None) is None else _nan_stats(grid_res.wsum_map),
+            "wabs_stats": None if getattr(grid_res, "wabs_map", None) is None else _nan_stats(grid_res.wabs_map),
             "mask_true": int(np.count_nonzero(np.asarray(grid_res.mask_map, dtype=bool))),
             "time_map_stats": None if getattr(grid_res, "time_map", None) is None else _nan_stats(grid_res.time_map),
             "rms_map_stats": None if getattr(grid_res, "rms_map", None) is None else _nan_stats(grid_res.rms_map),
@@ -324,7 +340,40 @@ def _format_otf_diag_text(diag: dict) -> str:
     gout = diag.get("grid_output", {})
     lines.append(f"cube_shape: {gout.get('cube_shape')} dtype={gout.get('cube_dtype')} cube_hash={gout.get('cube_hash')}")
     lines.append(f"output agg_spec_hash: {gout.get('agg_spec_hash')}")
+    if gout.get('weight_stats') is not None:
+        lines.append(f"weight_stats: {gout.get('weight_stats')}")
+    if gout.get('nsamp_stats') is not None:
+        lines.append(f"nsamp_stats: {gout.get('nsamp_stats')}")
+    if gout.get('wsum_stats') is not None:
+        lines.append(f"wsum_stats: {gout.get('wsum_stats')}")
+    if gout.get('wabs_stats') is not None:
+        lines.append(f"wabs_stats: {gout.get('wabs_stats')}")
     lines.append(f"mask_true: {gout.get('mask_true')}")
+    meta = gout.get("meta", {}) or {}
+    if meta:
+        if meta.get("kernel") is not None:
+            lines.append(
+                f"kernel_resolved: kernel={meta.get('kernel')} preset={meta.get('kernel_preset')} sign={meta.get('kernel_sign')} "
+                f"gwidth={meta.get('gwidth_arcsec', np.nan):.3f} arcsec "
+                f"jwidth={meta.get('jwidth_arcsec', np.nan):.3f} arcsec "
+                f"support={meta.get('support_radius_arcsec', np.nan):.3f} arcsec "
+                f"beam_pix={meta.get('beam_pix', np.nan):.3f} "
+                f"cell_over_beam={meta.get('cell_over_beam', np.nan):.4f}"
+            )
+        if np.isfinite(meta.get("nominal_radial_fwhm_arcsec", np.nan)):
+            lines.append(
+                f"beam_nominal: radial={meta.get('nominal_radial_fwhm_arcsec'):.3f} arcsec "
+                f"bmaj={meta.get('bmaj_nominal_arcsec', np.nan):.3f} arcsec "
+                f"bmin={meta.get('bmin_nominal_arcsec', np.nan):.3f} arcsec "
+                f"bpa={meta.get('bpa_nominal_deg', np.nan):.2f} deg"
+            )
+        if np.isfinite(meta.get("empirical_radial_fwhm_arcsec", np.nan)):
+            lines.append(
+                f"beam_empirical_center: radial={meta.get('empirical_radial_fwhm_arcsec'):.3f} arcsec "
+                f"bmaj={meta.get('bmaj_empirical_arcsec', np.nan):.3f} arcsec "
+                f"bmin={meta.get('bmin_empirical_arcsec', np.nan):.3f} arcsec "
+                f"bpa={meta.get('bpa_empirical_deg', np.nan):.2f} deg"
+            )
     of = diag.get("output_file", {})
     lines.append(f"output_file: {of.get('path')}")
     lines.append(f"output_size_bytes: {of.get('size_bytes')}  sha256: {of.get('sha256')}")
@@ -583,6 +632,34 @@ def run_mapping_pipeline(
         res.meta = {}
     res.meta["RESTFREQ"] = _extract_restfreq(scantable, table)
     res.meta["SPECSYS"] = "LSRK"
+
+    beam_meta = res.meta or {}
+    if beam_meta:
+        print(
+            "   kernel resolved: "
+            f"kernel={beam_meta.get('kernel')} "
+            f"preset={beam_meta.get('kernel_preset')} "
+            f"sign={beam_meta.get('kernel_sign')} "
+            f"gwidth={beam_meta.get('gwidth_arcsec', np.nan):.2f}\" "
+            f"jwidth={beam_meta.get('jwidth_arcsec', np.nan):.2f}\" "
+            f"support={beam_meta.get('support_radius_arcsec', np.nan):.2f}\""
+        )
+    if np.isfinite(beam_meta.get("nominal_radial_fwhm_arcsec", np.nan)):
+        print(
+            "   nominal effective beam: "
+            f"radial={beam_meta.get('nominal_radial_fwhm_arcsec'):.2f}\" "
+            f"bmaj={beam_meta.get('bmaj_nominal_arcsec', np.nan):.2f}\" "
+            f"bmin={beam_meta.get('bmin_nominal_arcsec', np.nan):.2f}\" "
+            f"bpa={beam_meta.get('bpa_nominal_deg', np.nan):.2f} deg"
+        )
+    if np.isfinite(beam_meta.get("empirical_radial_fwhm_arcsec", np.nan)):
+        print(
+            "   empirical center beam: "
+            f"radial={beam_meta.get('empirical_radial_fwhm_arcsec'):.2f}\" "
+            f"bmaj={beam_meta.get('bmaj_empirical_arcsec', np.nan):.2f}\" "
+            f"bmin={beam_meta.get('bmin_empirical_arcsec', np.nan):.2f}\" "
+            f"bpa={beam_meta.get('bpa_empirical_deg', np.nan):.2f} deg"
+        )
 
     # 6. FITS 書き出し
     print("5. Writing Multi-Extension FITS...")

@@ -404,6 +404,31 @@ def _strip_checksum_all_hdus(hdul: fits.HDUList) -> None:
                 del hdr[key]
 
 
+
+def _resolve_exclude_v_windows_aliases(
+    manual_v_windows: Optional[List[str]],
+    exclude_v_windows: Optional[List[str]],
+    signal_v_windows: Optional[List[str]],
+) -> Optional[List[str]]:
+    """Resolve backward-compatible aliases for velocity windows excluded from baseline fitting."""
+    def _norm(x: Optional[List[str]]) -> Optional[List[str]]:
+        return None if x is None or len(x) == 0 else x
+
+    manual_v_windows = _norm(manual_v_windows)
+    exclude_v_windows = _norm(exclude_v_windows)
+    signal_v_windows = _norm(signal_v_windows)
+
+    n_specified = sum(x is not None for x in (manual_v_windows, exclude_v_windows, signal_v_windows))
+    if n_specified > 1:
+        raise ValueError(
+            "Specify only one of manual_v_windows, exclude_v_windows, signal_v_windows."
+        )
+    if exclude_v_windows is not None:
+        return exclude_v_windows
+    if signal_v_windows is not None:
+        return signal_v_windows
+    return manual_v_windows
+
 def run_cli_pipeline(
     input_fits: str,
     output_fits: str,
@@ -414,6 +439,8 @@ def run_cli_pipeline(
     auto_linefree: bool = True,
     linefree_cfg: LineFreeConfig = LineFreeConfig(),
     manual_v_windows: Optional[List[str]] = None,
+    exclude_v_windows: Optional[List[str]] = None,
+    signal_v_windows: Optional[List[str]] = None,
     linefree_mode: str = "auto",
     linefree_scope: str = "global",
     target_mask_ext: Optional[Union[int, str]] = None,
@@ -438,6 +465,12 @@ def run_cli_pipeline(
       read FITS -> iterate baseline fit -> write baselined FITS with QC HDUs
       optionally run cube_analysis to append provisional masks, MASK3D, and moments.
     """
+    manual_v_windows = _resolve_exclude_v_windows_aliases(
+        manual_v_windows=manual_v_windows,
+        exclude_v_windows=exclude_v_windows,
+        signal_v_windows=signal_v_windows,
+    )
+
     _profile_records: List[Dict[str, Any]] = []
     _t0 = time.perf_counter()
     _tprev = _t0
@@ -687,6 +720,7 @@ def run_cli_pipeline(
                 "poly_order": int(poly_order),
                 "linefree_mode": linefree_mode,
                 "linefree_scope": linefree_scope,
+                "exclude_v_windows": manual_v_windows,
                 "manual_v_windows": manual_v_windows,
                 "ripple_mode": ripple_mode,
                 "ripple_scope": ripple_scope,
@@ -734,7 +768,9 @@ def _main() -> None:
     p.add_argument("--iter", type=int, default=2)
     p.add_argument("--poly", type=int, default=1)
     p.add_argument("--no-auto-linefree", action="store_true")
-    p.add_argument("--manual-vwin", nargs="*", default=None)
+    p.add_argument("--manual-vwin", nargs="*", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--exclude-vwin", nargs="*", default=None, help="Velocity windows [km/s] that contain real spectral lines and must be excluded from baseline fitting.")
+    p.add_argument("--signal-vwin", nargs="*", default=None, help=argparse.SUPPRESS)
     p.add_argument("--linefree-mode", default="auto", choices=["auto", "prior", "current", "or"])
     p.add_argument("--linefree-scope", default="global", choices=["global", "target", "both"])
     p.add_argument("--target-mask-ext", default=None, help="2D FITS HDU (name or index) used as target_mask_2d for target/both scopes.")
@@ -791,6 +827,8 @@ def _main() -> None:
         auto_linefree=not args.no_auto_linefree,
         linefree_cfg=lcfg,
         manual_v_windows=args.manual_vwin if args.manual_vwin else None,
+        exclude_v_windows=args.exclude_vwin if args.exclude_vwin else None,
+        signal_v_windows=args.signal_vwin if args.signal_vwin else None,
         linefree_mode=str(args.linefree_mode),
         linefree_scope=str(args.linefree_scope),
         target_mask_ext=target_mask_ext,

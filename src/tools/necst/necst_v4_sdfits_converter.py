@@ -42,6 +42,10 @@ import pathlib
 import sys
 import re
 import math
+import heapq
+import os
+import pickle
+import tempfile
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -375,13 +379,15 @@ def _structured_to_dataframe(arr):
         d = {name: arr[name] for name in (arr.dtype.names or [])}
         return pd.DataFrame(d)
 
-def _extract_spectral_from_structured(arr, nchan):
+def _extract_spectral_from_structured(arr, nchan, channel_slice_bounds=None):
     """
     spectral structured array から t_spec と spec2d を取り出す。
     - time basis is decided once from the first spectral timestamp row
     - accepted timestamp suffixes: UTC / GPS / TAI
     - PC / unknown / NaN timestamp falls back to numeric time field
     - spec field: prefer data > spectrum > spec
+    - channel_slice_bounds が与えられた場合は、可能な限りこの段階で切り出して
+      full-NCHAN の 2D 配列を作らないようにする
     """
     names = list(arr.dtype.names or [])
     s_field = None
@@ -394,22 +400,49 @@ def _extract_spectral_from_structured(arr, nchan):
 
     t_spec, time_meta = _select_spectral_time_from_structured(arr)
 
+    slice_bounds = None
+    if channel_slice_bounds is not None:
+        start, stop = map(int, channel_slice_bounds)
+        slice_bounds = (start, stop)
+        expected_nchan = int(stop - start)
+    else:
+        expected_nchan = int(nchan)
+
     spec = np.asarray(arr[s_field])
     if spec.ndim == 1 and spec.dtype == object:
-        spec2d = np.stack(spec, axis=0).astype(np.float32, copy=False)
+        nrow = int(spec.shape[0])
+        spec2d = np.empty((nrow, expected_nchan), dtype=np.float32)
+        for i, row_spec in enumerate(spec):
+            rr = np.asarray(row_spec)
+            if rr.ndim == 0:
+                rr = rr.reshape(1)
+            if rr.ndim != 1:
+                raise RuntimeError("spectrum row must be 1D. got row {} shape {}".format(i, rr.shape))
+            if int(rr.shape[0]) != int(nchan):
+                raise RuntimeError("NCHAN mismatch in spectral row {}: got {}, expected {}".format(i, rr.shape[0], nchan))
+            if slice_bounds is None:
+                spec2d[i, :] = np.asarray(rr, dtype=np.float32)
+            else:
+                start, stop = slice_bounds
+                spec2d[i, :] = np.asarray(rr[start:stop], dtype=np.float32)
     else:
-        spec2d = spec.astype(np.float32, copy=False)
-
-    # 1-channel spectra may be stored as a scalar numeric field per row, which
-    # appears here as shape (N,) instead of (N, 1). Treat that as a valid single-
-    # channel spectrum table rather than rejecting it.
-    if spec2d.ndim == 1:
-        spec2d = spec2d.reshape(-1, 1)
+        arr2 = np.asarray(spec)
+        if arr2.ndim == 1:
+            arr2 = arr2.reshape(-1, 1)
+        if arr2.ndim != 2:
+            raise RuntimeError("spectrum array must be 2D. got {}".format(arr2.shape))
+        if int(arr2.shape[1]) != int(nchan):
+            raise RuntimeError("NCHAN mismatch in spectral table: got {}, expected {}".format(arr2.shape[1], nchan))
+        if slice_bounds is None:
+            spec2d = np.asarray(arr2, dtype=np.float32)
+        else:
+            start, stop = slice_bounds
+            spec2d = np.asarray(arr2[:, start:stop], dtype=np.float32)
 
     if spec2d.ndim != 2:
-        raise RuntimeError("spectrum array must be 2D. got {}".format(spec2d.shape))
-    if int(spec2d.shape[1]) != int(nchan):
-        raise RuntimeError("NCHAN mismatch in spectral table: got {}, expected {}".format(spec2d.shape[1], nchan))
+        raise RuntimeError("spectrum array must be 2D after slicing. got {}".format(spec2d.shape))
+    if int(spec2d.shape[1]) != int(expected_nchan):
+        raise RuntimeError("NCHAN mismatch after channel slice: got {}, expected {}".format(spec2d.shape[1], expected_nchan))
 
     return np.asarray(t_spec, dtype=float), spec2d, time_meta, s_field
 
@@ -1519,8 +1552,9 @@ def extract_spectral_stream(common, db_namespace, telescope, stream):
         spec_table_name = _table_name(db_namespace, telescope, "data", "spectral", spec_stream_name)
     arr_spec = _read_structured_array_tolerant(common.db, spec_table_name)
     raw_nchan = int(stream.wcs_full.nchan if stream.wcs_full is not None else stream.wcs.nchan)
-    t_spec, spec2d, time_meta, s_field = _extract_spectral_from_structured(arr_spec, nchan=raw_nchan)
-    spec2d = _apply_channel_slice_to_spec2d(spec2d, stream.channel_slice_bounds, raw_nchan)
+    t_spec, spec2d, time_meta, s_field = _extract_spectral_from_structured(
+        arr_spec, nchan=raw_nchan, channel_slice_bounds=stream.channel_slice_bounds
+    )
     if int(spec2d.shape[1]) != int(stream.wcs.nchan):
         raise RuntimeError(
             "Sliced NCHAN mismatch for stream '{}': got {}, expected {} after channel_slice={}".format(
@@ -1973,29 +2007,17 @@ def _temperature_c_to_k_array(temp_c):
     if temp_c is None:
         return None
     x = np.asarray(temp_c, dtype=float)
-    out = np.full_like(x, np.nan, dtype=float)
-    good = np.isfinite(x)
-    out[good] = x[good] + 273.15
-    return out
+    return np.where(np.isfinite(x), x + 273.15, np.nan)
 
 
-def finalize_temperature_output_k(
-    t_spec,
-    temp_c,
-    args,
-    *,
-    fixed_attr,
-    default_attr,
-    min_attr,
-    max_attr,
-    default_k,
-    min_k,
-    max_k,
-):
+def finalize_temperature_output_k(t_spec, temp_c, args, fixed_attr, default_attr, min_attr, max_attr,
+                                  default_k, min_k, max_k):
     fixed_k = getattr(args, fixed_attr, None)
-    fallback_k = getattr(args, default_attr, None)
-    if fallback_k is None:
+    default_val = getattr(args, default_attr, None)
+    if default_val is None:
         fallback_k = default_k
+    else:
+        fallback_k = default_val
     fallback_k = float(fallback_k)
     if fixed_k is not None:
         out = np.full_like(t_spec, float(fixed_k), dtype=float)
@@ -2341,85 +2363,159 @@ def make_writer(site, telescope, observer, project, object_name, config_info, st
     )
 
 
+def _writer_add_row(writer, row):
+    t_unix = float(row["time_unix"])
+    mjd = float(Time(t_unix, format="unix", scale="utc").mjd)
+    sw = row["stream"].wcs
+    writer.add_row(
+        time_mjd=mjd,
+        scanid=int(row.get("scanid_out", row["scanid"])),
+        subscan=int(row["subscan"]),
+        intgrp=int(row.get("intgrp_out", row["intgrp"])),
+        obsmode=str(row["obsmode"]),
+        data=np.asarray(row["data"], dtype=np.float32),
+        exposure_s=float(row["exposure_s"]),
+        polariza=str(row["stream"].polariza),
+        fdnum=int(row["stream"].fdnum),
+        ifnum=int(row["stream"].ifnum),
+        plnum=int(row["stream"].plnum),
+        backend=row["stream"].backend,
+        sampler=row["stream"].sampler,
+        frontend=row["stream"].frontend,
+        obsfreq_hz=sw.obsfreq_hz,
+        imagfreq_hz=sw.imagfreq_hz,
+        lo1freq_hz=sw.lo1_hz,
+        lo2freq_hz=sw.lo2_hz,
+        lo3freq_hz=sw.lo3_hz,
+        sideband=sw.sideband,
+        sb1=sw.sb1,
+        sb2=sw.sb2,
+        sb3=sw.sb3,
+        object_name=None,
+        calstat="RAW",
+        ra_deg=float(row["ra_deg"]),
+        dec_deg=float(row["dec_deg"]),
+        glon_deg=float(row["glon_deg"]),
+        glat_deg=float(row["glat_deg"]),
+        srcframe=None,
+        src_radesys=None,
+        src_equinox=None,
+        src_long_deg=None,
+        src_lat_deg=None,
+        scanframe=None,
+        scan_radesys=None,
+        scan_equinox=None,
+        scan_x_deg=None,
+        scan_y_deg=None,
+        az_center_deg=float(row["beam_az_deg"]),
+        el_center_deg=float(row["beam_el_deg"]),
+        az_enc_deg=float(row["az_meas_deg"]),
+        el_enc_deg=float(row["el_meas_deg"]),
+        boresight_az_deg=float(row["boresight_az_deg"]),
+        boresight_el_deg=float(row["boresight_el_deg"]),
+        az_cmd_deg=float(row["az_cmd_deg"]),
+        el_cmd_deg=float(row["el_cmd_deg"]),
+        corr_az_deg=float(row["corr_az_deg"]),
+        corr_el_deg=float(row["corr_el_deg"]),
+        calc_refr_deg=float(row["calc_refr_deg"]) if np.isfinite(row["calc_refr_deg"]) else np.nan,
+        beam_xoff_arcsec=float(row["beam_xoff_arcsec"]),
+        beam_yoff_arcsec=float(row["beam_yoff_arcsec"]),
+        beam_rot_deg=float(row["beam_rot_deg"]),
+        t_hot_k=float(row["thot_k"]) if np.isfinite(row["thot_k"]) else np.nan,
+        tamb_c=(float(row["tamb_k"]) - 273.15) if np.isfinite(row["tamb_k"]) else np.nan,
+        pressure_hpa=float(row["pressure_hpa"]) if np.isfinite(row["pressure_hpa"]) else np.nan,
+        humidity_pct=float(row["humidity_pct"]) if np.isfinite(row["humidity_pct"]) else np.nan,
+        restfreq_hz=(float(sw.restfreq_hz) if np.isfinite(sw.restfreq_hz) else None),
+        crval1_hz=float(sw.crval1_hz),
+        cdelt1_hz=float(sw.cdelt1_hz),
+        crpix1=float(sw.crpix1),
+        ctype1=str(sw.ctype1),
+        cunit1=str(sw.cunit1),
+        specsys=str(sw.specsys),
+        veldef=(None if sw.veldef is None else str(sw.veldef)),
+    )
+
+
 def write_sdfits(out_fits, writer, rows):
     last_key = None
     for row in rows:
         t_unix = float(row["time_unix"])
-        mjd = float(Time(t_unix, format="unix", scale="utc").mjd)
         key = (t_unix, int(row.get("scanid_out", row["scanid"])), int(row["subscan"]), int(row["stream"].stream_index))
         if last_key is not None and key < last_key:
             raise RuntimeError("Row order violated: {} < {}".format(key, last_key))
         last_key = key
-
-        sw = row["stream"].wcs
-        writer.add_row(
-            time_mjd=mjd,
-            scanid=int(row.get("scanid_out", row["scanid"])),
-            subscan=int(row["subscan"]),
-            intgrp=int(row.get("intgrp_out", row["intgrp"])),
-            obsmode=str(row["obsmode"]),
-            data=np.asarray(row["data"], dtype=np.float32),
-            exposure_s=float(row["exposure_s"]),
-            polariza=str(row["stream"].polariza),
-            fdnum=int(row["stream"].fdnum),
-            ifnum=int(row["stream"].ifnum),
-            plnum=int(row["stream"].plnum),
-            backend=row["stream"].backend,
-            sampler=row["stream"].sampler,
-            frontend=row["stream"].frontend,
-            obsfreq_hz=sw.obsfreq_hz,
-            imagfreq_hz=sw.imagfreq_hz,
-            lo1freq_hz=sw.lo1_hz,
-            lo2freq_hz=sw.lo2_hz,
-            lo3freq_hz=sw.lo3_hz,
-            sideband=sw.sideband,
-            sb1=sw.sb1,
-            sb2=sw.sb2,
-            sb3=sw.sb3,
-            object_name=None,
-            calstat="RAW",
-            ra_deg=float(row["ra_deg"]),
-            dec_deg=float(row["dec_deg"]),
-            glon_deg=float(row["glon_deg"]),
-            glat_deg=float(row["glat_deg"]),
-            srcframe=None,
-            src_radesys=None,
-            src_equinox=None,
-            src_long_deg=None,
-            src_lat_deg=None,
-            scanframe=None,
-            scan_radesys=None,
-            scan_equinox=None,
-            scan_x_deg=None,
-            scan_y_deg=None,
-            az_center_deg=float(row["beam_az_deg"]),
-            el_center_deg=float(row["beam_el_deg"]),
-            az_enc_deg=float(row["az_meas_deg"]),
-            el_enc_deg=float(row["el_meas_deg"]),
-            boresight_az_deg=float(row["boresight_az_deg"]),
-            boresight_el_deg=float(row["boresight_el_deg"]),
-            az_cmd_deg=float(row["az_cmd_deg"]),
-            el_cmd_deg=float(row["el_cmd_deg"]),
-            corr_az_deg=float(row["corr_az_deg"]),
-            corr_el_deg=float(row["corr_el_deg"]),
-            calc_refr_deg=float(row["calc_refr_deg"]) if np.isfinite(row["calc_refr_deg"]) else np.nan,
-            beam_xoff_arcsec=float(row["beam_xoff_arcsec"]),
-            beam_yoff_arcsec=float(row["beam_yoff_arcsec"]),
-            beam_rot_deg=float(row["beam_rot_deg"]),
-            t_hot_k=float(row["thot_k"]) if np.isfinite(row["thot_k"]) else np.nan,
-            tamb_c=(float(row["tamb_k"]) - 273.15) if np.isfinite(row["tamb_k"]) else np.nan,
-            pressure_hpa=float(row["pressure_hpa"]) if np.isfinite(row["pressure_hpa"]) else np.nan,
-            humidity_pct=float(row["humidity_pct"]) if np.isfinite(row["humidity_pct"]) else np.nan,
-            restfreq_hz=(float(sw.restfreq_hz) if np.isfinite(sw.restfreq_hz) else None),
-            crval1_hz=float(sw.crval1_hz),
-            cdelt1_hz=float(sw.cdelt1_hz),
-            crpix1=float(sw.crpix1),
-            ctype1=str(sw.ctype1),
-            cunit1=str(sw.cunit1),
-            specsys=str(sw.specsys),
-            veldef=(None if sw.veldef is None else str(sw.veldef)),
-        )
+        _writer_add_row(writer, row)
     writer.write(out_fits, overwrite=True)
+
+
+def _dump_rows_pickle(path, rows):
+    with open(path, "wb") as f:
+        for row in rows:
+            pickle.dump(row, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def _open_row_pickle(path):
+    return open(path, "rb")
+
+
+def _next_pickled_row(fp):
+    try:
+        return pickle.load(fp)
+    except EOFError:
+        return None
+
+
+def _iter_merged_pickled_rows(paths):
+    files = []
+    heap = []
+    try:
+        for idx, path in enumerate(paths):
+            fp = _open_row_pickle(path)
+            files.append(fp)
+            row = _next_pickled_row(fp)
+            if row is None:
+                continue
+            key = (float(row["time_unix"]), int(row["scanid"]), int(row["subscan"]), int(row["stream"].stream_index))
+            heapq.heappush(heap, (key, idx, row))
+        while heap:
+            _, idx, row = heapq.heappop(heap)
+            yield row
+            nxt = _next_pickled_row(files[idx])
+            if nxt is not None:
+                key = (float(nxt["time_unix"]), int(nxt["scanid"]), int(nxt["subscan"]), int(nxt["stream"].stream_index))
+                heapq.heappush(heap, (key, idx, nxt))
+    finally:
+        for fp in files:
+            try:
+                fp.close()
+            except Exception:
+                pass
+
+
+def _pe_stats_update(stats, row):
+    mode = str(row.get("obsmode", "")).upper()
+    ent = stats.setdefault(mode, {"n": 0, "sum_pe2": 0.0, "max_pe2": np.nan})
+    px = float(row.get("pe_x_arcsec", np.nan))
+    py = float(row.get("pe_y_arcsec", np.nan))
+    if np.isfinite(px) and np.isfinite(py):
+        pe2 = px * px + py * py
+        ent["n"] += 1
+        ent["sum_pe2"] += pe2
+        if (not np.isfinite(ent["max_pe2"])) or (pe2 > ent["max_pe2"]):
+            ent["max_pe2"] = pe2
+
+
+def _print_pe_stats(stats):
+    print("[summary] Global PE over all written samples in each mode (0-centered):")
+    for mode in ("HOT", "ON", "OFF"):
+        ent = stats.get(mode, None)
+        if not ent or int(ent.get("n", 0)) <= 0:
+            print("  {:>3s}: N=0".format(mode))
+            continue
+        n = int(ent["n"])
+        rms0 = float(np.sqrt(ent["sum_pe2"] / n)) if n > 0 else float("nan")
+        max0 = float(np.sqrt(ent["max_pe2"])) if np.isfinite(ent.get("max_pe2", np.nan)) else float("nan")
+        print("  {:>3s}: N={}  PE_RMS0={:.2f} arcsec  PE_MAX0={:.2f} arcsec".format(mode, n, rms0, max0))
 
 
 # -----------------------------------------------------------------------------
@@ -2924,155 +3020,176 @@ def main(argv=None):
     writer.add_history("weather_inside_time_col", str(weather_inside_time_col))
     writer.add_history("weather_outside_time_col", str(weather_outside_time_col))
     writer.add_history("thot_meaning", "THOT=inside weather / hot-load temperature [K] after validation/fallback")
-    writer.add_history("tamb_meaning", "TAMBIENT=outside weather temperature [K] after validation/fallback")
+    writer.add_history("tamb_meaning", "TAMBIENT=outside ambient temperature written to writer as [degC] after K-domain validation/fallback")
     writer.add_history("source_block", "omitted unless true source coordinates become available")
     writer.add_history("scan_block", "omitted unless true scan offsets become available")
 
-    all_rows = []
     spectral_time_summaries = []
+    scan_first_times = []
+    row_pickle_paths = []
+    pe_stats = {}
 
-    for stream in streams:
-        print("[info] processing stream '{}'".format(stream.name))
-        stream_data = extract_spectral_stream(common, str(db_namespace), str(telescope_name), stream)
-        spectral_time_summaries.append({
-            "stream": stream.name,
-            "applied": stream_data.spec_time_basis,
-            "suffix": stream_data.spec_time_suffix,
-            "fallback": stream_data.spec_time_fallback_field,
-            "example": stream_data.spec_time_example,
-            "field": stream_data.spec_time_field,
-            "table": stream_data.spec_table_name,
-        })
-        pointing = normalize_pointing(
-            stream_data.t_spec,
-            common.arr_enc,
-            common.arr_alt,
-            str(args.encoder_time_col),
-            str(args.altaz_time_col),
-            str(args.interp_extrap),
-            float(args.encoder_shift_sec),
-            str(args.azel_correction_apply),
-        )
-        beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
-        pointing.update(beam_applied)
-        if np.any(~np.isfinite(pointing["beam_az_deg"])) or np.any(~np.isfinite(pointing["beam_el_deg"])):
-            nbad = int(np.count_nonzero(~np.isfinite(pointing["beam_az_deg"])) + np.count_nonzero(~np.isfinite(pointing["beam_el_deg"])))
-            raise RuntimeError(
-                "Beam-center Az/El contains NaN after applying beam offset/rotation for stream '{}'. Check beam offsets and elevations near the pole.".format(stream.name)
+    with tempfile.TemporaryDirectory(prefix="necst_sdfits_rows_") as tmpdir:
+        tmpdir_path = pathlib.Path(tmpdir)
+
+        for stream in streams:
+            print("[info] processing stream '{}'".format(stream.name))
+            stream_data = extract_spectral_stream(common, str(db_namespace), str(telescope_name), stream)
+            spectral_time_summaries.append({
+                "stream": stream.name,
+                "applied": stream_data.spec_time_basis,
+                "suffix": stream_data.spec_time_suffix,
+                "fallback": stream_data.spec_time_fallback_field,
+                "example": stream_data.spec_time_example,
+                "field": stream_data.spec_time_field,
+                "table": stream_data.spec_table_name,
+            })
+            pointing = normalize_pointing(
+                stream_data.t_spec,
+                common.arr_enc,
+                common.arr_alt,
+                str(args.encoder_time_col),
+                str(args.altaz_time_col),
+                str(args.interp_extrap),
+                float(args.encoder_shift_sec),
+                str(args.azel_correction_apply),
             )
-
-        radec_azel = select_radec_azel_source(pointing, stream.beam, str(args.radec_azel_source), str(args.azel_correction_apply))
-        if np.any(~np.isfinite(radec_azel["az_deg"])) or np.any(~np.isfinite(radec_azel["el_deg"])):
-            nbad = int(np.count_nonzero(~np.isfinite(radec_azel["az_deg"])) + np.count_nonzero(~np.isfinite(radec_azel["el_deg"])))
-            raise RuntimeError(
-                "Selected RA/DEC Az/El source '{}' contains NaN for stream '{}' ({} elements).".format(
-                    radec_azel["source"], stream.name, nbad
+            beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
+            pointing.update(beam_applied)
+            if np.any(~np.isfinite(pointing["beam_az_deg"])) or np.any(~np.isfinite(pointing["beam_el_deg"])):
+                nbad = int(np.count_nonzero(~np.isfinite(pointing["beam_az_deg"])) + np.count_nonzero(~np.isfinite(pointing["beam_el_deg"])))
+                raise RuntimeError(
+                    "Beam-center Az/El contains NaN after applying beam offset/rotation for stream '{}'. Check beam offsets and elevations near the pole.".format(stream.name)
                 )
+
+            radec_azel = select_radec_azel_source(pointing, stream.beam, str(args.radec_azel_source), str(args.azel_correction_apply))
+            if np.any(~np.isfinite(radec_azel["az_deg"])) or np.any(~np.isfinite(radec_azel["el_deg"])):
+                nbad = int(np.count_nonzero(~np.isfinite(radec_azel["az_deg"])) + np.count_nonzero(~np.isfinite(radec_azel["el_deg"])))
+                raise RuntimeError(
+                    "Selected RA/DEC Az/El source '{}' contains NaN for stream '{}' ({} elements).".format(
+                        radec_azel["source"], stream.name, nbad
+                    )
+                )
+
+            inside_temp_c, outside_temp_c, press_hpa, humid_pct, inside_weather, outside_weather = resolve_stream_meteorology(
+                common, stream_data, str(args.met_source).strip().lower(), str(args.interp_extrap)
+            )
+            thot_k_use = finalize_hot_temperature_k(stream_data.t_spec, inside_temp_c, args)
+            tamb_k_use = finalize_ambient_temperature_k(stream_data.t_spec, outside_temp_c, args)
+
+            apply_refraction = (str(getattr(args, "refraction", "on")).strip().lower() == "on")
+            if apply_refraction:
+                temp_use, press_use, humid_use = finalize_meteorology_for_refraction(stream_data.t_spec, outside_temp_c, press_hpa, humid_pct, args)
+            else:
+                temp_use, press_use, humid_use = outside_temp_c, press_hpa, humid_pct
+
+            obswl_um = _obswl_um_from_stream_or_args(stream.wcs, args)
+            radec = normalize_radec(
+                wcs_df=common.wcs_df if str(args.radec_method).strip().lower() == "wcs_first" else None,
+                t_spec=stream_data.t_spec,
+                beam_az_deg=radec_azel["az_deg"],
+                beam_el_deg=radec_azel["el_deg"],
+                site=site,
+                radec_method=str(args.radec_method),
+                apply_refraction=apply_refraction,
+                press_hpa=press_use,
+                temp_c=temp_use,
+                humid_pct=humid_use,
+                obswl_um=obswl_um,
+            )
+            radec.update(_gal_from_radec(radec["ra_deg"], radec["dec_deg"]))
+            if np.any(~np.isfinite(radec["glon_deg"])) or np.any(~np.isfinite(radec["glat_deg"])):
+                nbad = int(np.count_nonzero(~np.isfinite(radec["glon_deg"])) + np.count_nonzero(~np.isfinite(radec["glat_deg"])))
+                raise RuntimeError("GLON/GLAT contains NaN after RA/DEC->Galactic conversion for stream '{}' ({} elements).".format(stream.name, nbad))
+
+            if apply_refraction and press_use is not None and temp_use is not None and humid_use is not None:
+                calc_refr_deg = _calc_refraction_deg(
+                    site, stream_data.t_spec, pointing["beam_az_deg"], pointing["beam_el_deg"],
+                    press_use, temp_use, humid_use, obswl_um
+                )
+            else:
+                calc_refr_deg = np.full_like(stream_data.t_spec, np.nan, dtype=float)
+
+            if apply_refraction:
+                press_out, humid_out = press_use, humid_use
+            else:
+                press_out, humid_out = press_hpa, humid_pct
+
+            rows = build_rows_for_stream(
+                stream_data=stream_data,
+                pointing=pointing,
+                radec=radec,
+                calc_refr_deg=calc_refr_deg,
+                tamb_k=tamb_k_use,
+                thot_k=thot_k_use,
+                press_hpa=press_out,
+                humid_pct=humid_out,
+                collapse=bool(args.collapse),
+                scan_key=str(args.scan_key),
+                skip_nonstandard_position=bool(args.skip_nonstandard_position),
+                use_modes_csv=str(args.use_modes),
+                include_unknown=bool(args.include_unknown),
+                pe_rms_warn_arcsec=float(args.pe_rms_warn_arcsec),
+                pe_max_warn_arcsec=float(args.pe_max_warn_arcsec),
+                verbose_scan_pe=bool(args.print_pe),
+            )
+            rows.sort(key=lambda r: (float(r["time_unix"]), int(r["scanid"]), int(r["subscan"]), int(r["stream"].stream_index)))
+            local_scan_first = {}
+            for row in rows:
+                sid = int(row["scanid"])
+                t0 = float(row["time_unix"])
+                if sid not in local_scan_first or t0 < local_scan_first[sid]:
+                    local_scan_first[sid] = t0
+            for sid, t0 in sorted(local_scan_first.items()):
+                scan_first_times.append((t0, int(stream.stream_index), int(sid)))
+
+            stream_pickle = tmpdir_path / ("stream_{:03d}.rows.pkl".format(int(stream.stream_index)))
+            _dump_rows_pickle(stream_pickle, rows)
+            row_pickle_paths.append(str(stream_pickle))
+
+            writer.add_history(
+                "stream_{}".format(stream.stream_index),
+                "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={};radec_azel_source={};radec_azel_meaning={}".format(
+                    stream.name,
+                    stream.fdnum,
+                    stream.ifnum,
+                    stream.plnum,
+                    stream.polariza,
+                    stream.beam.beam_id,
+                    stream.beam.rotation_mode,
+                    (stream.beam.beam_model_version or ""),
+                    (stream.channel_slice_label or "full"),
+                    (int(stream.wcs_full.nchan) if stream.wcs_full is not None else int(stream.wcs.nchan)),
+                    int(stream.wcs.nchan),
+                    ("RESTFREQ->OBSFREQ" if (_is_meaningful_scalar(stream.wcs.obsfreq_hz) and not _is_meaningful_scalar(stream.local_oscillators.get("obsfreq_hz", None))) else "explicit_or_none"),
+                    spectral_time_summaries[-1]["applied"],
+                    (spectral_time_summaries[-1]["suffix"] or ""),
+                    (spectral_time_summaries[-1]["fallback"] or ""),
+                    radec_azel["source"],
+                    radec_azel["meaning"],
+                ),
             )
 
-        inside_temp_c, outside_temp_c, press_hpa, humid_pct, inside_weather, outside_weather = resolve_stream_meteorology(
-            common, stream_data, str(args.met_source).strip().lower(), str(args.interp_extrap)
-        )
-        thot_k_use = finalize_hot_temperature_k(stream_data.t_spec, inside_temp_c, args)
-        tamb_k_use = finalize_ambient_temperature_k(stream_data.t_spec, outside_temp_c, args)
+            del rows, stream_data, pointing, beam_applied, radec_azel, inside_temp_c, outside_temp_c, press_hpa, humid_pct, inside_weather, outside_weather, thot_k_use, tamb_k_use, temp_use, press_use, humid_use, radec, calc_refr_deg
 
-        apply_refraction = (str(getattr(args, "refraction", "on")).strip().lower() == "on")
-        if apply_refraction:
-            temp_use, press_use, humid_use = finalize_meteorology_for_refraction(stream_data.t_spec, outside_temp_c, press_hpa, humid_pct, args)
-        else:
-            temp_use, press_use, humid_use = outside_temp_c, press_hpa, humid_pct
+        scan_order = sorted(scan_first_times)
+        scanid_out_map = {}
+        for new_scanid, (_, stream_index, local_scanid) in enumerate(scan_order):
+            scanid_out_map[(int(stream_index), int(local_scanid))] = int(new_scanid)
 
-        obswl_um = _obswl_um_from_stream_or_args(stream.wcs, args)
-        radec = normalize_radec(
-            wcs_df=common.wcs_df if str(args.radec_method).strip().lower() == "wcs_first" else None,
-            t_spec=stream_data.t_spec,
-            beam_az_deg=radec_azel["az_deg"],
-            beam_el_deg=radec_azel["el_deg"],
-            site=site,
-            radec_method=str(args.radec_method),
-            apply_refraction=apply_refraction,
-            press_hpa=press_use,
-            temp_c=temp_use,
-            humid_pct=humid_use,
-            obswl_um=obswl_um,
-        )
-        radec.update(_gal_from_radec(radec["ra_deg"], radec["dec_deg"]))
-        if np.any(~np.isfinite(radec["glon_deg"])) or np.any(~np.isfinite(radec["glat_deg"])):
-            nbad = int(np.count_nonzero(~np.isfinite(radec["glon_deg"])) + np.count_nonzero(~np.isfinite(radec["glat_deg"])))
-            raise RuntimeError("GLON/GLAT contains NaN after RA/DEC->Galactic conversion for stream '{}' ({} elements).".format(stream.name, nbad))
+        if bool(args.plot_pe):
+            print("[warn] --plot-pe is not implemented in v1_40 for multi-stream mode; skipping plot generation.")
 
-        if apply_refraction and press_use is not None and temp_use is not None and humid_use is not None:
-            calc_refr_deg = _calc_refraction_deg(
-                site, stream_data.t_spec, pointing["beam_az_deg"], pointing["beam_el_deg"],
-                press_use, temp_use, humid_use, obswl_um
-            )
-        else:
-            calc_refr_deg = np.full_like(stream_data.t_spec, np.nan, dtype=float)
+        for row in _iter_merged_pickled_rows(row_pickle_paths):
+            key = (int(row["stream"].stream_index), int(row["scanid"]))
+            out_id = int(scanid_out_map[key])
+            row["scanid_out"] = out_id
+            row["intgrp_out"] = out_id
+            _writer_add_row(writer, row)
+            _pe_stats_update(pe_stats, row)
 
-        if apply_refraction:
-            press_out, humid_out = press_use, humid_use
-        else:
-            press_out, humid_out = press_hpa, humid_pct
-
-        rows = build_rows_for_stream(
-            stream_data=stream_data,
-            pointing=pointing,
-            radec=radec,
-            calc_refr_deg=calc_refr_deg,
-            tamb_k=tamb_k_use,
-            thot_k=thot_k_use,
-            press_hpa=press_out,
-            humid_pct=humid_out,
-            collapse=bool(args.collapse),
-            scan_key=str(args.scan_key),
-            skip_nonstandard_position=bool(args.skip_nonstandard_position),
-            use_modes_csv=str(args.use_modes),
-            include_unknown=bool(args.include_unknown),
-            pe_rms_warn_arcsec=float(args.pe_rms_warn_arcsec),
-            pe_max_warn_arcsec=float(args.pe_max_warn_arcsec),
-            verbose_scan_pe=bool(args.print_pe),
-        )
-        all_rows.extend(rows)
-
-        writer.add_history(
-            "stream_{}".format(stream.stream_index),
-            "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={};radec_azel_source={};radec_azel_meaning={}".format(
-                stream.name,
-                stream.fdnum,
-                stream.ifnum,
-                stream.plnum,
-                stream.polariza,
-                stream.beam.beam_id,
-                stream.beam.rotation_mode,
-                (stream.beam.beam_model_version or ""),
-                (stream.channel_slice_label or "full"),
-                (int(stream.wcs_full.nchan) if stream.wcs_full is not None else int(stream.wcs.nchan)),
-                int(stream.wcs.nchan),
-                ("RESTFREQ->OBSFREQ" if (_is_meaningful_scalar(stream.wcs.obsfreq_hz) and not _is_meaningful_scalar(stream.local_oscillators.get("obsfreq_hz", None))) else "explicit_or_none"),
-                stream_data.spec_time_basis,
-                (stream_data.spec_time_suffix or ""),
-                (stream_data.spec_time_fallback_field or ""),
-                radec_azel["source"],
-                radec_azel["meaning"],
-            ),
-        )
-
-    all_rows.sort(key=lambda r: (float(r["time_unix"]), int(r["scanid"]), int(r["subscan"]), int(r["stream"].stream_index)))
-    scan_map = {}
-    next_scanid = 0
-    for row in all_rows:
-        key = (int(row["stream"].stream_index), int(row["scanid"]))
-        if key not in scan_map:
-            scan_map[key] = next_scanid
-            next_scanid += 1
-        row["scanid_out"] = int(scan_map[key])
-        row["intgrp_out"] = int(scan_map[key])
-
-    if bool(args.plot_pe):
-        print("[warn] --plot-pe is not implemented in v1_40 for multi-stream mode; skipping plot generation.")
-
-    write_sdfits(str(out_fits), writer, all_rows)
-    _global_pe_summary(all_rows)
+        writer.write(str(out_fits), overwrite=True)
+        _print_pe_stats(pe_stats)
     print("Saved: {}".format(out_fits))
     if spectral_time_summaries:
         print("[info] spectral time basis summary:")
