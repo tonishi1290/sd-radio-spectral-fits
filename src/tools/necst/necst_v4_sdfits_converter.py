@@ -445,6 +445,10 @@ def _extract_spectral_from_structured(arr, nchan, channel_slice_bounds=None):
         raise RuntimeError("NCHAN mismatch after channel slice: got {}, expected {}".format(spec2d.shape[1], expected_nchan))
 
     return np.asarray(t_spec, dtype=float), spec2d, time_meta, s_field
+    if int(spec2d.shape[1]) != int(nchan):
+        raise RuntimeError("NCHAN mismatch in spectral table: got {}, expected {}".format(spec2d.shape[1], nchan))
+
+    return np.asarray(t_spec, dtype=float), spec2d, time_meta, s_field
 
 
 def _interp_lin(t_src, y_src, t_dst, extrap="nan"):
@@ -2294,6 +2298,11 @@ def build_rows_for_stream(stream_data, pointing, radec, calc_refr_deg, tamb_k, t
 # -----------------------------------------------------------------------------
 # 4) Writer bridge
 # -----------------------------------------------------------------------------
+def _safe_header_str(value, max_len=48):
+    s = "" if value is None else str(value)
+    return s if len(s) <= max_len else s[:max_len]
+
+
 def make_writer(site, telescope, observer, project, object_name, config_info, streams):
     nchans = sorted(set(int(s.wcs.nchan) for s in streams))
     max_nchan = int(max(nchans))
@@ -2319,9 +2328,9 @@ def make_writer(site, telescope, observer, project, object_name, config_info, st
     backend_meta = backend_values[0] if len(backend_values) == 1 else "MIXED"
 
     shared_meta = {
-        "BACKEND": backend_meta,
-        "NOTE": "Converted from NECST v4 RawData (multi-stream, beam-center Az/El, command/encoder separated)",
-        "CONFIG": str(config_info.get("config_name") or ""),
+        "BACKEND": _safe_header_str(backend_meta),
+        "NOTE": "NECST v4 RawData converted",
+        "CONFIG": _safe_header_str(config_info.get("config_name") or ""),
         "N_STREAM": int(len(streams)),
         "NCHAN_MAX": int(max_nchan),
     }
@@ -2986,7 +2995,9 @@ def main(argv=None):
         streams=streams,
     )
     writer.add_history("converter", pathlib.Path(__file__).name)
+    writer.add_history("note_detail", "Converted from NECST v4 RawData (multi-stream, beam-center Az/El, command/encoder separated)")
     writer.add_history("config_name", config_dict.get("config_name", ""))
+    writer.add_history("backend_full", ",".join(sorted(set(str(s.backend).strip() for s in streams if _is_meaningful_str(s.backend)))))
     if args.spectrometer_config:
         writer.add_history("config_path", str(pathlib.Path(args.spectrometer_config).expanduser().resolve()))
         if global_cfg.get("telescope") is not None:
@@ -3020,7 +3031,7 @@ def main(argv=None):
     writer.add_history("weather_inside_time_col", str(weather_inside_time_col))
     writer.add_history("weather_outside_time_col", str(weather_outside_time_col))
     writer.add_history("thot_meaning", "THOT=inside weather / hot-load temperature [K] after validation/fallback")
-    writer.add_history("tamb_meaning", "TAMBIENT=outside ambient temperature written to writer as [degC] after K-domain validation/fallback")
+    writer.add_history("tamb_meaning", "TAMBIENT=outside ambient temperature written in degC after K-domain validation/fallback")
     writer.add_history("source_block", "omitted unless true source coordinates become available")
     writer.add_history("scan_block", "omitted unless true scan offsets become available")
 
