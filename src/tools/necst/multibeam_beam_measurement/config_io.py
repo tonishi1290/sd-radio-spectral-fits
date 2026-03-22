@@ -22,6 +22,7 @@ class LightBeam:
     rotation_mode: str = "none"
     reference_angle_deg: float = 0.0
     rotation_sign: float = 1.0
+    rotation_slope_deg_per_deg: Optional[float] = None
     dewar_angle_deg: float = 0.0
 
 
@@ -163,6 +164,10 @@ def _fallback_load_spectrometer_config(config_path: Path) -> Dict[str, Any]:
             rotation_mode=str(beam_block.get("rotation_mode", "none")),
             reference_angle_deg=float(beam_block.get("reference_angle_deg", beam_block.get("reference_el_deg", 0.0))),
             rotation_sign=float(beam_block.get("rotation_sign", 1.0)),
+            rotation_slope_deg_per_deg=(
+                float(beam_block.get("rotation_slope_deg_per_deg"))
+                if beam_block.get("rotation_slope_deg_per_deg") is not None else None
+            ),
             dewar_angle_deg=float(beam_block.get("dewar_angle_deg", 0.0)),
         )
         freq_axis = dict(block.get("frequency_axis", {}) or {})
@@ -280,6 +285,10 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
                 "rotation_mode": str(getattr(stream.beam, "rotation_mode", "none")),
                 "reference_angle_deg": float(getattr(stream.beam, "reference_angle_deg", 0.0)),
                 "rotation_sign": float(getattr(stream.beam, "rotation_sign", 1.0)),
+                "rotation_slope_deg_per_deg": (
+                    float(getattr(stream.beam, "rotation_slope_deg_per_deg"))
+                    if getattr(stream.beam, "rotation_slope_deg_per_deg", None) is not None else None
+                ),
                 "dewar_angle_deg": float(getattr(stream.beam, "dewar_angle_deg", 0.0)),
                 "az_offset_arcsec": float(getattr(stream.beam, "az_offset_arcsec", 0.0)),
                 "el_offset_arcsec": float(getattr(stream.beam, "el_offset_arcsec", 0.0)),
@@ -420,19 +429,6 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
     beam_map = {str(row["beam_id"]): row for _, row in beam_rows_df.iterrows()}
     lines: List[str] = []
 
-    # NOTE:
-    #   sunscan multibeam fit returns source-relative fitted centers.
-    #   The converter, however, expects a fixed boresight->beam offset.
-    #   For the center_beam model those two quantities have opposite signs,
-    #   so we flip the sign only when exporting converter-ready beam offsets.
-    #   virtual_center is left unchanged here because it is primarily a
-    #   diagnostic/relative-geometry product, not a converter anchor.
-    export_sign = -1.0 if str(model_name) == "center_beam" else 1.0
-    offset_semantics = (
-        "boresight_to_beam" if str(model_name) == "center_beam"
-        else "fit_relative_frame"
-    )
-
     top_level = {k: v for k, v in raw.items() if k != "spectrometers"}
     _write_table_lines(lines, "", top_level)
 
@@ -445,15 +441,16 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
         beam_block = dict(block_copy.get("beam", {}) or {})
         if beam_row is not None:
             beam_block.update({
-                "az_offset_arcsec": export_sign * float(beam_row["az_offset_arcsec"]),
-                "el_offset_arcsec": export_sign * float(beam_row["el_offset_arcsec"]),
+                "az_offset_arcsec": float(beam_row["az_offset_arcsec"]),
+                "el_offset_arcsec": float(beam_row["el_offset_arcsec"]),
                 "rotation_mode": str(beam_row["rotation_mode"]),
                 "reference_angle_deg": float(beam_row["reference_angle_deg"]),
                 "rotation_sign": float(beam_row["rotation_sign"]),
                 "dewar_angle_deg": float(beam_row["dewar_angle_deg"]),
                 "beam_model_version": f"sunscan_multibeam_{model_name}",
-                "beam_offset_semantics": offset_semantics,
             })
+            if "rotation_slope_deg_per_deg" in beam_row and pd.notna(beam_row["rotation_slope_deg_per_deg"]):
+                beam_block["rotation_slope_deg_per_deg"] = float(beam_row["rotation_slope_deg_per_deg"])
         block_copy["beam"] = beam_block
 
         scalar_keys = [

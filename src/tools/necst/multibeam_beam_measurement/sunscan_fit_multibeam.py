@@ -301,19 +301,24 @@ def run_fit(
         raw_residual_df = model_result.usable_df.copy()
         rejected_df = model_result.rejected_df.copy()
 
-        beam_df, shifts_df, residual_df, norm_info = _recompute_converter_compatible_outputs(
-            model_result,
-            raw_beam_df,
-            raw_shifts_df,
-            raw_residual_df,
-            center_beam_id=center_beam_id,
-            model_name=model_name,
-        )
+        beam_df = raw_beam_df.copy()
+        shifts_df = raw_shifts_df.copy()
+        residual_df = raw_residual_df.copy()
+        norm_info = {
+            "raw_reference_angle_deg": float(model_result.reference_angle_deg),
+            "raw_rotation_slope_deg_per_deg": float(model_result.rotation_slope_deg_per_deg),
+            "raw_dewar_angle_deg": float(model_result.dewar_angle_deg),
+            "normalized_reference_angle_deg": float(model_result.reference_angle_deg),
+            "normalized_rotation_slope_deg_per_deg": float(model_result.rotation_slope_deg_per_deg),
+            "normalized_dewar_angle_deg": float(model_result.dewar_angle_deg),
+            "rotation_sign": float(model_result.rotation_sign),
+        }
         if not rejected_df.empty:
             rejected_df = rejected_df.copy()
-            rejected_df["raw_reference_angle_deg"] = float(model_result.reference_angle_deg)
-            rejected_df["raw_rotation_slope_deg_per_deg"] = float(model_result.rotation_slope_deg_per_deg)
-            rejected_df["raw_dewar_angle_deg"] = float(model_result.dewar_angle_deg)
+            rejected_df["reference_angle_deg"] = float(model_result.reference_angle_deg)
+            rejected_df["rotation_sign"] = float(model_result.rotation_sign)
+            rejected_df["rotation_slope_deg_per_deg"] = float(model_result.rotation_slope_deg_per_deg)
+            rejected_df["dewar_angle_deg"] = float(model_result.dewar_angle_deg)
 
         beam_csv = outdir / f"beam_fit_results_{model_name}.csv"
         shift_csv = outdir / f"run_shift_results_{model_name}.csv"
@@ -341,7 +346,7 @@ def run_fit(
         fit_summary_lines.append(f"raw_rotation_sign = {model_result.rotation_sign:.6f}")
         fit_summary_lines.append(f"raw_rotation_slope_deg_per_deg = {model_result.rotation_slope_deg_per_deg:.6f}")
         fit_summary_lines.append(f"raw_dewar_angle_deg = {model_result.dewar_angle_deg:.6f}")
-        fit_summary_lines.append("output_normalization = converter-compatible elevation model with reference_angle_deg=0 and dewar_angle_deg=0")
+        fit_summary_lines.append("output_normalization = raw_fit_parameters_are_exported_without_converter_renormalization")
         fit_summary_lines.append(f"reference_angle_deg = {norm_info['normalized_reference_angle_deg']:.6f}")
         fit_summary_lines.append(f"rotation_sign = {norm_info['rotation_sign']:.6f}")
         fit_summary_lines.append(f"rotation_slope_deg_per_deg = {norm_info['normalized_rotation_slope_deg_per_deg']:.6f}")

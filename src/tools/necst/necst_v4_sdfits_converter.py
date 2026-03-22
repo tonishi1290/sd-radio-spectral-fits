@@ -728,6 +728,7 @@ class BeamConfig:
     rotation_mode: str = "none"    # none | elevation
     reference_angle_deg: float = 0.0
     rotation_sign: float = 1.0
+    rotation_slope_deg_per_deg: Optional[float] = None
     dewar_angle_deg: float = 0.0
     beam_model_version: Optional[str] = None
 
@@ -1400,6 +1401,10 @@ def _normalize_stream_block(block, stream_index):
         rotation_mode=_normalize_rotation_mode(beam_block.get("rotation_mode", "none")),
         reference_angle_deg=float(beam_block.get("reference_angle_deg", beam_block.get("reference_el_deg", 0.0))),
         rotation_sign=float(beam_block.get("rotation_sign", 1.0)),
+        rotation_slope_deg_per_deg=(
+            float(beam_block.get("rotation_slope_deg_per_deg"))
+            if beam_block.get("rotation_slope_deg_per_deg") is not None else None
+        ),
         dewar_angle_deg=float(beam_block.get("dewar_angle_deg", 0.0)),
         beam_model_version=(str(beam_block.get("beam_model_version")).strip() if beam_block.get("beam_model_version") is not None else None),
     )
@@ -1783,7 +1788,11 @@ def _beam_rotation_angle_deg(boresight_el_deg, beam):
     if beam.rotation_mode == "none":
         return float(beam.dewar_angle_deg)
     if beam.rotation_mode == "elevation":
-        return float(beam.rotation_sign) * (np.asarray(boresight_el_deg, dtype=float) - float(beam.reference_angle_deg)) + float(beam.dewar_angle_deg)
+        slope = (
+            float(beam.rotation_slope_deg_per_deg)
+            if beam.rotation_slope_deg_per_deg is not None else float(beam.rotation_sign)
+        )
+        return slope * (np.asarray(boresight_el_deg, dtype=float) - float(beam.reference_angle_deg)) + float(beam.dewar_angle_deg)
     raise ValueError("unsupported rotation_mode={!r}".format(beam.rotation_mode))
 
 

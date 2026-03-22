@@ -12,6 +12,7 @@ class BeamRotationConfig:
     rotation_mode: str = "none"
     reference_angle_deg: float = 0.0
     rotation_sign: float = 1.0
+    rotation_slope_deg_per_deg: float | None = None
     dewar_angle_deg: float = 0.0
 
 
@@ -24,11 +25,13 @@ def beam_rotation_angle_deg(boresight_el_deg: np.ndarray | float, beam: Any) -> 
     rotation_mode = str(getattr(beam, "rotation_mode", "none") or "none").lower().strip()
     reference_angle_deg = float(getattr(beam, "reference_angle_deg", 0.0))
     rotation_sign = float(getattr(beam, "rotation_sign", 1.0))
+    rotation_slope_deg_per_deg = getattr(beam, "rotation_slope_deg_per_deg", None)
+    slope = float(rotation_slope_deg_per_deg) if rotation_slope_deg_per_deg is not None else rotation_sign
     dewar_angle_deg = float(getattr(beam, "dewar_angle_deg", 0.0))
     if rotation_mode == "none":
         return np.full_like(el, dewar_angle_deg, dtype=float)
     if rotation_mode == "elevation":
-        return rotation_sign * (el - reference_angle_deg) + dewar_angle_deg
+        return slope * (el - reference_angle_deg) + dewar_angle_deg
     raise ValueError(f"unsupported rotation_mode={rotation_mode!r}")
 
 
