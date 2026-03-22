@@ -15,7 +15,7 @@ from .ps_gridder import PSMapConfig
 # OTF (On-The-Fly)
 from .gridder import run_mapping_pipeline, create_grid_input
 from .core import grid_otf
-from .basketweave import solve_basket_weave_offsets, apply_basket_weave_correction
+from .basketweave import solve_basket_weave_offsets, apply_basket_weave_correction, basket_weave_inplace
 # PS (Position Switch)
 from .ps_gridder import run_ps_mapping_pipeline, grid_ps
 
@@ -45,9 +45,12 @@ __all__ = [
     "grid_ps",
     "solve_basket_weave_offsets",
     "apply_basket_weave_correction",
+    "basket_weave_inplace",
+
     # Cube Analysis
     "estimate_robust_rms",
     "generate_cube_mask",
     "append_analysis_hdus_to_fits",
     "make_3d_mask_for_existing_fits",
+    #
 ]

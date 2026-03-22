@@ -127,8 +127,12 @@ def make_pseudo_multibeam(
             stream_df["ifnum"] = int(stream.ifnum)
             stream_df["plnum"] = int(stream.plnum)
             stream_df["sampler"] = stream.sampler
-            stream_df["x_arcsec"] = pd.to_numeric(stream_df["x_arcsec"], errors="coerce").to_numpy(float) + np.asarray(beam_dx, dtype=float) + jitter_x
-            stream_df["y_arcsec"] = pd.to_numeric(stream_df["y_arcsec"], errors="coerce").to_numpy(float) + np.asarray(beam_dy, dtype=float) + jitter_y
+            # Synthetic summaries should mimic the fitted source-relative centers
+            # seen by sunscan. A beam physically offset from the boresight by
+            # (+dx, +dy) peaks when the boresight is moved by (-dx, -dy), so the
+            # synthetic fitted centers must subtract the converter-style offsets.
+            stream_df["x_arcsec"] = pd.to_numeric(stream_df["x_arcsec"], errors="coerce").to_numpy(float) - np.asarray(beam_dx, dtype=float) + jitter_x
+            stream_df["y_arcsec"] = pd.to_numeric(stream_df["y_arcsec"], errors="coerce").to_numpy(float) - np.asarray(beam_dy, dtype=float) + jitter_y
             stream_df["center_az_deg"] = stream_df["x_arcsec"] / 3600.0
             stream_df["center_el_deg"] = stream_df["y_arcsec"] / 3600.0
             rows.append(stream_df)

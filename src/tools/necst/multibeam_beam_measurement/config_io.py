@@ -420,6 +420,19 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
     beam_map = {str(row["beam_id"]): row for _, row in beam_rows_df.iterrows()}
     lines: List[str] = []
 
+    # NOTE:
+    #   sunscan multibeam fit returns source-relative fitted centers.
+    #   The converter, however, expects a fixed boresight->beam offset.
+    #   For the center_beam model those two quantities have opposite signs,
+    #   so we flip the sign only when exporting converter-ready beam offsets.
+    #   virtual_center is left unchanged here because it is primarily a
+    #   diagnostic/relative-geometry product, not a converter anchor.
+    export_sign = -1.0 if str(model_name) == "center_beam" else 1.0
+    offset_semantics = (
+        "boresight_to_beam" if str(model_name) == "center_beam"
+        else "fit_relative_frame"
+    )
+
     top_level = {k: v for k, v in raw.items() if k != "spectrometers"}
     _write_table_lines(lines, "", top_level)
 
@@ -432,13 +445,14 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
         beam_block = dict(block_copy.get("beam", {}) or {})
         if beam_row is not None:
             beam_block.update({
-                "az_offset_arcsec": float(beam_row["az_offset_arcsec"]),
-                "el_offset_arcsec": float(beam_row["el_offset_arcsec"]),
+                "az_offset_arcsec": export_sign * float(beam_row["az_offset_arcsec"]),
+                "el_offset_arcsec": export_sign * float(beam_row["el_offset_arcsec"]),
                 "rotation_mode": str(beam_row["rotation_mode"]),
                 "reference_angle_deg": float(beam_row["reference_angle_deg"]),
                 "rotation_sign": float(beam_row["rotation_sign"]),
                 "dewar_angle_deg": float(beam_row["dewar_angle_deg"]),
                 "beam_model_version": f"sunscan_multibeam_{model_name}",
+                "beam_offset_semantics": offset_semantics,
             })
         block_copy["beam"] = beam_block
 

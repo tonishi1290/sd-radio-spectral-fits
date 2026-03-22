@@ -11,6 +11,128 @@ from .config import GridInput
 from .gridder import create_grid_input
 from ..utils import parse_windows, in_any_windows
 
+
+C_KMS = 299792.458
+
+def _normalize_unit_local(unit_str: str) -> str:
+    u = str(unit_str).strip().lower()
+    if 'hz' in u:
+        return 'hz'
+    if u in ('m/s', 'm s-1', 'ms-1', 'meter/sec', 'm/sec'):
+        return 'm/s'
+    if u in ('km/s', 'km s-1', 'kms-1', 'kilometer/sec', 'km/sec'):
+        return 'km/s'
+    return u
+
+def _freq_scale_to_hz_local(unit_str: str) -> float:
+    u = str(unit_str).strip().lower()
+    if u in ('', 'hz'):
+        return 1.0
+    if u == 'khz':
+        return 1.0e3
+    if u == 'mhz':
+        return 1.0e6
+    if u == 'ghz':
+        return 1.0e9
+    if u == 'thz':
+        return 1.0e12
+    return 1.0
+
+def _get_restfreq_local(meta: dict) -> float:
+    for k in ('RESTFRQ', 'RESTFREQ', 'rest_hz', 'restfrq_hz', 'restfreq_hz'):
+        if k in meta and meta[k] not in (None, ''):
+            val = float(meta[k])
+            if np.isfinite(val) and val > 0:
+                return val
+    raise ValueError('RESTFRQ/RESTFREQ is required to convert spectral axis to velocity.')
+
+def _radio_velocity_kms_from_freq(freq_hz: np.ndarray, rest_hz: float) -> np.ndarray:
+    return C_KMS * (1.0 - np.asarray(freq_hz, dtype=float) / float(rest_hz))
+
+def _infer_nchan_from_dataset(dataset) -> int:
+    data = np.asarray(dataset.data)
+    if data.ndim == 1:
+        return int(data.shape[0])
+    if data.ndim >= 2:
+        return int(data.shape[1])
+    raise ValueError(f'Cannot infer NCHAN from dataset.data with shape={data.shape}')
+
+def _dataset_meta_like(dataset) -> dict:
+    meta = getattr(dataset, 'meta', None)
+    if meta is None:
+        raise ValueError('Input dataset does not provide .meta; cannot infer spectral axis automatically.')
+    if isinstance(meta, dict):
+        return dict(meta)
+    try:
+        return dict(meta)
+    except Exception as exc:
+        raise ValueError('Input dataset .meta is not dict-like; cannot infer spectral axis automatically.') from exc
+
+def _validate_non_topocentric_specsys(meta: dict) -> None:
+    specsys = str(meta.get('SPECSYS', meta.get('SSYSOBS', ''))).strip().upper()
+    if specsys == 'TOPOCENT':
+        raise ValueError('basketweave automatic velocity-axis inference does not support SPECSYS=TOPOCENT. Regrid/coadd to a non-topocentric spectral frame first, or pass v_axis/channel_mask explicitly.')
+
+def _velocity_axis_kms_from_meta_simple(meta: dict, *, nchan: int) -> np.ndarray:
+    _validate_non_topocentric_specsys(meta)
+    raw_ctype = str(meta.get('CTYPE1', 'FREQ')).strip()
+    ctype = raw_ctype.upper()
+    raw_cunit = str(meta.get('CUNIT1', ''))
+    unit_norm = _normalize_unit_local(raw_cunit)
+    if 'CRVAL1' not in meta or 'CDELT1' not in meta:
+        raise ValueError('CRVAL1/CDELT1 are required for automatic velocity-axis inference.')
+    crval = float(meta['CRVAL1'])
+    cdelt = float(meta['CDELT1'])
+    crpix = float(meta.get('CRPIX1', 1.0))
+    i = np.arange(int(nchan), dtype=float)
+    axis_native = crval + (i + 1.0 - crpix) * cdelt
+    if ctype.startswith('FREQ') or unit_norm == 'hz':
+        freq_hz = axis_native * _freq_scale_to_hz_local(raw_cunit)
+        rest_hz = _get_restfreq_local(meta)
+        return _radio_velocity_kms_from_freq(freq_hz, rest_hz)
+    scale_to_kms = 0.001 if unit_norm == 'm/s' else 1.0
+    v_axis_kms = axis_native * scale_to_kms
+    if ctype.startswith('VRAD'):
+        return v_axis_kms
+    if ctype.startswith('VOPT'):
+        rest_hz = _get_restfreq_local(meta)
+        freq_hz = rest_hz / (v_axis_kms / C_KMS + 1.0)
+        return _radio_velocity_kms_from_freq(freq_hz, rest_hz)
+    if ctype.startswith('VELO'):
+        rest_hz = _get_restfreq_local(meta)
+        beta = np.clip(v_axis_kms / C_KMS, -0.999, 0.999)
+        freq_hz = rest_hz * np.sqrt((1.0 - beta) / (1.0 + beta))
+        return _radio_velocity_kms_from_freq(freq_hz, rest_hz)
+    if unit_norm in ('m/s', 'km/s'):
+        return v_axis_kms
+    raise ValueError(f'Unsupported spectral axis for automatic velocity inference: CTYPE1={raw_ctype!r}, CUNIT1={raw_cunit!r}')
+
+def _infer_velocity_axis_kms_from_dataset(dataset) -> np.ndarray:
+    if isinstance(dataset, GridInput):
+        raise ValueError('Automatic velocity-axis inference is not available for GridInput input. Pass v_axis or channel_mask explicitly.')
+    meta = _dataset_meta_like(dataset)
+    nchan = _infer_nchan_from_dataset(dataset)
+    return np.asarray(_velocity_axis_kms_from_meta_simple(meta, nchan=nchan), dtype=float)
+
+def _infer_velocity_axis_kms_for_input(dataset_or_input_data) -> np.ndarray | None:
+    if isinstance(dataset_or_input_data, (list, tuple)):
+        axes = []
+        for item in dataset_or_input_data:
+            if isinstance(item, GridInput):
+                raise ValueError('Automatic velocity-axis inference for a list/tuple input is only supported when all elements are scantable-like objects. For GridInput elements, pass v_axis or channel_mask explicitly.')
+            axes.append(_infer_velocity_axis_kms_from_dataset(item))
+        if len(axes) == 0:
+            return None
+        ref = np.asarray(axes[0], dtype=float)
+        for k, ax in enumerate(axes[1:], start=1):
+            ax = np.asarray(ax, dtype=float)
+            if ax.shape != ref.shape or not np.allclose(ax, ref, rtol=0.0, atol=1.0e-12, equal_nan=True):
+                raise ValueError(f'Automatic velocity-axis inference requires all inputs to share the same spectral axis. Input 0 and input {k} differ; pass v_axis or channel_mask explicitly.')
+        return ref
+    if isinstance(dataset_or_input_data, GridInput):
+        return None
+    return _infer_velocity_axis_kms_from_dataset(dataset_or_input_data)
+
 @dataclass
 class _PairSelectionResult:
     i_idx: np.ndarray
@@ -1480,9 +1602,15 @@ def apply_basket_weave_correction(input_data: GridInput, offsets_or_solution) ->
         input_data.spec -= correction_vector[:, np.newaxis]
 
 def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only') -> BasketWeaveResult:
+    effective_v_axis = None if v_axis is None else np.asarray(v_axis, dtype=float)
+    resolved_windows = _resolve_linefree_velocity_windows(linefree_velocity_windows_kms=linefree_velocity_windows_kms, v_windows_kms=v_windows_kms)
+    if effective_v_axis is None and channel_mask is None and resolved_windows is not None:
+        inferred_v_axis = _infer_velocity_axis_kms_for_input(dataset_or_input_data)
+        if inferred_v_axis is not None:
+            effective_v_axis = np.asarray(inferred_v_axis, dtype=float)
     input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame)
     spec = np.asarray(input_data.spec)
-    solution, diagnostics = _solve_basket_weave_core(input_data, search_radius_arcsec=search_radius_arcsec, damp=damp, v_axis=v_axis, linefree_velocity_windows_kms=linefree_velocity_windows_kms, channel_mask=channel_mask, v_windows_kms=v_windows_kms, cross_direction_only=cross_direction_only, orthogonality_tolerance_deg=orthogonality_tolerance_deg, fallback_to_all_cross_scan_pairs=fallback_to_all_cross_scan_pairs, pair_mode=pair_mode, offset_model=offset_model, reference_mode=reference_mode, reference_direction=reference_direction, reference_scan_id=reference_scan_id, reference_constraint_weight=reference_constraint_weight, reference_constrain_terms=reference_constrain_terms)
+    solution, diagnostics = _solve_basket_weave_core(input_data, search_radius_arcsec=search_radius_arcsec, damp=damp, v_axis=effective_v_axis, linefree_velocity_windows_kms=linefree_velocity_windows_kms, channel_mask=channel_mask, v_windows_kms=v_windows_kms, cross_direction_only=cross_direction_only, orthogonality_tolerance_deg=orthogonality_tolerance_deg, fallback_to_all_cross_scan_pairs=fallback_to_all_cross_scan_pairs, pair_mode=pair_mode, offset_model=offset_model, reference_mode=reference_mode, reference_direction=reference_direction, reference_scan_id=reference_scan_id, reference_constraint_weight=reference_constraint_weight, reference_constrain_terms=reference_constrain_terms)
     apply_basket_weave_correction(input_data, solution)
     if writeback_to_dataset and original_target is not None:
         original_target.data = input_data.spec
