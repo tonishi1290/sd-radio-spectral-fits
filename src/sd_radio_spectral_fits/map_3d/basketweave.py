@@ -724,10 +724,10 @@ def estimate_basket_weave_search_radius_arcsec(input_data: GridInput, *, cross_s
             return radius
     return float(fallback_arcsec)
 
-def _as_grid_input(dataset_or_input_data, *, projection: str, ref_coord, frame: str) -> GridInput:
+def _as_grid_input(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_scan_region=False, otf_scan_png=None, otf_scan_existing_is_turn: str='prefer') -> GridInput:
     if isinstance(dataset_or_input_data, GridInput):
         return dataset_or_input_data
-    return create_grid_input(dataset_or_input_data, ref_coord=ref_coord, frame=frame, projection=projection)
+    return create_grid_input(dataset_or_input_data, ref_coord=ref_coord, frame=frame, projection=projection, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
 
 def _concatenate_optional_numeric(arrays: list[np.ndarray | None], lengths: list[int]) -> np.ndarray | None:
     if all((a is None for a in arrays)):
@@ -828,7 +828,7 @@ def _merge_grid_inputs(inputs: Sequence[GridInput]) -> GridInput:
         scan_dir = np.concatenate(scan_dir_list, axis=0)
     return GridInput(x=x, y=y, spec=spec, flag=flag, time=time, rms=rms, tint=tint, tsys=tsys, scan_id=scan_id, subscan_id=subscan_id, scan_dir=scan_dir, is_turnaround=is_turnaround)
 
-def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, frame: str) -> tuple[GridInput, object | None, bool, list[int] | None]:
+def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_scan_region=False, otf_scan_png=None, otf_scan_existing_is_turn: str='prefer') -> tuple[GridInput, object | None, bool, list[int] | None]:
     """
     Normalize input into a single GridInput.
 
@@ -843,12 +843,12 @@ def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, fr
         Lengths of the merged segments when the input was a list/tuple.
     """
     if isinstance(dataset_or_input_data, (list, tuple)):
-        grid_inputs = [_as_grid_input(item, projection=projection, ref_coord=ref_coord, frame=frame) for item in dataset_or_input_data]
+        grid_inputs = [_as_grid_input(item, projection=projection, ref_coord=ref_coord, frame=frame, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn) for item in dataset_or_input_data]
         lengths = [int(len(np.asarray(gi.x))) for gi in grid_inputs]
         return (_merge_grid_inputs(grid_inputs), dataset_or_input_data, False, lengths)
     if isinstance(dataset_or_input_data, GridInput):
         return (dataset_or_input_data, None, False, None)
-    input_data = _as_grid_input(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame)
+    input_data = _as_grid_input(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
     return (input_data, dataset_or_input_data, True, None)
 
 def _sort_scan_sample_indices(indices: np.ndarray, time_values: np.ndarray | None) -> np.ndarray:
@@ -1601,14 +1601,14 @@ def apply_basket_weave_correction(input_data: GridInput, offsets_or_solution) ->
     else:
         input_data.spec -= correction_vector[:, np.newaxis]
 
-def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only') -> BasketWeaveResult:
+def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only', otf_scan_region=False, otf_scan_png=None, otf_scan_existing_is_turn: str='prefer') -> BasketWeaveResult:
     effective_v_axis = None if v_axis is None else np.asarray(v_axis, dtype=float)
     resolved_windows = _resolve_linefree_velocity_windows(linefree_velocity_windows_kms=linefree_velocity_windows_kms, v_windows_kms=v_windows_kms)
     if effective_v_axis is None and channel_mask is None and resolved_windows is not None:
         inferred_v_axis = _infer_velocity_axis_kms_for_input(dataset_or_input_data)
         if inferred_v_axis is not None:
             effective_v_axis = np.asarray(inferred_v_axis, dtype=float)
-    input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame)
+    input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
     spec = np.asarray(input_data.spec)
     solution, diagnostics = _solve_basket_weave_core(input_data, search_radius_arcsec=search_radius_arcsec, damp=damp, v_axis=effective_v_axis, linefree_velocity_windows_kms=linefree_velocity_windows_kms, channel_mask=channel_mask, v_windows_kms=v_windows_kms, cross_direction_only=cross_direction_only, orthogonality_tolerance_deg=orthogonality_tolerance_deg, fallback_to_all_cross_scan_pairs=fallback_to_all_cross_scan_pairs, pair_mode=pair_mode, offset_model=offset_model, reference_mode=reference_mode, reference_direction=reference_direction, reference_scan_id=reference_scan_id, reference_constraint_weight=reference_constraint_weight, reference_constrain_terms=reference_constrain_terms)
     apply_basket_weave_correction(input_data, solution)

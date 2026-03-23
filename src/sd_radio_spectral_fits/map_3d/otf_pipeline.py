@@ -16,6 +16,12 @@ _RUNTIME_KW_NAMES = {
     "sort_neighbors",
 }
 
+_OTF_REGION_KW_NAMES = {
+    "otf_scan_region",
+    "otf_scan_png",
+    "otf_scan_existing_is_turn",
+}
+
 
 def run_otf_full_pipeline(
     scantable,
@@ -28,6 +34,7 @@ def run_otf_full_pipeline(
 ):
     basket_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _BASKET_KW_NAMES}
     runtime_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _RUNTIME_KW_NAMES}
+    otf_region_kwargs = {k: kwargs.pop(k) for k in list(kwargs.keys()) if k in _OTF_REGION_KW_NAMES}
 
     if do_basket_weave:
         print("Executing Basket-weave correction...")
@@ -39,6 +46,7 @@ def run_otf_full_pipeline(
             scantable,
             frame=frame,
             projection=projection,
+            **otf_region_kwargs,
         )
 
         offsets = solve_basket_weave_offsets(grid_input, **basket_kwargs)
@@ -54,5 +62,6 @@ def run_otf_full_pipeline(
         write_diagnostics=write_diagnostics,
         diagnostics_prefix=diagnostics_prefix,
         **runtime_kwargs,
+        **otf_region_kwargs,
         **kwargs,
     )

@@ -18,7 +18,7 @@ from .wcs_proj import project_to_plane
 from .config import MapConfig, GridInput
 from .fits_io import save_map_fits
 from ..tempscale import beameff_array, tempscal_array, ta_to_tr
-from ..scantable_utils import calc_mapping_offsets, _df_to_native_endian
+from ..scantable_utils import _df_to_native_endian
 
 
 class _ConfigView:
@@ -257,6 +257,7 @@ def _collect_otf_diagnostics(
             "tsys_stats": None if grid_input.tsys is None else _nan_stats(grid_input.tsys),
             "scan_id_stats": None if grid_input.scan_id is None else _nan_stats(pd.to_numeric(np.asarray(grid_input.scan_id), errors="coerce")),
             "is_turnaround_count": None if grid_input.is_turnaround is None else int(np.count_nonzero(np.asarray(grid_input.is_turnaround, dtype=bool))),
+            "otf_scan_summary": getattr(grid_input, "_otf_scan_summary", None),
         },
         "grid_output": {
             "cube_shape": list(np.asarray(grid_res.cube).shape),
@@ -515,6 +516,184 @@ def _resolve_time_array(table: pd.DataFrame) -> np.ndarray:
     return np.arange(len(table), dtype=float)
 
 
+
+
+def _frame_is_galactic(frame: str) -> bool:
+    return str(frame).strip().lower() in {"gal", "galactic"}
+
+
+def _extract_lon_lat_arrays(table: pd.DataFrame, frame: str) -> tuple[np.ndarray, np.ndarray]:
+    is_galactic = _frame_is_galactic(frame)
+    lon_col = "GLON" if is_galactic else "RA"
+    lat_col = "GLAT" if is_galactic else "DEC"
+    if lon_col not in table.columns or lat_col not in table.columns:
+        raise ValueError(f"Required coordinate columns not found for frame={frame!r}: {lon_col}, {lat_col}")
+    lon_deg = pd.to_numeric(table[lon_col], errors="coerce").to_numpy(float)
+    lat_deg = pd.to_numeric(table[lat_col], errors="coerce").to_numpy(float)
+    return lon_deg, lat_deg
+
+
+def _angle_like_to_deg(value) -> float:
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None:
+        return np.nan
+    for attr in ("deg", "degree"):
+        if hasattr(value, attr):
+            try:
+                return float(getattr(value, attr))
+            except Exception:
+                pass
+    if hasattr(value, "to_value"):
+        try:
+            return float(value.to_value("deg"))
+        except Exception:
+            pass
+    try:
+        return float(value)
+    except Exception:
+        return np.nan
+
+
+def _resolve_reference_lonlat(ref_coord, frame: str, lon_deg: np.ndarray, lat_deg: np.ndarray, *, ref_lon=None, ref_lat=None) -> tuple[float, float]:
+    valid_mask = np.isfinite(lon_deg) & np.isfinite(lat_deg)
+    if not np.any(valid_mask):
+        raise ValueError("No finite coordinates found.")
+
+    if ref_lon is not None and ref_lat is not None:
+        return float(ref_lon), float(ref_lat)
+
+    if ref_coord is not None:
+        if isinstance(ref_coord, (tuple, list, np.ndarray)) and len(ref_coord) >= 2:
+            lon0 = _angle_like_to_deg(ref_coord[0])
+            lat0 = _angle_like_to_deg(ref_coord[1])
+            if np.isfinite(lon0) and np.isfinite(lat0):
+                return float(lon0), float(lat0)
+        try:
+            from astropy.coordinates import SkyCoord
+        except Exception:
+            SkyCoord = None
+        if SkyCoord is not None and isinstance(ref_coord, SkyCoord):
+            if _frame_is_galactic(frame):
+                return float(ref_coord.galactic.l.deg), float(ref_coord.galactic.b.deg)
+            return float(ref_coord.icrs.ra.deg), float(ref_coord.icrs.dec.deg)
+        if _frame_is_galactic(frame):
+            for lon_name, lat_name in (("l", "b"), ("lon", "lat")):
+                if hasattr(ref_coord, lon_name) and hasattr(ref_coord, lat_name):
+                    lon0 = _angle_like_to_deg(getattr(ref_coord, lon_name))
+                    lat0 = _angle_like_to_deg(getattr(ref_coord, lat_name))
+                    if np.isfinite(lon0) and np.isfinite(lat0):
+                        return float(lon0), float(lat0)
+        else:
+            for lon_name, lat_name in (("ra", "dec"), ("lon", "lat")):
+                if hasattr(ref_coord, lon_name) and hasattr(ref_coord, lat_name):
+                    lon0 = _angle_like_to_deg(getattr(ref_coord, lon_name))
+                    lat0 = _angle_like_to_deg(getattr(ref_coord, lat_name))
+                    if np.isfinite(lon0) and np.isfinite(lat0):
+                        return float(lon0), float(lat0)
+        raise ValueError("Could not interpret ref_coord as a reference sky position.")
+
+    return float(np.nanmedian(lon_deg[valid_mask])), float(np.nanmedian(lat_deg[valid_mask]))
+
+
+def _prepare_projection_table_and_coords(
+    scantable,
+    *,
+    frame: str = "ICRS",
+    projection: str = "SFL",
+    ref_coord=None,
+    ref_lon: float | None = None,
+    ref_lat: float | None = None,
+):
+    table = _df_to_native_endian(scantable.table).copy()
+    lon_deg, lat_deg = _extract_lon_lat_arrays(table, frame)
+    lon0, lat0 = _resolve_reference_lonlat(ref_coord, frame, lon_deg, lat_deg, ref_lon=ref_lon, ref_lat=ref_lat)
+    x_arcsec, y_arcsec = project_to_plane(lon_deg, lat_deg, lon0, lat0, projection=projection)
+    return table, x_arcsec, y_arcsec, lon0, lat0
+
+
+def _normalize_otf_scan_region_mode(value):
+    if value in (None, False):
+        return None
+    if value is True:
+        return "auto"
+    text = str(value).strip().lower()
+    if text in {"0", "false", "f", "no", "n", "off"}:
+        return None
+    if text in {"1", "true", "t", "yes", "y", "on"}:
+        return "auto"
+    if text in {"auto", "loose", "normal", "strict"}:
+        return text
+    raise ValueError(f"Unsupported otf_scan_region mode: {value!r}")
+
+
+def _resolve_otf_scan_png_path(otf_scan_png, *, default_path: str | None = None) -> str | None:
+    if otf_scan_png in (None, False):
+        return None
+    if otf_scan_png is True:
+        return default_path if default_path is not None else "otf_scan_region.png"
+    return str(otf_scan_png)
+
+
+def _assemble_grid_input(
+    *,
+    scantable,
+    table: pd.DataFrame,
+    x_arcsec: np.ndarray,
+    y_arcsec: np.ndarray,
+    spec: np.ndarray,
+    out_scale_norm: str | None = None,
+    beameff_vec: np.ndarray | None = None,
+    otf_scan_region=False,
+    otf_scan_png=None,
+    otf_scan_existing_is_turn: str = "prefer",
+):
+    obsmode = table["OBSMODE"].astype(str).str.upper().to_numpy() if "OBSMODE" in table.columns else np.full(len(table), "ON")
+    flag_on = (obsmode == "ON")
+    time_arr = _resolve_time_array(table)
+    base_scan_id = _safe_scan_id_array(table["SCAN"]) if "SCAN" in table.columns else None
+    existing_is_turn = _safe_bool_array(table["IS_TURN"], default=False) if "IS_TURN" in table.columns else None
+
+    scan_id = base_scan_id
+    is_turn = existing_is_turn
+    scan_dir = None
+    otf_summary = None
+
+    mode = _normalize_otf_scan_region_mode(otf_scan_region)
+    if mode is not None:
+        from .otf_scan_region import identify_otf_scan_regions
+
+        otf_result = identify_otf_scan_regions(
+            table,
+            x_arcsec=x_arcsec,
+            y_arcsec=y_arcsec,
+            flag_on=flag_on,
+            time_arr=time_arr,
+            base_scan_id=base_scan_id,
+            existing_is_turn=existing_is_turn,
+            mode=mode,
+            existing_is_turn_mode=otf_scan_existing_is_turn,
+            png_path=_resolve_otf_scan_png_path(otf_scan_png),
+        )
+        scan_id = otf_result.effscan
+        is_turn = otf_result.is_turn
+        scan_dir = otf_result.scan_dir_deg
+        otf_summary = otf_result.summary
+
+    return GridInput(
+        x=np.asarray(x_arcsec, dtype=float),
+        y=np.asarray(y_arcsec, dtype=float),
+        spec=np.asarray(spec, dtype=float),
+        flag=np.asarray(flag_on, dtype=bool),
+        time=np.asarray(time_arr, dtype=float),
+        rms=_extract_rms(table, out_scale_norm, beameff_vec) if out_scale_norm is not None and beameff_vec is not None else None,
+        tint=_extract_meta_col(table, ("EXPOSURE", "INTTIME", "DUR")),
+        tsys=_extract_tsys_scalar(table),
+        scan_id=scan_id,
+        scan_dir=scan_dir,
+        is_turnaround=is_turn,
+    ), otf_summary
+
 def run_mapping_pipeline(
     scantable,
     config: MapConfig,
@@ -530,6 +709,9 @@ def run_mapping_pipeline(
     sort_neighbors: bool | None = None,
     write_diagnostics: bool = False,
     diagnostics_prefix: str | None = None,
+    otf_scan_region=False,
+    otf_scan_png=None,
+    otf_scan_existing_is_turn: str = "prefer",
 ):
     """
     Scantable から 3D FITS キューブを生成する汎用統合パイプライン。
@@ -577,19 +759,14 @@ def run_mapping_pipeline(
 
     # 2. 座標投影 (deg -> arcsec)
     print("2. Projecting coordinates to local plane...")
-    table = _df_to_native_endian(scantable.table).copy()
-    is_galactic = coord_sys.lower() in ("galactic", "gal")
-    lon_deg = pd.to_numeric(table["GLON" if is_galactic else "RA"], errors="coerce").to_numpy(float)
-    lat_deg = pd.to_numeric(table["GLAT" if is_galactic else "DEC"], errors="coerce").to_numpy(float)
-
-    valid_mask = np.isfinite(lon_deg) & np.isfinite(lat_deg)
-    if not np.any(valid_mask):
-        raise ValueError("No finite coordinates found.")
-
-    lon0 = float(ref_lon) if ref_lon is not None else float(np.nanmedian(lon_deg[valid_mask]))
-    lat0 = float(ref_lat) if ref_lat is not None else float(np.nanmedian(lat_deg[valid_mask]))
-
-    x_arcsec, y_arcsec = project_to_plane(lon_deg, lat_deg, lon0, lat0, projection=projection)
+    table, x_arcsec, y_arcsec, lon0, lat0 = _prepare_projection_table_and_coords(
+        scantable,
+        frame=coord_sys,
+        projection=projection,
+        ref_coord=None,
+        ref_lon=ref_lon,
+        ref_lat=ref_lat,
+    )
 
     # 3. 温度スケールと BEAMEFF の処理
     print("3. Handling BEAMEFF and Temperature Scale...")
@@ -611,18 +788,22 @@ def run_mapping_pipeline(
         rep_beameff = float(np.median(valid_beameff)) if len(valid_beameff) > 0 else np.nan
 
     # 4. GridInput の詳細な組み立て
-    grid_input = GridInput(
-        x=x_arcsec,
-        y=y_arcsec,
+    grid_input, otf_scan_summary = _assemble_grid_input(
+        scantable=scantable,
+        table=table,
+        x_arcsec=x_arcsec,
+        y_arcsec=y_arcsec,
         spec=full_matrix,
-        flag=(table["OBSMODE"].astype(str).str.upper() == "ON").to_numpy(dtype=bool) if "OBSMODE" in table.columns else np.ones(len(table), dtype=bool),
-        time=_resolve_time_array(table),
-        rms=_extract_rms(table, out_scale_norm, beameff_vec),
-        tint=_extract_meta_col(table, ("EXPOSURE", "INTTIME", "DUR")),
-        tsys=_extract_tsys_scalar(table),
-        scan_id=_safe_scan_id_array(table["SCAN"]) if "SCAN" in table.columns else None,
-        is_turnaround=_safe_bool_array(table["IS_TURN"], default=False) if "IS_TURN" in table.columns else None,
+        out_scale_norm=out_scale_norm,
+        beameff_vec=beameff_vec,
+        otf_scan_region=otf_scan_region,
+        otf_scan_png=_resolve_otf_scan_png_path(
+            otf_scan_png,
+            default_path=str(Path(output_fits).with_suffix(Path(output_fits).suffix + ".scan_region.png")),
+        ),
+        otf_scan_existing_is_turn=otf_scan_existing_is_turn,
     )
+    setattr(grid_input, "_otf_scan_summary", otf_scan_summary)
 
     # 5. グリッディング実行
     print("4. Executing Gridding Engine...")
@@ -742,36 +923,36 @@ def _extract_meta_col(table, names):
     return None
 
 
-def create_grid_input(scantable, ref_coord=None, frame="ICRS", projection="SFL"):
+def create_grid_input(
+    scantable,
+    ref_coord=None,
+    frame="ICRS",
+    projection="SFL",
+    otf_scan_region=False,
+    otf_scan_png=None,
+    otf_scan_existing_is_turn: str = "prefer",
+):
     """
-    ScantableからGridInputを安全に生成する。
-    ※ 将来的に src/map/gridder.py に移設することを推奨します。
+    Scantable から GridInput を安全に生成する。
+    Basket-weave と最終 gridding で同じ座標投影・同じ OTF 領域判定を使う。
     """
-    table = _df_to_native_endian(scantable.table).copy()
-
-    offsets_df = calc_mapping_offsets(
+    table, x_arcsec, y_arcsec, _, _ = _prepare_projection_table_and_coords(
         scantable,
-        ref_coord=ref_coord,
         frame=frame,
         projection=projection,
-        unit="arcsec",
-        verbose=False,
+        ref_coord=ref_coord,
     )
-
-    x_arcsec = offsets_df["OFS_LON"].to_numpy()
-    y_arcsec = offsets_df["OFS_LAT"].to_numpy()
-
-    obsmode = table["OBSMODE"].astype(str).str.upper().to_numpy() if "OBSMODE" in table.columns else np.full(len(table), "ON")
-    time_arr = _resolve_time_array(table)
-    scan_id = _safe_scan_id_array(table["SCAN"]) if "SCAN" in table.columns else None
-    is_turn = _safe_bool_array(table["IS_TURN"], default=False) if "IS_TURN" in table.columns else None
-
-    return GridInput(
-        x=x_arcsec,
-        y=y_arcsec,
+    grid_input, otf_scan_summary = _assemble_grid_input(
+        scantable=scantable,
+        table=table,
+        x_arcsec=x_arcsec,
+        y_arcsec=y_arcsec,
         spec=np.asarray(scantable.data, dtype=float),
-        flag=(obsmode == "ON"),
-        time=time_arr,
-        scan_id=scan_id,
-        is_turnaround=is_turn,
+        out_scale_norm=None,
+        beameff_vec=None,
+        otf_scan_region=otf_scan_region,
+        otf_scan_png=_resolve_otf_scan_png_path(otf_scan_png),
+        otf_scan_existing_is_turn=otf_scan_existing_is_turn,
     )
+    setattr(grid_input, "_otf_scan_summary", otf_scan_summary)
+    return grid_input

@@ -16,6 +16,7 @@ from .ps_gridder import PSMapConfig
 from .gridder import run_mapping_pipeline, create_grid_input
 from .core import grid_otf
 from .basketweave import solve_basket_weave_offsets, apply_basket_weave_correction, basket_weave_inplace
+from .otf_scan_region import identify_otf_scan_regions, OTFScanRegionResult
 # PS (Position Switch)
 from .ps_gridder import run_ps_mapping_pipeline, grid_ps
 
@@ -46,6 +47,8 @@ __all__ = [
     "solve_basket_weave_offsets",
     "apply_basket_weave_correction",
     "basket_weave_inplace",
+    "identify_otf_scan_regions",
+    "OTFScanRegionResult",
 
     # Cube Analysis
     "estimate_robust_rms",
