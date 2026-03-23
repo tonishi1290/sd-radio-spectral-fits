@@ -13,10 +13,86 @@ from .legacy_loaders import load_converter_module
 
 ALLOWED_POLARIZA = {"RR", "LL", "RL", "LR", "XX", "YY", "XY", "YX"}
 
+PURE_ROTATION_MODEL = "pure_rotation_v1"
+PURE_ROTATION_LEGACY_KEYS = {
+    "az_offset_arcsec",
+    "el_offset_arcsec",
+    "rotation_mode",
+    "reference_angle_deg",
+    "reference_el_deg",
+    "rotation_sign",
+    "rotation_slope_deg_per_deg",
+    "dewar_angle_deg",
+}
+
+
+def _normalize_beam_model(value: Any) -> str:
+    if value is None:
+        return "legacy"
+    s = str(value).strip()
+    if not s:
+        return "legacy"
+    if s == PURE_ROTATION_MODEL:
+        return PURE_ROTATION_MODEL
+    return s
+
+
+def _normalize_rotation_mode(value: Any) -> str:
+    s = str(value if value is not None else "none").strip().lower()
+    if s not in {"none", "elevation"}:
+        raise ValueError(f"rotation_mode must be one of ['none', 'elevation'], got {value!r}")
+    return s
+
+
+def _build_light_beam(beam_id: str, beam_block: Dict[str, Any]) -> LightBeam:
+    beam_block = dict(beam_block or {})
+    beam_model = _normalize_beam_model(beam_block.get("model", None))
+    beam_model_version = (str(beam_block.get("beam_model_version")).strip() if beam_block.get("beam_model_version") is not None else None)
+    if beam_model == PURE_ROTATION_MODEL:
+        legacy_keys = sorted(k for k in PURE_ROTATION_LEGACY_KEYS if k in beam_block and beam_block.get(k) is not None)
+        if legacy_keys:
+            raise ValueError(
+                f"beam.model={PURE_ROTATION_MODEL!r} forbids legacy beam keys: {legacy_keys}"
+            )
+        pure_block = dict(beam_block.get("pure_rotation", {}) or {})
+        for req in ("offset_x_el0_arcsec", "offset_y_el0_arcsec", "rotation_sign"):
+            if pure_block.get(req) is None:
+                raise ValueError(f"beam.model={PURE_ROTATION_MODEL!r} requires beam.pure_rotation.{req}")
+        pure_sign = float(pure_block.get("rotation_sign"))
+        if pure_sign not in (-1.0, 1.0):
+            raise ValueError(f"beam.pure_rotation.rotation_sign must be +/-1, got {pure_sign!r}")
+        return LightBeam(
+            beam_id=beam_id,
+            beam_model=PURE_ROTATION_MODEL,
+            beam_model_version=beam_model_version,
+            rotation_sign=pure_sign,
+            pure_rotation_offset_x_el0_arcsec=float(pure_block.get("offset_x_el0_arcsec")),
+            pure_rotation_offset_y_el0_arcsec=float(pure_block.get("offset_y_el0_arcsec")),
+            pure_rotation_sign=pure_sign,
+        )
+    return LightBeam(
+        beam_id=beam_id,
+        beam_model=beam_model,
+        beam_model_version=beam_model_version,
+        az_offset_arcsec=float(beam_block.get("az_offset_arcsec", 0.0)),
+        el_offset_arcsec=float(beam_block.get("el_offset_arcsec", 0.0)),
+        rotation_mode=_normalize_rotation_mode(beam_block.get("rotation_mode", "none")),
+        reference_angle_deg=float(beam_block.get("reference_angle_deg", beam_block.get("reference_el_deg", 0.0))),
+        rotation_sign=float(beam_block.get("rotation_sign", 1.0)),
+        rotation_slope_deg_per_deg=(
+            float(beam_block.get("rotation_slope_deg_per_deg"))
+            if beam_block.get("rotation_slope_deg_per_deg") is not None else None
+        ),
+        dewar_angle_deg=float(beam_block.get("dewar_angle_deg", 0.0)),
+    )
+
+
 
 @dataclass
 class LightBeam:
     beam_id: str
+    beam_model: str = "legacy"
+    beam_model_version: Optional[str] = None
     az_offset_arcsec: float = 0.0
     el_offset_arcsec: float = 0.0
     rotation_mode: str = "none"
@@ -24,6 +100,9 @@ class LightBeam:
     rotation_sign: float = 1.0
     rotation_slope_deg_per_deg: Optional[float] = None
     dewar_angle_deg: float = 0.0
+    pure_rotation_offset_x_el0_arcsec: Optional[float] = None
+    pure_rotation_offset_y_el0_arcsec: Optional[float] = None
+    pure_rotation_sign: Optional[float] = None
 
 
 @dataclass
@@ -157,19 +236,7 @@ def _fallback_load_spectrometer_config(config_path: Path) -> Dict[str, Any]:
         plnum = int(block.get("plnum", 0))
         beam_id = str(block.get("beam_id", f"B{fdnum:02d}")).strip() or f"B{fdnum:02d}"
         beam_block = dict(block.get("beam", {}) or {})
-        beam = LightBeam(
-            beam_id=beam_id,
-            az_offset_arcsec=float(beam_block.get("az_offset_arcsec", 0.0)),
-            el_offset_arcsec=float(beam_block.get("el_offset_arcsec", 0.0)),
-            rotation_mode=str(beam_block.get("rotation_mode", "none")),
-            reference_angle_deg=float(beam_block.get("reference_angle_deg", beam_block.get("reference_el_deg", 0.0))),
-            rotation_sign=float(beam_block.get("rotation_sign", 1.0)),
-            rotation_slope_deg_per_deg=(
-                float(beam_block.get("rotation_slope_deg_per_deg"))
-                if beam_block.get("rotation_slope_deg_per_deg") is not None else None
-            ),
-            dewar_angle_deg=float(beam_block.get("dewar_angle_deg", 0.0)),
-        )
+        beam = _build_light_beam(beam_id, beam_block)
         freq_axis = dict(block.get("frequency_axis", {}) or {})
         restfreq_hz = freq_axis.get("restfreq_hz", float("nan"))
         try:
@@ -282,6 +349,8 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
                 "use_for_sunscan": usage_policy.get("use_for_sunscan", True),
                 "use_for_fit": usage_policy.get("use_for_fit", True),
                 "beam_fit_use": usage_policy.get("beam_fit_use", None),
+                "beam_model": str(getattr(stream.beam, "beam_model", "legacy")),
+                "beam_model_version": getattr(stream.beam, "beam_model_version", None),
                 "rotation_mode": str(getattr(stream.beam, "rotation_mode", "none")),
                 "reference_angle_deg": float(getattr(stream.beam, "reference_angle_deg", 0.0)),
                 "rotation_sign": float(getattr(stream.beam, "rotation_sign", 1.0)),
@@ -292,6 +361,9 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
                 "dewar_angle_deg": float(getattr(stream.beam, "dewar_angle_deg", 0.0)),
                 "az_offset_arcsec": float(getattr(stream.beam, "az_offset_arcsec", 0.0)),
                 "el_offset_arcsec": float(getattr(stream.beam, "el_offset_arcsec", 0.0)),
+                "offset_x_el0_arcsec": getattr(stream.beam, "pure_rotation_offset_x_el0_arcsec", None),
+                "offset_y_el0_arcsec": getattr(stream.beam, "pure_rotation_offset_y_el0_arcsec", None),
+                "pure_rotation_sign": getattr(stream.beam, "pure_rotation_sign", None),
             }
         )
     return pd.DataFrame(rows)
@@ -299,30 +371,16 @@ def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, A
 
 
 def resolve_primary_stream_names(raw_config_path: Path, stream_cfg: Dict[str, Any], explicit_stream_names: Optional[Sequence[str]] = None) -> List[str]:
+    """Return fit-enabled stream names.
+
+    The historical name is kept for CLI compatibility, but pure_rotation_v1 does
+    not require a single primary stream per beam. Duplicate beam_id entries are
+    therefore allowed and all selected fit streams are returned.
+    """
     streams = filter_streams_for_purpose(raw_config_path, stream_cfg, "fit", explicit_stream_names=explicit_stream_names)
     if explicit_stream_names:
         return [str(s) for s in explicit_stream_names]
-    extras = stream_extras_by_name(raw_config_path)
-    primary: List[str] = []
-    by_beam: Dict[str, List[Any]] = {}
-    for stream in streams:
-        by_beam.setdefault(str(stream.beam.beam_id), []).append(stream)
-    for beam_id, group in by_beam.items():
-        chosen = []
-        for stream in group:
-            policy = resolve_stream_usage_policy(extras.get(str(stream.name), {}))
-            if policy.get("beam_fit_use") is True:
-                chosen.append(stream.name)
-        if len(chosen) > 1:
-            raise ValueError(f"multiple primary streams declared for beam_id={beam_id!r}: {chosen}")
-        if len(group) > 1 and not chosen:
-            names = [s.name for s in group]
-            raise ValueError(
-                f"beam_id={beam_id!r} has multiple fit-enabled streams {names} but no primary stream was specified. "
-                "Add use_for_fit=true to the desired streams and beam_fit_use=true to exactly one stream, or pass --fit-stream-name."
-            )
-        primary.extend(chosen if chosen else [group[0].name])
-    return primary
+    return [str(getattr(stream, "name", "")) for stream in streams]
 
 
 
@@ -338,22 +396,41 @@ def validate_spectrometer_config(config_path: Path, *, explicit_stream_names: Op
     except Exception as exc:
         warnings.append(str(exc))
         primary_streams = list(explicit_stream_names or [])
+    if duplicate_beam_ids:
+        for beam_id in duplicate_beam_ids:
+            dup = table.loc[table["beam_id"].astype(str) == str(beam_id)].copy()
+            pure_mask = dup.get("beam_model", pd.Series(["legacy"] * len(dup), index=dup.index)).astype(str) == PURE_ROTATION_MODEL
+            if bool(pure_mask.all()):
+                pure = dup.loc[pure_mask].copy()
+                sig = pd.to_numeric(pure["pure_rotation_sign"], errors="coerce")
+                x0 = pd.to_numeric(pure["offset_x_el0_arcsec"], errors="coerce")
+                y0 = pd.to_numeric(pure["offset_y_el0_arcsec"], errors="coerce")
+                if not (sig.nunique(dropna=True) <= 1 and x0.nunique(dropna=True) <= 1 and y0.nunique(dropna=True) <= 1):
+                    warnings.append(
+                        f"beam_id={beam_id!r} appears in multiple streams but pure_rotation_v1 parameters are not identical across those streams"
+                    )
+            elif bool(pure_mask.any()):
+                warnings.append(
+                    f"beam_id={beam_id!r} mixes pure_rotation_v1 and legacy beam models across streams"
+                )
+
     for _, row in table.iterrows():
         if str(row["polariza"]).upper() not in ALLOWED_POLARIZA:
             warnings.append(f"unsupported polariza for stream {row['stream_name']!r}: {row['polariza']!r}")
         restfreq = row.get("restfreq_hz")
         if restfreq is None or (isinstance(restfreq, float) and not math.isfinite(restfreq)):
             warnings.append(f"stream {row['stream_name']!r} has no finite restfreq_hz")
-        rot_sign = row.get("rotation_sign")
+        rot_sign = row.get("pure_rotation_sign") if str(row.get("beam_model", "legacy")) == PURE_ROTATION_MODEL else row.get("rotation_sign")
         try:
             rot_sign_f = float(rot_sign)
-            if rot_sign_f not in (-1.0, 0.0, 1.0):
+            allowed = (-1.0, 1.0) if str(row.get("beam_model", "legacy")) == PURE_ROTATION_MODEL else (-1.0, 0.0, 1.0)
+            if rot_sign_f not in allowed:
                 warnings.append(
-                    f"stream {row['stream_name']!r} has rotation_sign={rot_sign_f!r}; "
-                    "converter-compatible configurations should use -1, 0, or +1"
+                    f"stream {row['stream_name']!r} has rotation sign={rot_sign_f!r}; "
+                    f"beam model {row.get('beam_model', 'legacy')!r} expects one of {allowed}"
                 )
         except Exception:
-            warnings.append(f"stream {row['stream_name']!r} has non-numeric rotation_sign={rot_sign!r}")
+            warnings.append(f"stream {row['stream_name']!r} has non-numeric rotation sign={rot_sign!r}")
 
     if primary_streams:
         primary_table = table.loc[table["stream_name"].astype(str).isin([str(s) for s in primary_streams])].copy()
@@ -361,17 +438,25 @@ def validate_spectrometer_config(config_path: Path, *, explicit_stream_names: Op
             geom_mag = (
                 pd.to_numeric(primary_table["az_offset_arcsec"], errors="coerce").fillna(0.0).abs()
                 + pd.to_numeric(primary_table["el_offset_arcsec"], errors="coerce").fillna(0.0).abs()
+                + pd.to_numeric(primary_table.get("offset_x_el0_arcsec"), errors="coerce").fillna(0.0).abs()
+                + pd.to_numeric(primary_table.get("offset_y_el0_arcsec"), errors="coerce").fillna(0.0).abs()
             )
             if bool((geom_mag <= 0.0).all()):
                 warnings.append(
-                    "all selected primary streams have zero nominal beam offsets; "
-                    "pseudo multi-beam dry-runs will not constrain rotation unless non-zero az/el offsets are set in [spectrometers.beam]"
+                    "all selected fit streams have zero nominal beam offsets; pseudo multi-beam dry-runs will not constrain rotation unless non-zero beam offsets are set in [spectrometers.beam]"
                 )
-            rot_modes = primary_table["rotation_mode"].astype(str).str.lower().str.strip()
-            if bool((rot_modes == "none").all()):
-                warnings.append(
-                    "all selected primary streams have rotation_mode='none'; pseudo multi-beam dry-runs will not exercise EL-dependent beam rotation"
-                )
+            beam_models = primary_table.get("beam_model", pd.Series(["legacy"] * len(primary_table), index=primary_table.index)).astype(str).str.strip()
+            pure_mask = beam_models == PURE_ROTATION_MODEL
+            if bool(pure_mask.any()):
+                pure_signs = pd.to_numeric(primary_table.loc[pure_mask, "pure_rotation_sign"], errors="coerce")
+                if bool((pure_signs.abs() != 1.0).any()):
+                    warnings.append("some selected fit streams use pure_rotation_v1 but do not have rotation_sign=+/-1")
+            elif "rotation_mode" in primary_table.columns:
+                rot_modes = primary_table["rotation_mode"].astype(str).str.lower().str.strip()
+                if bool((rot_modes == "none").all()):
+                    warnings.append(
+                        "all selected fit streams have rotation_mode='none'; pseudo multi-beam dry-runs will not exercise EL-dependent beam rotation"
+                    )
     return SpectrometerValidationResult(
         stream_table=table,
         duplicate_beam_ids=duplicate_beam_ids,
@@ -428,6 +513,7 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
     raw = load_raw_toml(raw_config_path)
     beam_map = {str(row["beam_id"]): row for _, row in beam_rows_df.iterrows()}
     lines: List[str] = []
+    missing_required: List[str] = []
 
     top_level = {k: v for k, v in raw.items() if k != "spectrometers"}
     _write_table_lines(lines, "", top_level)
@@ -439,18 +525,37 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
         beam_row = beam_map.get(beam_id)
         block_copy = dict(block)
         beam_block = dict(block_copy.get("beam", {}) or {})
+        usage_policy = resolve_stream_usage_policy(block)
+        requires_geometry = bool(usage_policy.get("use_for_convert", True) or usage_policy.get("use_for_fit", True))
         if beam_row is not None:
-            beam_block.update({
-                "az_offset_arcsec": float(beam_row["az_offset_arcsec"]),
-                "el_offset_arcsec": float(beam_row["el_offset_arcsec"]),
-                "rotation_mode": str(beam_row["rotation_mode"]),
-                "reference_angle_deg": float(beam_row["reference_angle_deg"]),
-                "rotation_sign": float(beam_row["rotation_sign"]),
-                "dewar_angle_deg": float(beam_row["dewar_angle_deg"]),
-                "beam_model_version": f"sunscan_multibeam_{model_name}",
-            })
-            if "rotation_slope_deg_per_deg" in beam_row and pd.notna(beam_row["rotation_slope_deg_per_deg"]):
-                beam_block["rotation_slope_deg_per_deg"] = float(beam_row["rotation_slope_deg_per_deg"])
+            has_pure = all(col in beam_row.index for col in ["offset_x_el0_arcsec", "offset_y_el0_arcsec", "rotation_sign"])
+            if has_pure and pd.notna(beam_row["offset_x_el0_arcsec"]) and pd.notna(beam_row["offset_y_el0_arcsec"]):
+                for legacy_key in [
+                    "az_offset_arcsec", "el_offset_arcsec", "rotation_mode", "reference_angle_deg", "reference_el_deg",
+                    "rotation_sign", "rotation_slope_deg_per_deg", "dewar_angle_deg",
+                ]:
+                    beam_block.pop(legacy_key, None)
+                beam_block["model"] = PURE_ROTATION_MODEL
+                beam_block["beam_model_version"] = f"sunscan_multibeam_{model_name}"
+                beam_block["pure_rotation"] = {
+                    "offset_x_el0_arcsec": float(beam_row["offset_x_el0_arcsec"]),
+                    "offset_y_el0_arcsec": float(beam_row["offset_y_el0_arcsec"]),
+                    "rotation_sign": float(beam_row["rotation_sign"]),
+                }
+            else:
+                beam_block.update({
+                    "az_offset_arcsec": float(beam_row["az_offset_arcsec"]),
+                    "el_offset_arcsec": float(beam_row["el_offset_arcsec"]),
+                    "rotation_mode": str(beam_row["rotation_mode"]),
+                    "reference_angle_deg": float(beam_row["reference_angle_deg"]),
+                    "rotation_sign": float(beam_row["rotation_sign"]),
+                    "dewar_angle_deg": float(beam_row["dewar_angle_deg"]),
+                    "beam_model_version": f"sunscan_multibeam_{model_name}",
+                })
+                if "rotation_slope_deg_per_deg" in beam_row and pd.notna(beam_row["rotation_slope_deg_per_deg"]):
+                    beam_block["rotation_slope_deg_per_deg"] = float(beam_row["rotation_slope_deg_per_deg"])
+        elif requires_geometry:
+            missing_required.append(f"stream={block.get('name', '')!r} beam_id={beam_id!r}")
         block_copy["beam"] = beam_block
 
         scalar_keys = [
@@ -468,6 +573,12 @@ def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df
             sub = block_copy.get(sub_key)
             if isinstance(sub, dict) and sub:
                 _write_table_lines(lines, f"spectrometers.{sub_key}", sub)
+
+    if missing_required:
+        raise ValueError(
+            "cannot write beam model TOML because fit results are missing required beam geometry for: "
+            + ", ".join(missing_required)
+        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

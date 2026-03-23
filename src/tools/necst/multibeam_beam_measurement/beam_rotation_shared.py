@@ -4,9 +4,12 @@ from dataclasses import dataclass
 from typing import Any, Tuple
 import numpy as np
 
+from .pure_rotation_model import rotate_el0_offset
+
 
 @dataclass
 class BeamRotationConfig:
+    beam_model: str = "legacy"
     az_offset_arcsec: float = 0.0
     el_offset_arcsec: float = 0.0
     rotation_mode: str = "none"
@@ -14,14 +17,24 @@ class BeamRotationConfig:
     rotation_sign: float = 1.0
     rotation_slope_deg_per_deg: float | None = None
     dewar_angle_deg: float = 0.0
+    offset_x_el0_arcsec: float | None = None
+    offset_y_el0_arcsec: float | None = None
+    pure_rotation_sign: float | None = None
 
 
 def beam_rotation_angle_deg(boresight_el_deg: np.ndarray | float, beam: Any) -> np.ndarray:
-    """Converter-compatible beam rotation angle.
+    """Beam rotation angle in degrees.
 
-    This intentionally mirrors the current formula in necst_v4_sdfits_converter.py.
+    For ``pure_rotation_v1`` this is simply ``rotation_sign * El``.
+    Legacy mode mirrors necst_v4_sdfits_converter.py.
     """
     el = np.asarray(boresight_el_deg, dtype=float)
+    beam_model = str(getattr(beam, "beam_model", getattr(beam, "model", "legacy")) or "legacy").strip().lower()
+    if beam_model == "pure_rotation_v1":
+        pure_sign = getattr(beam, "pure_rotation_sign", None)
+        if pure_sign is None:
+            pure_sign = getattr(beam, "rotation_sign", 1.0)
+        return np.asarray(float(pure_sign) * el, dtype=float)
     rotation_mode = str(getattr(beam, "rotation_mode", "none") or "none").lower().strip()
     reference_angle_deg = float(getattr(beam, "reference_angle_deg", 0.0))
     rotation_sign = float(getattr(beam, "rotation_sign", 1.0))
@@ -45,6 +58,15 @@ def rotate_offset_arcsec(dx0_arcsec: np.ndarray | float, dy0_arcsec: np.ndarray 
 
 
 def apply_beam_offset_arcsec(boresight_el_deg: np.ndarray | float, beam: Any) -> Tuple[np.ndarray, np.ndarray]:
+    beam_model = str(getattr(beam, "beam_model", getattr(beam, "model", "legacy")) or "legacy").strip().lower()
+    if beam_model == "pure_rotation_v1":
+        dx, dy, _ = rotate_el0_offset(
+            getattr(beam, "offset_x_el0_arcsec", getattr(beam, "pure_rotation_offset_x_el0_arcsec", 0.0)),
+            getattr(beam, "offset_y_el0_arcsec", getattr(beam, "pure_rotation_offset_y_el0_arcsec", 0.0)),
+            boresight_el_deg,
+            getattr(beam, "pure_rotation_sign", getattr(beam, "rotation_sign", 1.0)),
+        )
+        return dx, dy
     theta_deg = beam_rotation_angle_deg(boresight_el_deg, beam)
     return rotate_offset_arcsec(
         getattr(beam, "az_offset_arcsec", 0.0),

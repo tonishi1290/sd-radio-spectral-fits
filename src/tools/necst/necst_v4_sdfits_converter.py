@@ -65,6 +65,17 @@ from astropy.time import Time
 from astropy.coordinates import AltAz, SkyCoord
 from astropy import units as u
 
+try:
+    from .multibeam_beam_measurement.pure_rotation_model import (
+        rotate_el0_offset,
+        offset_xy_to_beam_azel,
+    )
+except ImportError:
+    from tools.necst.multibeam_beam_measurement.pure_rotation_model import (
+        rotate_el0_offset,
+        offset_xy_to_beam_azel,
+    )
+
 from sd_radio_spectral_fits import (
     SDRadioSpectralSDFITSWriter,
     Site, DatasetInfo, SpectralAxisUniform, Efficiency,
@@ -723,6 +734,7 @@ def _mode_from_pos(s):
 @dataclass
 class BeamConfig:
     beam_id: str = "B00"
+    model: str = "legacy"
     az_offset_arcsec: float = 0.0  # tangent-plane X = dAz*cosEl
     el_offset_arcsec: float = 0.0  # tangent-plane Y = dEl
     rotation_mode: str = "none"    # none | elevation
@@ -731,6 +743,9 @@ class BeamConfig:
     rotation_slope_deg_per_deg: Optional[float] = None
     dewar_angle_deg: float = 0.0
     beam_model_version: Optional[str] = None
+    pure_rotation_offset_x_el0_arcsec: Optional[float] = None
+    pure_rotation_offset_y_el0_arcsec: Optional[float] = None
+    pure_rotation_sign: Optional[float] = None
 
 
 @dataclass
@@ -1008,12 +1023,106 @@ def _validate_required(dct, keys, context):
         raise ValueError("{} is missing required keys: {}".format(context, ", ".join(miss)))
 
 
+
+PURE_ROTATION_MODEL = "pure_rotation_v1"
+PURE_ROTATION_LEGACY_KEYS = {
+    "az_offset_arcsec",
+    "el_offset_arcsec",
+    "rotation_mode",
+    "reference_angle_deg",
+    "reference_el_deg",
+    "rotation_sign",
+    "rotation_slope_deg_per_deg",
+    "dewar_angle_deg",
+}
+
 def _normalize_rotation_mode(v):
     s = str(v if v is not None else "none").strip().lower()
     if s not in ("none", "elevation"):
         raise ValueError("rotation_mode must be one of ['none', 'elevation'], got {!r}".format(v))
     return s
 
+
+
+
+def _normalize_beam_model(v):
+    s = str(v if v is not None else "legacy").strip()
+    if not s:
+        return "legacy"
+    return s
+
+
+def _normalize_pure_rotation_sign(v):
+    sign = float(v)
+    if sign not in (-1.0, 1.0):
+        raise ValueError("beam.pure_rotation.rotation_sign must be +1 or -1, got {!r}".format(v))
+    return sign
+
+
+def _beam_summary_descriptor(beam):
+    model = str(getattr(beam, "model", "legacy") or "legacy")
+    if model == PURE_ROTATION_MODEL:
+        return "model={};sign={:+.0f};el0_xy=({:+.3f},{:+.3f})arcsec".format(
+            model,
+            float(beam.pure_rotation_sign),
+            float(beam.pure_rotation_offset_x_el0_arcsec),
+            float(beam.pure_rotation_offset_y_el0_arcsec),
+        )
+    slope = float(beam.rotation_slope_deg_per_deg) if beam.rotation_slope_deg_per_deg is not None else float(beam.rotation_sign)
+    return "model={};rotation_mode={};xy0=({:+.3f},{:+.3f})arcsec;theta(el)={:+.6f}*(El-{:+.3f})+{:+.3f}".format(
+        model,
+        beam.rotation_mode,
+        float(beam.az_offset_arcsec),
+        float(beam.el_offset_arcsec),
+        slope,
+        float(beam.reference_angle_deg),
+        float(beam.dewar_angle_deg),
+    )
+
+
+def _format_optional_summary_number(value, digits=3):
+    try:
+        x = float(value)
+    except Exception:
+        return "nan"
+    if not np.isfinite(x):
+        return "nan"
+    return f"{x:+.{int(digits)}f}"
+
+
+def _print_beam_application_summary(stream, boresight_el_deg, beam_applied):
+    beam = stream.beam
+    model = str(getattr(beam, "model", "legacy") or "legacy")
+    print("[beam] stream='{}' beam_id='{}' {} version={}".format(
+        stream.name,
+        beam.beam_id,
+        _beam_summary_descriptor(beam),
+        (beam.beam_model_version or ""),
+    ))
+    el = np.asarray(boresight_el_deg, dtype=float)
+    rep_el = float(np.nanmedian(el)) if el.size else float("nan")
+    dx = np.asarray(beam_applied.get("beam_dx_arcsec"), dtype=float)
+    dy = np.asarray(beam_applied.get("beam_dy_arcsec"), dtype=float)
+    theta = np.asarray(beam_applied.get("beam_rot_deg"), dtype=float)
+    rep_dx = float(np.nanmedian(dx)) if dx.size else float("nan")
+    rep_dy = float(np.nanmedian(dy)) if dy.size else float("nan")
+    rep_theta = float(np.nanmedian(theta)) if theta.size else float("nan")
+    if model == PURE_ROTATION_MODEL:
+        print("[beam] stream='{}' applied pure_rotation_v1 at El_med={} deg -> theta={} deg, xy=({}, {}) arcsec".format(
+            stream.name,
+            _format_optional_summary_number(rep_el, digits=3),
+            _format_optional_summary_number(rep_theta, digits=3),
+            _format_optional_summary_number(rep_dx, digits=3),
+            _format_optional_summary_number(rep_dy, digits=3),
+        ))
+    else:
+        print("[beam] stream='{}' applied legacy model at El_med={} deg -> theta={} deg, xy=({}, {}) arcsec".format(
+            stream.name,
+            _format_optional_summary_number(rep_el, digits=3),
+            _format_optional_summary_number(rep_theta, digits=3),
+            _format_optional_summary_number(rep_dx, digits=3),
+            _format_optional_summary_number(rep_dy, digits=3),
+        ))
 
 def _normalize_definition_mode(v):
     s = str(v).strip().lower()
@@ -1394,20 +1503,46 @@ def _normalize_stream_block(block, stream_index):
     beam_id = str(block.get("beam_id", "B{:02d}".format(fdnum))).strip() or "B{:02d}".format(fdnum)
 
     beam_block = dict(block.get("beam", {}) or {})
-    beam = BeamConfig(
-        beam_id=beam_id,
-        az_offset_arcsec=float(beam_block.get("az_offset_arcsec", 0.0)),
-        el_offset_arcsec=float(beam_block.get("el_offset_arcsec", 0.0)),
-        rotation_mode=_normalize_rotation_mode(beam_block.get("rotation_mode", "none")),
-        reference_angle_deg=float(beam_block.get("reference_angle_deg", beam_block.get("reference_el_deg", 0.0))),
-        rotation_sign=float(beam_block.get("rotation_sign", 1.0)),
-        rotation_slope_deg_per_deg=(
-            float(beam_block.get("rotation_slope_deg_per_deg"))
-            if beam_block.get("rotation_slope_deg_per_deg") is not None else None
-        ),
-        dewar_angle_deg=float(beam_block.get("dewar_angle_deg", 0.0)),
-        beam_model_version=(str(beam_block.get("beam_model_version")).strip() if beam_block.get("beam_model_version") is not None else None),
-    )
+    beam_model = _normalize_beam_model(beam_block.get("model", None))
+    beam_model_version = (str(beam_block.get("beam_model_version")).strip() if beam_block.get("beam_model_version") is not None else None)
+    if beam_model == PURE_ROTATION_MODEL:
+        legacy_keys = sorted(k for k in PURE_ROTATION_LEGACY_KEYS if k in beam_block and beam_block.get(k) is not None)
+        if legacy_keys:
+            raise ValueError(
+                "stream '{}' beam.model={!r} forbids legacy beam keys: {}".format(name, PURE_ROTATION_MODEL, legacy_keys)
+            )
+        pure_block = dict(beam_block.get("pure_rotation", {}) or {})
+        missing = [k for k in ("offset_x_el0_arcsec", "offset_y_el0_arcsec", "rotation_sign") if pure_block.get(k) is None]
+        if missing:
+            raise ValueError(
+                "stream '{}' beam.model={!r} requires beam.pure_rotation keys: {}".format(name, PURE_ROTATION_MODEL, missing)
+            )
+        pure_sign = _normalize_pure_rotation_sign(pure_block.get("rotation_sign"))
+        beam = BeamConfig(
+            beam_id=beam_id,
+            model=PURE_ROTATION_MODEL,
+            rotation_sign=pure_sign,
+            beam_model_version=beam_model_version,
+            pure_rotation_offset_x_el0_arcsec=float(pure_block.get("offset_x_el0_arcsec")),
+            pure_rotation_offset_y_el0_arcsec=float(pure_block.get("offset_y_el0_arcsec")),
+            pure_rotation_sign=pure_sign,
+        )
+    else:
+        beam = BeamConfig(
+            beam_id=beam_id,
+            model=beam_model,
+            az_offset_arcsec=float(beam_block.get("az_offset_arcsec", 0.0)),
+            el_offset_arcsec=float(beam_block.get("el_offset_arcsec", 0.0)),
+            rotation_mode=_normalize_rotation_mode(beam_block.get("rotation_mode", "none")),
+            reference_angle_deg=float(beam_block.get("reference_angle_deg", beam_block.get("reference_el_deg", 0.0))),
+            rotation_sign=float(beam_block.get("rotation_sign", 1.0)),
+            rotation_slope_deg_per_deg=(
+                float(beam_block.get("rotation_slope_deg_per_deg"))
+                if beam_block.get("rotation_slope_deg_per_deg") is not None else None
+            ),
+            dewar_angle_deg=float(beam_block.get("dewar_angle_deg", 0.0)),
+            beam_model_version=beam_model_version,
+        )
 
     frequency_axis = dict(block.get("frequency_axis", {}) or {})
     local_oscillators = dict(block.get("local_oscillators", {}) or {})
@@ -1785,6 +1920,8 @@ def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_co
 
 
 def _beam_rotation_angle_deg(boresight_el_deg, beam):
+    if str(getattr(beam, "model", "legacy") or "legacy") == PURE_ROTATION_MODEL:
+        return float(beam.pure_rotation_sign) * np.asarray(boresight_el_deg, dtype=float)
     if beam.rotation_mode == "none":
         return float(beam.dewar_angle_deg)
     if beam.rotation_mode == "elevation":
@@ -1797,10 +1934,26 @@ def _beam_rotation_angle_deg(boresight_el_deg, beam):
 
 
 def apply_beam_offset(boresight_az_deg, boresight_el_deg, beam):
-    dx0 = float(beam.az_offset_arcsec)
-    dy0 = float(beam.el_offset_arcsec)
     el = np.asarray(boresight_el_deg, dtype=float)
     az = np.asarray(boresight_az_deg, dtype=float)
+    if str(getattr(beam, "model", "legacy") or "legacy") == PURE_ROTATION_MODEL:
+        dx_rot, dy_rot, theta_deg = rotate_el0_offset(
+            float(beam.pure_rotation_offset_x_el0_arcsec),
+            float(beam.pure_rotation_offset_y_el0_arcsec),
+            el,
+            float(beam.pure_rotation_sign),
+        )
+        beam_az, beam_el = offset_xy_to_beam_azel(az, el, dx_rot, dy_rot)
+        return {
+            "beam_az_deg": np.asarray(beam_az, dtype=float),
+            "beam_el_deg": np.asarray(beam_el, dtype=float),
+            "beam_dx_arcsec": np.asarray(dx_rot, dtype=float),
+            "beam_dy_arcsec": np.asarray(dy_rot, dtype=float),
+            "beam_rot_deg": np.asarray(theta_deg, dtype=float),
+        }
+
+    dx0 = float(beam.az_offset_arcsec)
+    dy0 = float(beam.el_offset_arcsec)
     theta_deg = np.asarray(_beam_rotation_angle_deg(el, beam), dtype=float)
     if theta_deg.shape == ():
         theta_deg = np.full_like(el, float(theta_deg), dtype=float)
@@ -3075,6 +3228,7 @@ def main(argv=None):
                 str(args.azel_correction_apply),
             )
             beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
+            _print_beam_application_summary(stream, pointing["boresight_el"], beam_applied)
             pointing.update(beam_applied)
             if np.any(~np.isfinite(pointing["beam_az_deg"])) or np.any(~np.isfinite(pointing["beam_el_deg"])):
                 nbad = int(np.count_nonzero(~np.isfinite(pointing["beam_az_deg"])) + np.count_nonzero(~np.isfinite(pointing["beam_el_deg"])))
@@ -3169,15 +3323,17 @@ def main(argv=None):
 
             writer.add_history(
                 "stream_{}".format(stream.stream_index),
-                "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};rotation_mode={};beam_model_version={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={};radec_azel_source={};radec_azel_meaning={}".format(
+                "name={};fdnum={};ifnum={};plnum={};polariza={};beam_id={};beam_model={};rotation_mode={};beam_model_version={};beam_summary={};channel_slice={};nchan_full={};nchan_written={};obsfreq_fallback={};spec_time_basis={};spec_time_suffix={};spec_time_fallback={};radec_azel_source={};radec_azel_meaning={}".format(
                     stream.name,
                     stream.fdnum,
                     stream.ifnum,
                     stream.plnum,
                     stream.polariza,
                     stream.beam.beam_id,
+                    (stream.beam.model or "legacy"),
                     stream.beam.rotation_mode,
                     (stream.beam.beam_model_version or ""),
+                    _beam_summary_descriptor(stream.beam),
                     (stream.channel_slice_label or "full"),
                     (int(stream.wcs_full.nchan) if stream.wcs_full is not None else int(stream.wcs.nchan)),
                     int(stream.wcs.nchan),

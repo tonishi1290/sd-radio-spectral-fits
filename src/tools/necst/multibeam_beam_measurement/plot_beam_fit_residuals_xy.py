@@ -14,6 +14,10 @@ REQUIRED_COLUMNS = ["x_rel_arcsec", "y_rel_arcsec", "pred_x_arcsec", "pred_y_arc
 OPTIONAL_NUMERIC_COLUMNS = [
     "rep_el_deg",
     "rotation_sign",
+    "offset_x_el0_arcsec",
+    "offset_y_el0_arcsec",
+    "observed_template_x_arcsec",
+    "observed_template_y_arcsec",
     "reference_angle_deg",
     "dewar_angle_deg",
 ]
@@ -42,6 +46,9 @@ def _theta_from_row(row: pd.Series, rep_el_deg: float) -> Optional[float]:
     if not np.isfinite(rep_el_deg):
         return None
     sign = float(row["rotation_sign"]) if "rotation_sign" in row and np.isfinite(row["rotation_sign"]) else 0.0
+    if "offset_x_el0_arcsec" in row and "offset_y_el0_arcsec" in row:
+        if np.isfinite(row["offset_x_el0_arcsec"]) and np.isfinite(row["offset_y_el0_arcsec"]):
+            return float(sign * rep_el_deg)
     ref = float(row["reference_angle_deg"]) if "reference_angle_deg" in row and np.isfinite(row["reference_angle_deg"]) else 0.0
     dew = float(row["dewar_angle_deg"]) if "dewar_angle_deg" in row and np.isfinite(row["dewar_angle_deg"]) else 0.0
     return float(sign * (rep_el_deg - ref) + dew)
@@ -55,11 +62,30 @@ def _group_column(df: pd.DataFrame) -> str:
     return "__group__"
 
 
-def _estimate_template_by_group(df: pd.DataFrame, group_col: str) -> Dict[str, Tuple[float, float]]:
+def _estimate_template_by_group(df: pd.DataFrame, group_col: str) -> Tuple[Dict[str, Tuple[float, float]], str]:
     templates: Dict[str, Tuple[float, float]] = {}
+
+    if {"observed_template_x_arcsec", "observed_template_y_arcsec"}.issubset(df.columns):
+        for group_name, sub in df.groupby(group_col, sort=True):
+            x0 = pd.to_numeric(sub["observed_template_x_arcsec"], errors="coerce")
+            y0 = pd.to_numeric(sub["observed_template_y_arcsec"], errors="coerce")
+            if bool(np.isfinite(x0).any()) and bool(np.isfinite(y0).any()):
+                templates[str(group_name)] = (float(np.nanmean(x0)), float(np.nanmean(y0)))
+        if templates:
+            return templates, "observed_template_columns"
+
+    if {"offset_x_el0_arcsec", "offset_y_el0_arcsec"}.issubset(df.columns):
+        for group_name, sub in df.groupby(group_col, sort=True):
+            x0 = pd.to_numeric(sub["offset_x_el0_arcsec"], errors="coerce")
+            y0 = pd.to_numeric(sub["offset_y_el0_arcsec"], errors="coerce")
+            if bool(np.isfinite(x0).any()) and bool(np.isfinite(y0).any()):
+                templates[str(group_name)] = (float(-np.nanmean(x0)), float(-np.nanmean(y0)))
+        if templates:
+            return templates, "negated_physical_offsets"
+
     needed = {"rep_el_deg", "rotation_sign", "pred_x_arcsec", "pred_y_arcsec"}
     if not needed.issubset(df.columns):
-        return templates
+        return templates, "unavailable"
     for group_name, sub in df.groupby(group_col, sort=True):
         vals = []
         for _, row in sub.iterrows():
@@ -72,12 +98,16 @@ def _estimate_template_by_group(df: pd.DataFrame, group_col: str) -> Dict[str, T
         if vals:
             arr = np.asarray(vals, dtype=float)
             templates[str(group_name)] = (float(np.nanmean(arr[:, 0])), float(np.nanmean(arr[:, 1])))
-    return templates
+    return templates, "inverse_rotated_observed_predictions"
 
 
 def _label_text(group_name: str, sub: pd.DataFrame) -> str:
     lines = [str(group_name)]
-    if "stream_name" in sub.columns:
+    if "stream_names" in sub.columns:
+        streams = sorted({str(v) for v in sub["stream_names"].dropna().astype(str).tolist() if str(v)})
+        if len(streams) == 1 and streams[0] != str(group_name):
+            lines.append(streams[0])
+    elif "stream_name" in sub.columns:
         streams = sorted({str(v) for v in sub["stream_name"].dropna().astype(str).tolist()})
         if len(streams) == 1 and streams[0] != str(group_name):
             lines.append(streams[0])
@@ -99,10 +129,31 @@ def _choose_label_anchor(x_ref: float, y_ref: float, x_rel: np.ndarray, y_rel: n
     return float(x_rel[idx]), float(y_rel[idx])
 
 
-def _choose_label_position(anchor_x: float, anchor_y: float, span: float, *, radial_scale: float = 0.080, tangential_scale: float = 0.040, tangential_sign: Optional[float] = None) -> Tuple[float, float, str, str]:
+def _sector_index(anchor_x: float, anchor_y: float) -> int:
+    ang = (math.degrees(math.atan2(anchor_y, anchor_x)) + 360.0) % 360.0
+    return int(((ang + 22.5) % 360.0) // 45.0)
+
+
+def _sector_sort_key(anchor_x: float, anchor_y: float, sector: int) -> Tuple[float, float]:
     r = math.hypot(anchor_x, anchor_y)
-    base_offset = radial_scale * span
-    tangential_offset = tangential_scale * span
+    if sector in {0, 4}:
+        return (anchor_y, r)
+    if sector in {2, 6}:
+        return (anchor_x, r)
+    return (r, math.atan2(anchor_y, anchor_x))
+
+
+def _stagger_centered(index: int) -> int:
+    if index <= 0:
+        return 0
+    k = (index + 1) // 2
+    return k if (index % 2 == 1) else -k
+
+
+def _choose_label_position(anchor_x: float, anchor_y: float, span: float, *, radial_scale: float = 0.080, tangential_scale: float = 0.040, tangential_sign: Optional[float] = None, radial_extra_scale: float = 0.0, tangential_extra_scale: float = 0.0) -> Tuple[float, float, str, str]:
+    r = math.hypot(anchor_x, anchor_y)
+    base_offset = (radial_scale + radial_extra_scale) * span
+    tangential_offset = (tangential_scale + tangential_extra_scale) * span
     if r < 1e-9:
         ux, uy = 1.0, 0.0
     else:
@@ -116,6 +167,27 @@ def _choose_label_position(anchor_x: float, anchor_y: float, span: float, *, rad
     va = "bottom" if uy >= 0 else "top"
     return lx, ly, ha, va
 
+
+def _plan_label_positions(anchor_map: Dict[str, Tuple[float, float]], span: float) -> Dict[str, Dict[str, Tuple[float, float, str, str]]]:
+    sectors: Dict[int, list] = {i: [] for i in range(8)}
+    for key, (ax0, ay0) in anchor_map.items():
+        sectors[_sector_index(ax0, ay0)].append((key, ax0, ay0))
+
+    placements: Dict[str, Dict[str, Tuple[float, float, str, str]]] = {}
+    for sec, items in sectors.items():
+        if not items:
+            continue
+        items.sort(key=lambda t: _sector_sort_key(t[1], t[2], sec))
+        for i, (key, ax0, ay0) in enumerate(items):
+            st = _stagger_centered(i)
+            tangential_sign = 1.0 if st >= 0 else -1.0
+            tangential_extra = 0.022 * abs(st)
+            radial_extra = 0.020 * max(0, abs(st) - 1) + 0.018 * (i // 3)
+            placements[key] = {
+                'main': _choose_label_position(ax0, ay0, span, radial_scale=0.098, tangential_scale=0.058, tangential_sign=tangential_sign, radial_extra_scale=radial_extra, tangential_extra_scale=tangential_extra),
+                'ref': _choose_label_position(ax0, ay0, span, radial_scale=0.044, tangential_scale=0.026, tangential_sign=-tangential_sign, radial_extra_scale=0.010 * min(abs(st), 2), tangential_extra_scale=0.010 * abs(st)),
+            }
+    return placements
 
 def _friendly_title(title: Optional[str], output_path: Path) -> str:
     if title is None:
@@ -158,7 +230,7 @@ def write_beam_fit_xy_png(
     if connect_mode not in {"none", "line", "arrow"}:
         raise ValueError(f"unsupported connect_mode={connect_mode!r}")
 
-    templates = _estimate_template_by_group(df, group_col)
+    templates, template_source = _estimate_template_by_group(df, group_col)
 
     fig, ax = plt.subplots(figsize=(9.2, 9.2))
 
@@ -225,13 +297,32 @@ def write_beam_fit_xy_png(
 
     dummy_zero90 = None
 
-    for ig, (group_name, sub) in enumerate(df.groupby(group_col, sort=True)):
-        color = colors[ig % len(colors)]
-        sub = sub.copy()
+    label_anchor_map: Dict[str, Tuple[float, float]] = {}
+    grouped_subframes = []
+    for ig, (group_name, sub0) in enumerate(df.groupby(group_col, sort=True)):
+        sub = sub0.copy()
         if "rep_el_deg" in sub.columns:
             sub = sub.sort_values("rep_el_deg", kind="mergesort")
         else:
             sub = sub.sort_index()
+        x_rel = sub["x_rel_arcsec"].to_numpy(dtype=float)
+        y_rel = sub["y_rel_arcsec"].to_numpy(dtype=float)
+        key = str(group_name)
+        x_ref = np.nan
+        y_ref = np.nan
+        if key in templates and "rep_el_deg" in sub.columns and "rotation_sign" in sub.columns:
+            rep = sub.iloc[0]
+            theta0 = _theta_from_row(rep, 0.0)
+            if theta0 is not None:
+                x_ref, y_ref = _rotate_xy(templates[key][0], templates[key][1], theta0)
+        anchor_x, anchor_y = _choose_label_anchor(x_ref, y_ref, x_rel, y_rel)
+        label_anchor_map[key] = (anchor_x, anchor_y)
+        grouped_subframes.append((ig, group_name, sub, x_ref, y_ref, anchor_x, anchor_y))
+
+    label_positions = _plan_label_positions(label_anchor_map, span)
+
+    for ig, group_name, sub, x_ref, y_ref, anchor_x, anchor_y in grouped_subframes:
+        color = colors[ig % len(colors)]
 
         x_rel = sub["x_rel_arcsec"].to_numpy(dtype=float)
         y_rel = sub["y_rel_arcsec"].to_numpy(dtype=float)
@@ -239,8 +330,6 @@ def write_beam_fit_xy_png(
         y_pred = sub["pred_y_arcsec"].to_numpy(dtype=float)
 
         key = str(group_name)
-        x_ref = np.nan
-        y_ref = np.nan
 
         if key in templates and "rep_el_deg" in sub.columns and "rotation_sign" in sub.columns:
             rep = sub.iloc[0]
@@ -319,10 +408,8 @@ def write_beam_fit_xy_png(
                 zorder=6,
             )
 
-        anchor_x, anchor_y = _choose_label_anchor(x_ref, y_ref, x_rel, y_rel)
-        tangential_sign = 1.0 if (ig % 2 == 0) else -1.0
-        lx, ly, ha, va = _choose_label_position(anchor_x, anchor_y, span, radial_scale=0.095, tangential_scale=0.055, tangential_sign=tangential_sign)
-        ax.annotate(
+        lx, ly, ha, va = label_positions.get(key, {}).get("main", _choose_label_position(anchor_x, anchor_y, span, radial_scale=0.098, tangential_scale=0.058))
+        main_ann = ax.annotate(
             _label_text(key, sub),
             xy=(anchor_x, anchor_y),
             xytext=(lx, ly),
@@ -336,9 +423,9 @@ def write_beam_fit_xy_png(
             zorder=7,
         )
         if np.isfinite(x_ref) and np.isfinite(y_ref):
-            rx, ry, rha, rva = _choose_label_position(x_ref, y_ref, span, radial_scale=0.040, tangential_scale=0.030, tangential_sign=-tangential_sign)
-            ax.annotate(
-                "ref (El=0)",
+            rx, ry, rha, rva = label_positions.get(key, {}).get("ref", _choose_label_position(x_ref, y_ref, span, radial_scale=0.044, tangential_scale=0.026))
+            ref_ann = ax.annotate(
+                "ref_obs (El=0)",
                 xy=(x_ref, y_ref),
                 xytext=(rx, ry),
                 textcoords="data",
@@ -355,23 +442,49 @@ def write_beam_fit_xy_png(
     ax.axhline(0.0, color="0.55", linewidth=0.8, alpha=0.6, zorder=0)
     ax.axvline(0.0, color="0.55", linewidth=0.8, alpha=0.6, zorder=0)
     ax.set_aspect("equal", adjustable="box")
-    ax.set_xlabel("x [arcsec]")
-    ax.set_ylabel("y [arcsec]")
+    ax.set_xlabel("x [arcsec]  (observed-space: fitted center relative to center beam)")
+    ax.set_ylabel("y [arcsec]  (observed-space: fitted center relative to center beam)")
     ax.set_title(_friendly_title(title, Path(output_path)))
     ax.grid(True, alpha=0.22)
+
+
+    coord_note_lines = [
+        "plot coordinate system: observed-space",
+        "circles / x / stars / dotted tracks = fitted-center relative coordinates",
+        "converter-space (physical boresight→beam) is not drawn here",
+    ]
+    if template_source == "observed_template_columns":
+        coord_note_lines.append("template source: observed_template_x/y_arcsec columns")
+    elif template_source == "negated_physical_offsets":
+        coord_note_lines.append("template source: -offset_x/y_el0_arcsec (physical→observed conversion)")
+    elif template_source == "inverse_rotated_observed_predictions":
+        coord_note_lines.append("template source: inverse-rotated pred_x/pred_y in observed-space")
+    else:
+        coord_note_lines.append("template source: unavailable")
+    ax.text(
+        0.015,
+        0.015,
+        "\n".join(coord_note_lines),
+        transform=ax.transAxes,
+        fontsize=7.8,
+        ha="left",
+        va="bottom",
+        bbox=dict(boxstyle="round,pad=0.20", facecolor="white", edgecolor="0.55", alpha=0.88, linewidth=0.6),
+        zorder=10,
+    )
 
     legend_handles = [
         mlines.Line2D([], [], color="0.45", marker="o", linestyle="-", markersize=6, label="measured beam centers"),
         mlines.Line2D([], [], color="0.45", marker="x", linestyle="--", markersize=6, label="fitted model at sampled El"),
         mlines.Line2D([], [], color="0.25", marker="v", linestyle="None", markersize=7, label="lower-El end of measured track"),
         mlines.Line2D([], [], color="0.25", marker=None, linestyle="-", linewidth=1.0, label="arrow shows increasing El"),
-        mlines.Line2D([], [], color="0.25", marker="*", linestyle="None", markersize=10, label="reference position / model point at El = 0°"),
+        mlines.Line2D([], [], color="0.25", marker="*", linestyle="None", markersize=10, label="reference observed-space position / model point at El = 0°"),
     ]
     if dummy_zero90 is not None:
         legend_handles.append(
-            mlines.Line2D([], [], color="0.45", linestyle=":", linewidth=1.1, alpha=0.35, label="thin model track for El = 0° to 90°")
+            mlines.Line2D([], [], color="0.45", linestyle=":", linewidth=1.1, alpha=0.35, label="thin observed-space model track for El = 0° to 90°")
         )
-    ax.legend(handles=legend_handles, loc="best", fontsize=8)
+    ax.legend(handles=legend_handles, loc="upper right", fontsize=8, framealpha=0.92)
 
 
     fig.tight_layout()
