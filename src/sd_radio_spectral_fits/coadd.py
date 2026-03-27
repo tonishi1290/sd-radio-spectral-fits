@@ -35,6 +35,25 @@ from .tempscale import (
 )
 
 
+BSL_METADATA_COLUMNS = [
+    "BSL_DONE",
+    "BSL_APPLIED",
+    "BSL_STAGE",
+    "BSL_POLY",
+    "BSL_WINF",
+    "BSL_RMS",
+    "BSL_STAT",
+    "BSL_NUSED",
+    "BSL_COEF",
+    "BSL_SCALE",
+]
+
+
+def _purge_bsl_metadata_in_row(row: dict) -> dict:
+    for col in BSL_METADATA_COLUMNS:
+        row.pop(col, None)
+    return row
+
 # -----------------------------------------------------------------------------
 # QC Presets & Constants
 # -----------------------------------------------------------------------------
@@ -814,9 +833,15 @@ def run_velocity_coadd(
     baseline_poly: int = 0,
     baseline_iter_max: int = 0,
     baseline_iter_sigma: float = 3.0,
+    post_baseline_mode: Optional[str] = None,
+    post_baseline_vwin: Union[str, List[str], None] = "inherit",
+    post_baseline_poly: Union[str, int] = "inherit",
+    post_baseline_iter_max: Union[str, int] = "inherit",
+    post_baseline_iter_sigma: Union[str, float] = "inherit",
     rms_vwin: Union[str, List[str], None] = None,       # [MODIFIED]
     rms_poly: int = 1,   # [MODIFIED] 指定がない場合のデフォルトを 1 に変更
     rms_bin: int = 1,
+    weight_zero_policy: str = "error",
     coadd_qc: Optional[str] = None,
     line_vwin: Union[str, List[str], None] = None,      # [MODIFIED]
     block_size: int = 0,
@@ -843,6 +868,16 @@ def run_velocity_coadd(
 
     # [ADDED] 文字列が直接渡された場合は自動的にリスト化する（利便性向上）
     if isinstance(baseline_vwin, str): baseline_vwin = [baseline_vwin]
+    post_baseline_mode_norm = None if post_baseline_mode is None else str(post_baseline_mode).strip().lower()
+    if post_baseline_mode_norm in {"", "none"}:
+        post_baseline_mode_norm = None
+    if post_baseline_mode_norm not in {None, "inherit_all"}:
+        raise ValueError("post_baseline_mode must be None or 'inherit_all'.")
+    if isinstance(post_baseline_vwin, str):
+        if str(post_baseline_vwin).strip().lower() != "inherit":
+            post_baseline_vwin = [post_baseline_vwin]
+        else:
+            post_baseline_vwin = "inherit"
     if isinstance(rms_vwin, str): rms_vwin = [rms_vwin]
     if isinstance(line_vwin, str): line_vwin = [line_vwin]
     
@@ -853,6 +888,10 @@ def run_velocity_coadd(
             "Use 'baseline_vwin' for baseline subtraction and weighting, or "
             "'rms_vwin' for RMS weighting without subtraction."
         )
+
+    weight_zero_policy = str(weight_zero_policy).strip().lower()
+    if weight_zero_policy not in {"error", "drop", "impute_median"}:
+        raise ValueError("weight_zero_policy must be 'error', 'drop', or 'impute_median'.")
 
     # [ADDED] Mode Validation
     valid_modes = ["uniform", "rms", "rms_weight"]
@@ -1060,12 +1099,59 @@ def run_velocity_coadd(
     baseline_windows_parsed = parse_windows(baseline_vwin) if baseline_vwin else []
     rms_windows_parsed = parse_windows(rms_vwin) if rms_vwin else []
     line_windows_parsed = parse_windows(line_vwin) if line_vwin else []
+
+    if post_baseline_mode_norm == "inherit_all":
+        if not baseline_windows_parsed:
+            raise ValueError(
+                "post_baseline_mode='inherit_all' requires baseline_vwin to be set, "
+                "because there is no pre-coadd baseline configuration to inherit."
+            )
+        # inherit_all provides defaults for post-baseline parameters, but explicit
+        # post_baseline_vwin still overrides them. In particular, post_baseline_vwin=None
+        # must disable post-baseline explicitly.
+        if post_baseline_vwin is None:
+            post_baseline_windows_parsed = []
+        elif post_baseline_vwin == "inherit":
+            post_baseline_windows_parsed = list(baseline_windows_parsed)
+        else:
+            post_baseline_windows_parsed = parse_windows(post_baseline_vwin) if post_baseline_vwin else []
+    elif post_baseline_vwin == "inherit":
+        post_baseline_windows_parsed = list(baseline_windows_parsed)
+    else:
+        post_baseline_windows_parsed = parse_windows(post_baseline_vwin) if post_baseline_vwin else []
     
     if line_windows_parsed:
         if baseline_windows_parsed:
             baseline_windows_parsed = subtract_windows(baseline_windows_parsed, line_windows_parsed)
         if rms_windows_parsed:
             rms_windows_parsed = subtract_windows(rms_windows_parsed, line_windows_parsed)
+        if post_baseline_windows_parsed:
+            post_baseline_windows_parsed = subtract_windows(post_baseline_windows_parsed, line_windows_parsed)
+
+    def _inherit_or_cast_int(value, fallback: int) -> int:
+        if isinstance(value, str) and value.strip().lower() == "inherit":
+            return int(fallback)
+        return int(value)
+
+    def _inherit_or_cast_float(value, fallback: float) -> float:
+        if isinstance(value, str) and value.strip().lower() == "inherit":
+            return float(fallback)
+        return float(value)
+
+    if post_baseline_mode_norm == "inherit_all":
+        resolved_post_poly = int(baseline_poly)
+        resolved_post_iter_max = int(baseline_iter_max)
+        resolved_post_iter_sigma = float(baseline_iter_sigma)
+        if not (isinstance(post_baseline_poly, str) and post_baseline_poly.strip().lower() == "inherit"):
+            resolved_post_poly = int(post_baseline_poly)
+        if not (isinstance(post_baseline_iter_max, str) and post_baseline_iter_max.strip().lower() == "inherit"):
+            resolved_post_iter_max = int(post_baseline_iter_max)
+        if not (isinstance(post_baseline_iter_sigma, str) and post_baseline_iter_sigma.strip().lower() == "inherit"):
+            resolved_post_iter_sigma = float(post_baseline_iter_sigma)
+    else:
+        resolved_post_poly = _inherit_or_cast_int(post_baseline_poly, int(baseline_poly))
+        resolved_post_iter_max = _inherit_or_cast_int(post_baseline_iter_max, int(baseline_iter_max))
+        resolved_post_iter_sigma = _inherit_or_cast_float(post_baseline_iter_sigma, float(baseline_iter_sigma))
 
     use_qc = coadd_qc is not None
     qc_config: dict = {}
@@ -1225,18 +1311,31 @@ def run_velocity_coadd(
                 processed_specs.append(y_for_coadd)
 
             if (rms_windows_parsed or baseline_windows_parsed) and is_rms_mode:
-                valid_weights = weights[weights > 0]
-                if len(valid_weights) > 0:
-                    typical_weight = float(np.median(valid_weights))
-                    rescue_count = 0
-                    for i in range(n_rows_local):
-                        if weights[i] <= 0 and np.any(np.isfinite(processed_specs[i])):
-                            weights[i] = typical_weight
-                            rescue_count += 1
-                    
-                    if rescue_count > 0:
-                        print(f"Warning: {rescue_count} spectra in Group {gid} had valid data but 0 weight. "
-                              f"Imputed median weight ({typical_weight:.3g}) to prevent data loss.")
+                invalid_weight_mask = np.array([
+                    (weights[i] <= 0) and np.any(np.isfinite(processed_specs[i]))
+                    for i in range(n_rows_local)
+                ], dtype=bool)
+                invalid_count = int(np.count_nonzero(invalid_weight_mask))
+                if invalid_count > 0:
+                    if weight_zero_policy == "error":
+                        raise ValueError(
+                            f"Group {gid} contains {invalid_count} spectra with valid data but non-positive RMS weight. "
+                            "Use weight_zero_policy='drop' to discard them or 'impute_median' to force a replacement weight."
+                        )
+                    elif weight_zero_policy == "impute_median":
+                        valid_weights = weights[weights > 0]
+                        if len(valid_weights) == 0:
+                            raise ValueError(
+                                f"Group {gid} has no positive RMS-derived weights, so impute_median cannot be applied."
+                            )
+                        typical_weight = float(np.median(valid_weights))
+                        for i in range(n_rows_local):
+                            if invalid_weight_mask[i]:
+                                weights[i] = typical_weight
+                        print(f"Warning: {invalid_count} spectra in Group {gid} had valid data but 0 weight. "
+                              f"Imputed median weight ({typical_weight:.3g}) as requested by weight_zero_policy='impute_median'.")
+                    elif weight_zero_policy == "drop":
+                        print(f"Warning: Dropping {invalid_count} spectra in Group {gid} because weight_zero_policy='drop'.")
 
             # Weighted Sum
             sum_spec = np.zeros(n_tgt, dtype=float)
@@ -1328,21 +1427,30 @@ def run_velocity_coadd(
                 
             mode_label = f"{mode_label}+TRout"
 
-        # [MODIFIED] 合算後（Post-Coadd）のベースライン再フィットと純粋なRMS取得
-        if baseline_windows_parsed and not use_qc:
-            _, base_post, info_post = fit_polynomial_baseline(
+        do_post_baseline = bool(post_baseline_windows_parsed) and (not use_qc)
+        post_bsl_coeff = None
+        post_bsl_nused = 0
+        post_bsl_winf = ""
+        if do_post_baseline:
+            post_bsl_coeff, base_post, info_post = fit_polynomial_baseline(
                 v_tgt, out_spec,
-                base_windows=baseline_windows_parsed,
-                poly_order=int(baseline_poly),
-                iter_max=int(baseline_iter_max),
-                iter_sigma=float(baseline_iter_sigma)
+                base_windows=post_baseline_windows_parsed,
+                poly_order=int(resolved_post_poly),
+                iter_max=int(resolved_post_iter_max),
+                iter_sigma=float(resolved_post_iter_sigma)
             )
             out_spec = out_spec - base_post
             final_grp_rms = info_post.get("std", np.nan)
+            post_bsl_nused = int(np.count_nonzero(info_post.get("mask", np.zeros_like(out_spec, dtype=bool))))
+            if isinstance(post_baseline_vwin, list):
+                post_bsl_winf = ";".join(post_baseline_vwin)
+            else:
+                post_bsl_winf = ";".join(baseline_vwin) if baseline_vwin else ""
 
         out_specs.append(out_spec)
 
         row = table_all.iloc[rep].to_dict()
+        row = _purge_bsl_metadata_in_row(row)
         if pos_col in row: row[pos_col] = int(row[pos_col])
         
         row["TEMPSCAL"] = scale_label
@@ -1350,19 +1458,40 @@ def run_velocity_coadd(
         row["N_IN"] = int(len(idxs))
         row["N_USED"] = int(n_used)
         row["WEIGHT_MODE"] = mode_label
-        
-        # [MODIFIED] ベースライン情報を各行に記録
-        if baseline_windows_parsed and not use_qc:
-            row["BSL_DONE"] = True
-            row["BSL_POLY"] = int(baseline_poly)
-            row["BSL_WINF"] = ";".join(baseline_vwin) if baseline_vwin else ""
-            row["BSL_RMS"] = float(final_grp_rms)
+
+        row["WGT_MODE"] = "inverse_variance" if is_rms_mode else "uniform"
+        if baseline_windows_parsed:
+            row["WGT_SRC"] = "baseline_vwin" if is_rms_mode else "uniform"
+            row["WGT_VWIN"] = ";".join(baseline_vwin) if baseline_vwin else ""
+            row["WGT_POLY"] = int(baseline_poly)
+        elif rms_windows_parsed:
+            row["WGT_SRC"] = "rms_vwin"
+            row["WGT_VWIN"] = ";".join(rms_vwin) if rms_vwin else ""
+            row["WGT_POLY"] = int(rms_poly)
+        elif use_header_rms:
+            row["WGT_SRC"] = "input_bsl_rms"
+            row["WGT_VWIN"] = ""
+            row["WGT_POLY"] = 0
         else:
-            # 実行していない場合、元データにBSL情報が残っていてもクリアする（不整合防止）
-            row["BSL_DONE"] = False
-            row["BSL_POLY"] = 0
-            row["BSL_WINF"] = ""
-            row["BSL_RMS"] = np.nan
+            row["WGT_SRC"] = "uniform"
+            row["WGT_VWIN"] = ""
+            row["WGT_POLY"] = 0
+        row["WGT_BIN"] = int(rms_bin) if is_rms_mode else 1
+        row["WGT_STAT"] = "std" if is_rms_mode else ""
+        row["WGT_INPUT_SUB"] = bool(baseline_windows_parsed)
+        row["WGT_ZERO_POLICY"] = str(weight_zero_policy) if is_rms_mode else ""
+        
+        if do_post_baseline:
+            row["BSL_DONE"] = True
+            row["BSL_APPLIED"] = True
+            row["BSL_STAGE"] = "post_coadd"
+            row["BSL_POLY"] = int(resolved_post_poly)
+            row["BSL_WINF"] = post_bsl_winf
+            row["BSL_RMS"] = float(final_grp_rms)
+            row["BSL_STAT"] = "std"
+            row["BSL_NUSED"] = int(post_bsl_nused)
+            row["BSL_COEF"] = None if post_bsl_coeff is None else np.asarray(post_bsl_coeff, dtype=float)
+            row["BSL_SCALE"] = scale_label
             
         out_rows.append(row)
 
@@ -1460,8 +1589,15 @@ def run_velocity_coadd(
         qc_config=qc_config if use_qc else None,
         # [MODIFIED] rmsの評価に使った次数とビニング幅も追加
         rms=dict(windows=rms_windows_parsed, poly=int(rms_poly), bin=int(rms_bin)),
-        # [ADDED] ベースライン引きに関するパラメータを追加
-        baseline=dict(windows=baseline_windows_parsed, poly=int(baseline_poly))
+        baseline=dict(windows=baseline_windows_parsed, poly=int(baseline_poly)),
+        post_baseline=dict(
+            mode=post_baseline_mode_norm,
+            windows=post_baseline_windows_parsed,
+            poly=int(resolved_post_poly),
+            iter_max=int(resolved_post_iter_max),
+            iter_sigma=float(resolved_post_iter_sigma),
+        ),
+        weight_zero_policy=str(weight_zero_policy),
     )
     
     if mixed_groups_auto:

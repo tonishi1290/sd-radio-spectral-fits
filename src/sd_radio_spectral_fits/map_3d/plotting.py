@@ -60,6 +60,14 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 from spectral_cube import SpectralCube
 
 try:
+    from .otf_bundle import OTFBundle
+except Exception:  # pragma: no cover - optional when used as a standalone script
+    try:
+        from otf_bundle import OTFBundle  # type: ignore
+    except Exception:  # pragma: no cover - environment dependent
+        OTFBundle = None  # type: ignore
+
+try:
     from spectral_cube.lower_dimensional_structures import Projection
 except Exception:  # pragma: no cover - environment dependent
     Projection = None
@@ -377,6 +385,135 @@ def _open_hdul_if_needed(source: SourceLike) -> Tuple[Optional[fits.HDUList], bo
     return None, False
 
 
+def _is_otf_bundle(source: Any) -> bool:
+    return OTFBundle is not None and isinstance(source, OTFBundle)
+
+
+def _bundle_ext_name(ext: Optional[Union[int, str]]) -> str:
+    if ext is None:
+        return "DATA"
+    if isinstance(ext, int):
+        if ext == 0:
+            return "DATA"
+        raise ValueError(f"OTFBundle does not support integer ext={ext!r} except 0 for primary/data.")
+    return str(ext).strip()
+
+
+def _bundle_find_image_ext_key(bundle: Any, ext: str) -> Optional[str]:
+    target = str(ext).strip().upper()
+    for key in bundle.image_ext.keys():
+        if str(key).strip().upper() == target:
+            return key
+    return None
+
+
+def _bundle_spectral_axis_unit(header: fits.Header) -> Optional[u.UnitBase]:
+    for key in ("CUNIT3", "CUNIT1"):
+        value = header.get(key)
+        if value not in (None, ""):
+            unit = _as_unit(value)
+            if unit is not None:
+                return unit
+    return None
+
+
+def _bundle_unit_for_ext(bundle: Any, ext_name: str, arr: np.ndarray) -> Optional[u.UnitBase]:
+    ext_upper = str(ext_name).strip().upper()
+    data_unit = _as_unit(getattr(bundle, "unit", None)) or _get_bunit_from_header(bundle.header)
+    spec_unit = _bundle_spectral_axis_unit(bundle.header)
+
+    if ext_upper in {"DATA", "PRIMARY", "CUBE"}:
+        return data_unit
+    if ext_upper in {"VARIANCE"}:
+        return None if data_unit is None else data_unit * data_unit
+    if ext_upper in {"RMS", "BASE_RMS", "MOSAIC_RMS_OBS", "MOSAIC_RMS", "RMS_MAP_EMP", "RMS_MAP_INPUT_0", "TSYS"}:
+        return data_unit
+    if ext_upper in {"MOMENT0", "MOM0_BASESUP", "MOM0_LINECAND", "MOM0_3D_MASK"}:
+        return None if (data_unit is None or spec_unit is None) else data_unit * spec_unit
+    if ext_upper in {"MOMENT1"}:
+        return spec_unit
+    if ext_upper in {"MOMENT2"}:
+        return None if spec_unit is None else spec_unit * spec_unit
+    if ext_upper in {
+        "WEIGHT", "WEIGHT_SUM", "HIT", "NSAMP", "WSUM", "WABS", "CANCEL", "WREL",
+        "MASK", "VALID_MASK", "SUPPORT_MASK", "VALID_MASK_AND", "VALID_MASK_UNION",
+        "LINEFREE", "LINEFREE_USED", "LINEFREE_PRIOR", "SIGNAL_MASK_USED",
+        "BASE_FLG", "MASK3D", "LINECAND3D", "BASESUP3D",
+        "MOSAIC_GAIN", "MOSAIC_TRUST", "MOSAIC_WEIGHT", "MOSAIC_INFO",
+    }:
+        return None
+    if arr.ndim == 3:
+        return data_unit
+    return None
+
+
+def _bundle_header_for_array(bundle: Any, arr: np.ndarray, *, unit: Optional[u.UnitBase]) -> fits.Header:
+    if arr.ndim == 2:
+        hdr = _drop_nonspatial_wcs_keywords(bundle.header)
+    else:
+        hdr = _copy_header(bundle.header)
+    if unit is not None:
+        try:
+            hdr["BUNIT"] = unit.to_string()
+        except Exception:
+            pass
+    elif "BUNIT" in hdr:
+        del hdr["BUNIT"]
+    return hdr
+
+
+def _bundle_lookup_array(
+    bundle: Any,
+    ext: Optional[Union[int, str]] = None,
+) -> Tuple[np.ndarray, fits.Header, Optional[u.UnitBase], Dict[str, Any]]:
+    ext_name = _bundle_ext_name(ext)
+    ext_upper = ext_name.upper()
+
+    if ext_upper in {"DATA", "PRIMARY", "CUBE"}:
+        arr = np.asarray(bundle.data)
+    elif ext_upper == "VARIANCE":
+        if bundle.variance is None:
+            raise ValueError("OTFBundle has no VARIANCE cube.")
+        arr = np.asarray(bundle.variance)
+    elif ext_upper == "VALID_MASK":
+        if bundle.valid_mask is not None:
+            arr = np.asarray(bundle.valid_mask)
+        else:
+            key = _bundle_find_image_ext_key(bundle, ext_upper)
+            if key is None:
+                raise ValueError("OTFBundle has no VALID_MASK array.")
+            arr = np.asarray(bundle.image_ext[key])
+    elif ext_upper == "SUPPORT_MASK":
+        if bundle.support_mask is not None:
+            arr = np.asarray(bundle.support_mask)
+        else:
+            key = _bundle_find_image_ext_key(bundle, ext_upper)
+            if key is None:
+                raise ValueError("OTFBundle has no SUPPORT_MASK array.")
+            arr = np.asarray(bundle.image_ext[key])
+    else:
+        key = _bundle_find_image_ext_key(bundle, ext_upper)
+        if key is None:
+            raise ValueError(f"Extension '{ext_name}' was not found in the OTFBundle.")
+        arr = np.asarray(bundle.image_ext[key])
+        ext_name = str(key)
+
+    unit = _bundle_unit_for_ext(bundle, ext_name, arr)
+    header = _bundle_header_for_array(bundle, arr, unit=unit)
+    meta = {
+        "source_kind": "otf_bundle",
+        "ext": ext_name,
+        "family_label": getattr(bundle, "family_label", None),
+    }
+    if isinstance(getattr(bundle, "meta", None), dict):
+        baseline_viewer_mode = bundle.meta.get("baseline_viewer_mode")
+        if baseline_viewer_mode is not None:
+            meta["baseline_viewer_mode"] = baseline_viewer_mode
+        baseline_viewer_mask_key = bundle.meta.get("baseline_viewer_mask_key")
+        if baseline_viewer_mask_key is not None:
+            meta["baseline_viewer_mask_key"] = baseline_viewer_mask_key
+    return arr, header, unit, meta
+
 
 def _projection_to_map2d(obj: Any, meta: Optional[Dict[str, Any]] = None) -> Map2D:
     header = None
@@ -411,9 +548,19 @@ def resolve_map_input(
     header: Optional[fits.Header] = None,
     ext: Optional[Union[int, str]] = None,
 ) -> Map2D:
-    """Resolve 2D input from file, HDU, (header, data), Projection, or Map2D."""
+    """Resolve 2D input from file, HDU, (header, data), Projection, Map2D, or OTFBundle."""
     if isinstance(source, Map2D):
         return source
+
+    if _is_otf_bundle(source):
+        arr, hdr, unit, meta = _bundle_lookup_array(source, ext=ext)
+        arr = np.asarray(arr, dtype=float)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"Selected OTFBundle source is not 2D (ext={meta.get('ext')!r}, ndim={arr.ndim})."
+            )
+        hdr2d = _drop_nonspatial_wcs_keywords(hdr)
+        return Map2D(data=arr, header=hdr2d, wcs=WCS(hdr2d).celestial, unit=unit, meta=meta)
 
     if data is not None:
         if header is None:
@@ -470,7 +617,7 @@ def resolve_map_input(
 
     raise TypeError(
         "Could not interpret source as a 2D map. Supported inputs are file path, HDUList, "
-        "2D HDU, (header, data), Projection-like object, or Map2D."
+        "2D HDU, (header, data), Projection-like object, Map2D, or OTFBundle."
     )
 
 
@@ -504,7 +651,7 @@ def resolve_cube_input(
     *,
     ext: Optional[Union[int, str]] = None,
 ) -> CubeInput:
-    """Resolve a 3D cube from file, HDU, (header, data), or SpectralCube."""
+    """Resolve a 3D cube from file, HDU, (header, data), SpectralCube, or OTFBundle."""
     if isinstance(source, SpectralCube):
         header = getattr(source, "header", None)
         if header is None:
@@ -521,6 +668,16 @@ def resolve_cube_input(
         unit = _get_bunit_from_header(hdr)
         cube = _make_cube_from_header_and_data(hdr, arr, unit=unit)
         return CubeInput(cube=cube, header=hdr, unit=unit, meta={"source_kind": "header_data"})
+
+    if _is_otf_bundle(source):
+        arr, hdr, unit, meta = _bundle_lookup_array(source, ext=ext)
+        arr = np.asarray(arr, dtype=float)
+        if arr.ndim != 3:
+            raise ValueError(
+                f"Selected OTFBundle source is not 3D (ext={meta.get('ext')!r}, ndim={arr.ndim})."
+            )
+        cube = _make_cube_from_header_and_data(hdr, arr, unit=unit)
+        return CubeInput(cube=cube, header=hdr, unit=unit, meta=meta)
 
     if isinstance(source, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)):
         arr = np.asarray(source.data, dtype=float)
@@ -553,7 +710,7 @@ def resolve_cube_input(
 
     raise TypeError(
         "Could not interpret source as a 3D cube. Supported inputs are file path, HDUList, "
-        "3D HDU, (header, data), or SpectralCube."
+        "3D HDU, (header, data), SpectralCube, or OTFBundle."
     )
 
 
@@ -1057,9 +1214,13 @@ def _mask_from_associated_hdu(
     *,
     ext: Union[int, str],
 ) -> np.ndarray:
+    if _is_otf_bundle(source):
+        arr, _hdr, _unit, meta = _bundle_lookup_array(source, ext=ext)
+        return np.asarray(arr)
+
     hdul, close_after = _open_hdul_if_needed(source)
     if hdul is None:
-        raise ValueError(f"Associated mask HDU '{ext}' requires source to be a FITS path or HDUList.")
+        raise ValueError(f"Associated mask HDU '{ext}' requires source to be a FITS path, HDUList, or OTFBundle.")
     try:
         if not _has_ext(hdul, ext):
             raise ValueError(f"Extension '{ext}' was not found in the FITS source.")
@@ -1089,10 +1250,21 @@ def _select_default_provisional_mask_mode(
         BASESUP3D and LINEFREE describe baseline / line-free regions, so their complement
         is used as a provisional signal region when LINECAND3D is unavailable.
     """
+    if _is_otf_bundle(source):
+        if _bundle_find_image_ext_key(source, linecand_ext) is not None:
+            return "linecand3d"
+        if _bundle_find_image_ext_key(source, basesup_ext) is not None:
+            return "basesup3d"
+        if _bundle_find_image_ext_key(source, linefree_ext) is not None:
+            return "linefree_complement"
+        raise ValueError(
+            f"No provisional-mask candidate found in the OTFBundle ({linecand_ext} / {basesup_ext} / {linefree_ext})."
+        )
+
     hdul, close_after = _open_hdul_if_needed(source)
     if hdul is None:
         raise ValueError(
-            "Automatic provisional moment requires source to be a FITS path or HDUList so that "
+            "Automatic provisional moment requires source to be a FITS path, HDUList, or OTFBundle so that "
             "LINECAND3D / BASESUP3D / LINEFREE can be searched."
         )
     try:

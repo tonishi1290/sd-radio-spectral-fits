@@ -291,6 +291,63 @@ pl.plot_rgb(rgb)
 
 ---
 
+## 3.8 `OTFBundle` を使う
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+pl.quicklook(bundle, ext='MOMENT0')
+```
+
+ここでのポイント:
+
+- Python 上の `OTFBundle` を **そのまま** source として渡せます
+- 2D product をそのまま見るときは `ext='MOMENT0'` のように指定します
+- `ext` は `MOMENT0`, `RMS`, `HIT`, `MOSAIC_WEIGHT` など bundle 内の image ext 名を使えます
+
+---
+
+## 3.9 baseline viewer bundle を使う
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal', fill_value=0.0)
+pl.quicklook(viewer, mode='moment0', vel_range=(20, 40))
+```
+
+重要:
+
+- viewer bundle は特別な型ではなく、**通常の `OTFBundle`** です
+- ただし `viewer.data` は 3D cube なので、2D 表示したいときは `mode='moment0'` などで 2D 化してから描きます
+- `plot_map(viewer)` のように 3D bundle をそのまま 2D 扱いするのではありません
+
+---
+
+## 3.10 `HDUList` を使う
+
+```python
+from astropy.io import fits
+
+hdul = fits.open('products.fits')
+pl.quicklook(hdul, ext='MOMENT0')
+```
+
+`HDU` だけでなく `HDUList` もそのまま渡せます。
+
+---
+
+## 3.11 OTF bundle FITS を path のまま使う
+
+```python
+pl.quicklook('otf_bundle.fits', ext='MOMENT0')
+```
+
+ディスク上の OTF bundle FITS を使うだけなら、必ずしも `read_otf_bundle()` で Python object に直さなくても構いません。
+
+- path / `HDUList` / `OTFBundle` のどれを使うかは、手元の処理フローに合わせて選べます
+- ただし **viewer bundle を一度 Python 上で作ってから描きたい**ときは、`OTFBundle` object を直接渡せる方が自然です
+
+---
+
 # 4. 3D cube から 2D を作る基本例
 
 ## 4.1 全 channel の moment0
@@ -418,6 +475,85 @@ pl.quicklook('products.fits', ext='MOMENT0', mode='identity')
 
 ---
 
+## 5.4 OTF bundle の `MOMENT0` extension をそのまま描く
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+pl.quicklook(bundle, ext='MOMENT0')
+```
+
+これは bundle の 2D extension を **2D passthrough** でそのまま表示する例です。
+
+---
+
+## 5.5 OTF bundle の `RMS` や `HIT` を確認する
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+pl.quicklook(bundle, ext='RMS', cmap='magma')
+pl.quicklook(bundle, ext='HIT', cmap='viridis')
+```
+
+観測の被覆やノイズの確認に便利です。
+
+---
+
+## 5.6 `LINEFREE_USED` や `SIGNAL_MASK_USED` は 2D map ではない
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+print(bundle.image_ext['LINEFREE_USED'].shape)
+print(bundle.image_ext['SIGNAL_MASK_USED'].shape)
+```
+
+ここで重要なのは、現行仕様では
+
+- `LINEFREE`, `LINEFREE_USED`
+- `SIGNAL_MASK_USED`
+
+は **global な 1D channel mask** であり、2D map でも 3D voxel mask でもないという点です。
+
+したがって、次のような使い方はしません。
+
+```python
+# これは意図に合わない
+# pl.quicklook(bundle, ext='LINEFREE_USED')
+```
+
+代わりに、viewer bundle を作ってから 3D cube を 2D 化して確認します。
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='linefree', fill_value=0.0)
+pl.quicklook(viewer, mode='moment0', vel_range=(20, 40))
+```
+
+---
+
+## 5.7 `identity` を OTF bundle の 2D ext に対して明示する
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+pl.quicklook(bundle, ext='MOMENT0', mode='identity')
+```
+
+2D ext をそのまま描いていることを、呼び出し側で明示したいときの書き方です。
+
+---
+
+## 5.8 `HDUList` + `ext` で OTF bundle 風 products を扱う
+
+```python
+from astropy.io import fits
+
+hdul = fits.open('otf_bundle.fits')
+pl.quicklook(hdul, ext='MOMENT0')
+```
+
+FITS 化された products を読むだけなら、この書き方でも十分です。
+
+---
+
 # 6. provisional / final moment の例
 
 ## 6.1 provisional moment を自動選択で作る
@@ -465,6 +601,49 @@ m = pl.make_final_moment(
 )
 pl.plot_map(m)
 ```
+
+---
+
+## 6.5 provisional moment を OTF bundle から作る
+
+```python
+bundle = pl.read_otf_bundle('cube_with_masks_bundle.fits')
+m = pl.make_provisional_moment(bundle)
+pl.plot_map(m, title='provisional moment from bundle')
+```
+
+`prefer='auto'` の探索順は、FITS path のときと同じです。
+
+---
+
+## 6.6 final moment を OTF bundle から作る
+
+```python
+bundle = pl.read_otf_bundle('cube_with_masks_bundle.fits')
+m = pl.make_final_moment(bundle)
+pl.plot_map(m, title='final moment from bundle')
+```
+
+`MASK3D` が bundle 内にあれば、そのまま使えます。
+
+---
+
+## 6.7 baseline viewer bundle を provisional / final moment と混同しない
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+
+# viewer は 3D cube source として使う
+pl.quicklook(viewer, mode='moment0', vel_range=(20, 40))
+```
+
+viewer bundle は
+
+- `SIGNAL_MASK_USED` や `LINEFREE_USED` を使って `data` を選別した 3D bundle
+- `MASK3D` を直接持つ final-moment source そのものではない
+
+という点を区別してください。
 
 ---
 
@@ -580,6 +759,86 @@ m = pl.make_2d_map(
 )
 pl.plot_map(m)
 ```
+
+---
+
+## 7.9 OTF bundle の `LINEFREE` 補集合を使う
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+m = pl.make_2d_map(
+    bundle,
+    mode='moment0',
+    mask_mode='linefree_complement',
+)
+pl.plot_map(m)
+```
+
+---
+
+## 7.10 OTF bundle の `LINECAND3D` を直接使う
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+m = pl.make_2d_map(
+    bundle,
+    mode='moment0',
+    mask_mode='linecand3d',
+)
+pl.plot_map(m)
+```
+
+---
+
+## 7.11 OTF bundle の `BASESUP3D` 補集合を使う
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+m = pl.make_2d_map(
+    bundle,
+    mode='moment0',
+    mask_mode='basesup3d',
+)
+pl.plot_map(m)
+```
+
+---
+
+## 7.12 `LINEFREE*` は現行仕様では global 1D mask
+
+ここは特に重要です。
+
+現行仕様では、`LINEFREE`, `LINEFREE_USED`, `SIGNAL_MASK_USED` は
+
+- shape = `(nchan,)`
+- cube 全体に共通な channel mask
+
+です。つまり、pixel ごとに異なる `L(c, y, x)` を持つわけではありません。
+
+したがって、
+
+- `mask_mode='linefree_complement'` は **各 pixel で別々の 3D mask** を使う処理ではない
+- channel 軸だけの 1D mask を cube 全体へ適用する処理
+
+と理解してください。
+
+---
+
+## 7.13 pixel ごとに違う mask を使いたいなら外部 3D mask を渡す
+
+```python
+mask3d = my_per_voxel_mask.astype(bool)
+
+m = pl.make_2d_map(
+    bundle,
+    mode='moment0',
+    mask=mask3d,
+    mask_mode='external',
+)
+pl.plot_map(m)
+```
+
+将来的な per-spectrum / per-voxel mask を今すぐ試したいなら、この形が最も明示的です。
 
 ---
 
@@ -893,6 +1152,47 @@ print(out.keys())
 
 ---
 
+## 12.11 `plot_map()` に OTF bundle の 2D ext を渡す
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+pl.plot_map(bundle, ext='MOMENT0', title='bundle MOMENT0')
+```
+
+`plot_map()` でも bundle を直接受けられます。
+
+---
+
+## 12.12 `plot_map()` に 3D bundle をそのまま渡さない
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+
+# 2D ext を選ぶ
+pl.plot_map(bundle, ext='MOMENT0')
+
+# あるいは 3D -> 2D 化してから渡す
+m = pl.make_2d_map(bundle, mode='moment0', vel_range=(20, 40))
+pl.plot_map(m)
+```
+
+`plot_map(bundle)` のように `ext` なしで 3D bundle を 2D map として描こうとするのは避けてください。
+
+---
+
+## 12.13 baseline viewer bundle を `plot_map()` で使う
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+m = pl.make_2d_map(viewer, mode='moment0', vel_range=(20, 40))
+pl.plot_map(m, title='viewer-based moment0')
+```
+
+viewer bundle も 3D source なので、まず 2D 化してから `plot_map()` に渡します。
+
+---
+
 # 13. contour の基本
 
 ## 13.1 1 本だけ重ねる
@@ -947,6 +1247,74 @@ pl.plot_map(
         {'source': 'c18o.fits', 'mode': 'moment0', 'colors': 'magenta', 'label': 'C18O'},
     ],
     legend=True,
+)
+```
+
+---
+
+## 13.5 contour source に OTF bundle を使う
+
+```python
+base = pl.make_2d_map('12co_cube.fits', mode='moment0', vel_range=(20, 40))
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+pl.plot_map(
+    base,
+    contours=[
+        {
+            'source': cont_bundle,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'colors': 'cyan',
+            'levels': 'auto',
+        }
+    ],
+)
+```
+
+---
+
+## 13.6 color は bundle の 2D ext、contour は別 bundle の 3D cube
+
+```python
+base_bundle = pl.read_otf_bundle('12co_bundle.fits')
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+pl.plot_map(
+    base_bundle,
+    ext='MOMENT0',
+    contours=[
+        {
+            'source': cont_bundle,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'colors': 'white',
+            'levels': 'auto',
+        }
+    ],
+)
+```
+
+このように、color と contour で source 型が違っていても構いません。
+
+---
+
+## 13.7 color は FITS、contour は bundle
+
+```python
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+pl.plot_map(
+    'optical_or_radio_moment0.fits',
+    contours=[
+        {
+            'source': cont_bundle,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'levels': 'auto',
+            'colors': 'cyan',
+        }
+    ],
 )
 ```
 
@@ -1392,6 +1760,63 @@ pl.plot_scene(
 
 ---
 
+## 16.4 光学画像の上に OTF bundle contour
+
+```python
+co_bundle = pl.read_otf_bundle('12co_bundle.fits')
+
+pl.plot_scene(
+    base={
+        'kind': 'image',
+        'source': 'optical.fits',
+        'cmap': 'gray',
+    },
+    overlays=[
+        {
+            'kind': 'contour',
+            'source': co_bundle,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'levels': 'auto',
+            'colors': 'cyan',
+        }
+    ],
+)
+```
+
+OTF bundle を contour source としてそのまま使えます。
+
+---
+
+## 16.5 光学画像の上に baseline viewer bundle 由来の contour
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+
+pl.plot_scene(
+    base={
+        'kind': 'image',
+        'source': 'optical.fits',
+        'cmap': 'gray',
+    },
+    overlays=[
+        {
+            'kind': 'contour',
+            'source': viewer,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'levels': 'auto',
+            'colors': 'yellow',
+        }
+    ],
+)
+```
+
+viewer bundle も contour source にできます。
+
+---
+
 # 17. image overlay と reprojection
 
 ## 17.1 透過 image overlay（同一 WCS 近傍）
@@ -1530,6 +1955,75 @@ ov = [
 
 pl.plot_scene(scene, overlays=ov)
 ```
+
+---
+
+## 18.5 base に OTF bundle の 2D ext を使う
+
+```python
+bundle = pl.read_otf_bundle('otf_bundle.fits')
+
+pl.plot_scene(
+    base={
+        'kind': 'image',
+        'source': bundle,
+        'ext': 'MOMENT0',
+        'cmap': 'inferno',
+        'beam': 'auto',
+    },
+    title='bundle MOMENT0 as base',
+)
+```
+
+---
+
+## 18.6 overlay contour に OTF bundle を使う
+
+```python
+base_bundle = pl.read_otf_bundle('12co_bundle.fits')
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+pl.plot_scene(
+    base={
+        'kind': 'image',
+        'source': base_bundle,
+        'ext': 'MOMENT0',
+        'cmap': 'magma',
+    },
+    overlays=[
+        {
+            'kind': 'contour',
+            'source': cont_bundle,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'levels': 'auto',
+            'colors': 'white',
+        }
+    ],
+)
+```
+
+---
+
+## 18.7 base に baseline viewer bundle を使う
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+
+pl.plot_scene(
+    base={
+        'kind': 'image',
+        'source': viewer,
+        'mode': 'moment0',
+        'vel_range': (20, 40),
+        'cmap': 'inferno',
+    },
+    title='viewer bundle as base source',
+)
+```
+
+`plot_scene()` でも viewer bundle は通常の 3D source として扱います。
 
 ---
 
@@ -2595,6 +3089,35 @@ python plotting_updated_v5p5.py cube.fits --mode moment0 --vel-range 20,40 --bea
 
 ---
 
+## 31.25 OTF bundle FITS を CLI で使う
+
+```bash
+python -m sd_radio_spectral_fits.map_3d.plotting otf_bundle.fits --ext MOMENT0
+```
+
+ディスク上の bundle FITS を products として読むだけなら、CLI でも自然に扱えます。
+
+---
+
+## 31.26 Python 上の `OTFBundle` object は CLI には直接渡せない
+
+CLI は path ベースなので、Python 上で作った
+
+- `OTFBundle`
+- baseline viewer bundle
+
+をそのまま引数には渡せません。
+
+その場合は Python API を使います。
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+pl.quicklook(viewer, mode='moment0', vel_range=(20, 40))
+```
+
+---
+
 # 32. `quicklook(contours=...)` の集中的な実例集
 
 この章は、**現行 v5p5 での重要追加機能**である `quicklook(contours=...)` を中心に、
@@ -2853,6 +3376,104 @@ pl.quicklook(
 - scalebar / north_arrow / legend をまとめて管理
 - 複数の image overlay
 - base を RGB にする
+
+---
+
+## 32.12 base を OTF bundle の 2D ext にする
+
+```python
+base_bundle = pl.read_otf_bundle('12co_bundle.fits')
+
+pl.quicklook(
+    base_bundle,
+    ext='MOMENT0',
+    cmap='inferno',
+    contours=[
+        {
+            'source': '13co_cube.fits',
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'levels': 'auto',
+            'colors': 'white',
+        }
+    ],
+)
+```
+
+---
+
+## 32.13 base と contour の両方に bundle を使う
+
+```python
+base_bundle = pl.read_otf_bundle('12co_bundle.fits')
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+pl.quicklook(
+    base_bundle,
+    ext='MOMENT0',
+    cmap='magma',
+    contours=[
+        {
+            'source': cont_bundle,
+            'mode': 'moment0',
+            'vel_range': (20, 40),
+            'levels': 'auto',
+            'colors': 'cyan',
+        }
+    ],
+)
+```
+
+---
+
+## 32.14 baseline viewer bundle を base にする
+
+```python
+bundle = pl.read_otf_bundle('baseline_bundle.fits')
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+
+pl.quicklook(
+    viewer,
+    mode='moment0',
+    vel_range=(20, 40),
+    cmap='inferno',
+    contours=[
+        {
+            'source': bundle,
+            'ext': 'MOMENT0',
+            'levels': 'auto',
+            'colors': 'white',
+        }
+    ],
+)
+```
+
+viewer bundle と元 bundle を比較したいときの基本形です。
+
+---
+
+## 32.15 contour に bundle の 2D ext を直接使う
+
+```python
+base_bundle = pl.read_otf_bundle('12co_bundle.fits')
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+pl.quicklook(
+    base_bundle,
+    ext='MOMENT0',
+    cmap='inferno',
+    contours=[
+        {
+            'source': cont_bundle,
+            'ext': 'MOMENT0',
+            'levels': 'auto',
+            'colors': 'cyan',
+        }
+    ],
+)
+```
+
+contour 側も 2D passthrough にできます。
 
 ---
 
@@ -3504,6 +4125,67 @@ crop={'center': (83.82, -5.39), 'size': (0.2, 0.2), 'mode': 'world'}
 
 ---
 
+## 35.11 `LINEFREE_USED` を per-spectrum 3D mask だと思い込まない
+
+現行仕様では、`LINEFREE_USED` と `SIGNAL_MASK_USED` は **cube 全体で共通の 1D channel mask** です。
+
+したがって、
+
+- 「各 pixel のスペクトルごとに別の line-free が入っている」
+- 「`LINEFREE_USED` をそのまま 3D voxel mask として contour できる」
+
+とは考えないでください。
+
+viewer が欲しいときは、
+
+```python
+viewer = pl.make_baseline_viewer_bundle(bundle, mode='signal')
+```
+
+のように、1D channel mask を使って 3D cube を作り直してから扱います。
+
+---
+
+## 35.12 `plot_map(bundle)` と書いて 3D bundle を 2D 扱いしない
+
+安全な書き方は次の 2 つです。
+
+```python
+pl.plot_map(bundle, ext='MOMENT0')
+```
+
+または
+
+```python
+m = pl.make_2d_map(bundle, mode='moment0', vel_range=(20, 40))
+pl.plot_map(m)
+```
+
+---
+
+## 35.13 bundle の 1D ext を 2D 表示 API に直接渡さない
+
+```python
+# 避ける
+# pl.quicklook(bundle, ext='LINEFREE_USED')
+```
+
+`LINEFREE_USED` などは 1D spectral mask なので、2D image として扱う API には向きません。
+
+---
+
+## 35.14 baseline viewer bundle は別の特別クラスではない
+
+viewer bundle は通常の `OTFBundle` として plotting に渡します。
+
+- 2D ext を持つとは限らない
+- `data` は 3D cube
+- したがって `mode='moment0'` などで 2D 化して使う
+
+と覚えておくと混乱しにくいです。
+
+---
+
 # 36. 追加の publication / presentation レシピ
 
 この章は、論文図・スライド図・比較図を作る実務例をさらに増やした章です。
@@ -3744,6 +4426,36 @@ python plotting_updated_v5p5.py 12co_cube.fits \
 
 ---
 
+## 37.9 OTF bundle を使った比較図を量産する
+
+```python
+base_bundle = pl.read_otf_bundle('12co_bundle.fits')
+cont_bundle = pl.read_otf_bundle('13co_bundle.fits')
+
+for vr in [(10, 20), (20, 30), (30, 40)]:
+    pl.quicklook(
+        base_bundle,
+        mode='moment0',
+        vel_range=vr,
+        cmap='inferno',
+        contours=[
+            {
+                'source': cont_bundle,
+                'mode': 'moment0',
+                'vel_range': vr,
+                'levels': 'auto',
+                'colors': 'white',
+            }
+        ],
+        save=f'compare_{vr[0]}_{vr[1]}.pdf',
+        show=False,
+    )
+```
+
+Python 上で bundle を保持したまま図を量産したいときに便利です。
+
+---
+
 # 38. この cookbook の現行版における使い分けの結論
 
 最後に、使い分けを短くまとめます。
@@ -3777,3 +4489,22 @@ python plotting_updated_v5p5.py 12co_cube.fits \
 - `plot_map()` / `plot_rgb()` は互換 API として残す
 - ただし中心 API は今後 `quicklook()` / `plot_scene()` に寄る
 - cookbook もこの方針で今後さらに増補していく
+
+## 38.6 OTF bundle / baseline viewer bundle
+
+- OTF products を Python 上でそのまま扱うなら `OTFBundle` を直接渡す
+- bundle の 2D ext をそのまま見たいなら `ext='MOMENT0'` などを使う
+- bundle の 3D cube から 2D を作りたいなら `mode='moment0'` などを使う
+- baseline viewer bundle も通常の `OTFBundle` として扱い、必要に応じて 2D 化する
+
+## 38.7 1D spectral mask の理解
+
+- 現行の `LINEFREE`, `LINEFREE_USED`, `SIGNAL_MASK_USED` は global 1D channel mask
+- 2D image や per-spectrum 3D mask と混同しない
+- viewer が欲しければ `make_baseline_viewer_bundle()` で 3D source に変換してから描く
+
+## 38.8 path / HDU / HDUList / bundle の選び方
+
+- 単にファイルを読んで表示するだけなら path / `HDUList` で十分
+- Python 上で途中生成した products をそのまま渡したいなら `OTFBundle` が便利
+- cookbook ではまず `quicklook()` を第一候補とし、複雑な overlay は `plot_scene()` に進む

@@ -6,6 +6,8 @@ from typing import Dict, Tuple, Optional
 
 import numpy as np
 
+from .doppler import get_doppler_factor
+
 C_KMS = 299792.458
 
 def freq_axis_from_wcs(meta: dict, nchan: int) -> np.ndarray:
@@ -41,6 +43,38 @@ def wcs_slice_channels(meta: dict, ch_start: int, ch_stop: int) -> dict:
     # CRPIX1 unchanged
     return meta2
 
+def _get_restfreq(meta: dict, rest_hz: Optional[float] = None) -> float:
+    if rest_hz is not None:
+        return float(rest_hz)
+    for key in ("RESTFRQ", "RESTFREQ"):
+        if key in meta and meta[key] not in (None, ""):
+            return float(meta[key])
+    raise KeyError("channel_slice_from_vrange_union: meta lacks RESTFRQ/RESTFREQ.")
+
+
+def vlsrk_axis_from_freq_meta(meta: dict, *, v_corr_kms: float, nchan: Optional[int] = None, rest_hz: Optional[float] = None) -> np.ndarray:
+    """Return the exact per-row LSRK radio-velocity axis from a native FREQ WCS.
+
+    Policy:
+      - Start from the stored native frequency axis (typically TOPOCENT or already LSRK).
+      - Apply the relativistic frequency-frame correction using the row-wise
+        unapplied velocity correction v_corr_kms.
+      - Only after the frame transform, convert to radio velocity using RESTFRQ.
+
+    This keeps the convention consistent with regrid_vlsrk.vlsrk_axis_for_spectrum() and
+    avoids the approximation v_radio_lsrk ~= v_radio_native + v_corr.
+    """
+    if nchan is None:
+        nchan = int(meta.get("NAXIS1", 0))
+    if nchan <= 0:
+        raise KeyError("vlsrk_axis_from_freq_meta: meta lacks valid NAXIS1.")
+    freq_obs = freq_axis_from_wcs(meta, nchan=nchan)
+    k = get_doppler_factor(float(v_corr_kms))
+    freq_lsrk = freq_obs / k
+    rest = _get_restfreq(meta, rest_hz=rest_hz)
+    return radio_velocity_kms(freq_lsrk, rest)
+
+
 def channel_slice_from_vrange_union(
     meta: dict,
     v_corr_kms: np.ndarray,
@@ -50,22 +84,28 @@ def channel_slice_from_vrange_union(
 ) -> Tuple[int, int]:
     """Determine a single channel slice that covers [vmin, vmax] for ALL dumps.
 
-    This uses:
-      v_lsrk(ch, dump) = v_radio(ch) + v_corr_kms[dump]
+    The requested velocity window is defined in LSRK/VLSR radio velocity. For each
+    row, we therefore:
+      1) generate the native frequency axis from the stored WCS,
+      2) apply the *exact* relativistic frame correction in frequency using the
+         row-wise unapplied velocity correction v_corr_kms,
+      3) convert that corrected frequency axis to radio velocity using RESTFRQ,
+      4) find the channel interval covering [vmin_kms, vmax_kms].
 
     Returns (ch_start, ch_stop) with stop exclusive.
 
     Notes:
-      - Requires v_corr_kms per dump (can be constant array).
-      - Uses union over dumps, to ensure requested velocity range is included for all times.
+      - Requires v_corr_kms per dump (can be a constant array).
+      - Uses a union over dumps so that the requested VLSRK velocity window is
+        covered for all times.
+      - This function does *not* regrid or alter data values. It only selects a
+        channel span.
     """
-    import builtins
-    rest = float(meta.get("RESTFREQ") if rest_hz is None else rest_hz)
+    rest = _get_restfreq(meta, rest_hz=rest_hz)
     nchan = int(meta.get("NAXIS1", 0))
     if nchan <= 0:
-        raise KeyError("channel_slice_from_vrange_union: meta lacks nchan (or NCHAN).")
-    freq = freq_axis_from_wcs(meta, nchan=nchan)
-    v_radio = radio_velocity_kms(freq, rest)  # shape (nchan,)
+        raise KeyError("channel_slice_from_vrange_union: meta lacks nchan (or NAXIS1).")
+
     v1, v2 = float(vmin_kms), float(vmax_kms)
     if v2 < v1:
         v1, v2 = v2, v1
@@ -73,13 +113,13 @@ def channel_slice_from_vrange_union(
     starts = []
     stops = []
     for vc in np.asarray(v_corr_kms, float):
-        v = v_radio + vc
+        v = vlsrk_axis_from_freq_meta(meta, v_corr_kms=float(vc), nchan=nchan, rest_hz=rest)
         m = (v >= v1) & (v <= v2)
         if not np.any(m):
             raise ValueError("Requested velocity window does not overlap spectral axis.")
         idx = np.where(m)[0]
         starts.append(int(idx[0]))
-        stops.append(int(idx[-1]) + 1)  # exclusive
+        stops.append(int(idx[-1]) + 1)
 
     return builtins.min(starts), builtins.max(stops)
 

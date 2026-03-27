@@ -42,8 +42,8 @@ def main():
         pos_tol_arcsec=1,
         baseline_vwin=vwin_list,
         baseline_poly=poly_order,
-        rms_vwin=["-20:0"], # CLIの指定に合わせる
-        rms_poly=3,
+        post_baseline_mode="inherit_all",
+        post_baseline_vwin=None,  # inherit_all defaults are available, but None explicitly disables post-coadd baseline
         overwrite=True
     )
 

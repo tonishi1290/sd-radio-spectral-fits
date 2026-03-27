@@ -37,6 +37,20 @@ from ..tempscale import (
     tr_to_ta
 )
 
+
+
+def _row_has_display_baseline(row: pd.Series) -> bool:
+    applied = row.get("BSL_APPLIED", False)
+    try:
+        if pd.isna(applied):
+            applied = False
+    except Exception:
+        pass
+    if not bool(applied):
+        return False
+    arr = _parse_list_like(row.get("BSL_COEF")) if "BSL_COEF" in row.index else None
+    return arr is not None
+
 # -----------------------------------------------------------------------------
 # Row Selection Helper
 # -----------------------------------------------------------------------------
@@ -654,9 +668,9 @@ class SpectralViewer:
         xlim = self._xlim_for_current_axis(vel, chan, freq_ghz)
 
         # Baseline Logic
-        win_str = str(row.get("BSL_WINF", ""))
-        arr = _parse_list_like(row.get("BSL_COEF")) if "BSL_COEF" in row.index else None
-        has_bsl = arr is not None
+        has_bsl = _row_has_display_baseline(row)
+        win_str = str(row.get("BSL_WINF", "")) if has_bsl else ""
+        arr = _parse_list_like(row.get("BSL_COEF")) if has_bsl and "BSL_COEF" in row.index else None
         
         if self.view_mode == "baseline_added" and not has_bsl:
             self.view_mode = "original"
@@ -832,9 +846,9 @@ class SpectralViewer:
         elif key == "p": self.idx = (self.idx - 1 + self.n_spec) % self.n_spec; self.update_plot()
         elif key == "b":
             row = self.st.table.iloc[int(self.idx)]
-            has_bsl = "BSL_COEF" in row.index and _parse_list_like(row.get("BSL_COEF")) is not None
+            has_bsl = _row_has_display_baseline(row)
             if not has_bsl:
-                print("⚠️ BSL_COEF が無いため Baseline View は切替できません。")
+                print("⚠️ BSL_APPLIED=True の baseline 情報が無いため Baseline View は切替できません。")
                 self.view_mode = "original"
             else:
                 self.view_mode = "baseline_added" if self.view_mode == "original" else "original"

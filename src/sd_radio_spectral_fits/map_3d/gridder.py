@@ -42,7 +42,14 @@ def _coerce_optional_bool(value):
     return str(value).strip().lower() in {"1", "true", "t", "yes", "y", "on"}
 
 
-def _effective_config(config, reproducible_mode=None, workers=None, sort_neighbors=None):
+def _resolve_weight_mode(config) -> str:
+    mode = str(getattr(config, "weight_mode", "uniform")).strip().lower()
+    if mode not in {"uniform", "rms"}:
+        raise ValueError(f"Unknown weight_mode={mode!r}. Use 'uniform' or 'rms'.")
+    return mode
+
+
+def _effective_config(config, reproducible_mode=None, workers=None, sort_neighbors=None, verbose=None):
     overrides = {}
     rep = _coerce_optional_bool(reproducible_mode)
     if rep is not None:
@@ -52,6 +59,9 @@ def _effective_config(config, reproducible_mode=None, workers=None, sort_neighbo
         overrides["_sort_neighbors"] = srt
     if workers is not None:
         overrides["_workers"] = int(workers)
+    vb = _coerce_optional_bool(verbose)
+    if vb is not None:
+        overrides["verbose"] = vb
     if not overrides:
         return config
     return _ConfigView(config, **overrides)
@@ -210,9 +220,12 @@ def _collect_otf_diagnostics(
             "backend": str(config.backend),
             "chunk_ch": int(config.chunk_ch),
             "exclude_turnaround": bool(config.exclude_turnaround),
+            "weight_mode": str(_resolve_weight_mode(config)),
             "alpha_rms": float(config.alpha_rms),
             "beta_tint": float(config.beta_tint),
             "dv_kms": None if getattr(config, "dv_kms", None) is None else float(config.dv_kms),
+            "vmin_kms": None if getattr(config, "vmin_kms", None) is None else float(config.vmin_kms),
+            "vmax_kms": None if getattr(config, "vmax_kms", None) is None else float(config.vmax_kms),
         },
         "scantable_input": {
             "nrow": int(len(table)),
@@ -386,6 +399,36 @@ def _format_otf_diag_text(diag: dict) -> str:
             f"CRVAL3={oh.get('CRVAL3')} CDELT3={oh.get('CDELT3')} CRPIX3={oh.get('CRPIX3')}"
         )
     return "\n".join(lines) + "\n"
+
+
+def _print_effective_beam_summary(meta: dict | None, *, indent: str = "   ", print_kernel: bool = True) -> None:
+    meta = meta or {}
+    if print_kernel and meta:
+        print(
+            f"{indent}kernel resolved: "
+            f"kernel={meta.get('kernel')} "
+            f"preset={meta.get('kernel_preset')} "
+            f"sign={meta.get('kernel_sign')} "
+            f"gwidth={meta.get('gwidth_arcsec', np.nan):.2f}\" "
+            f"jwidth={meta.get('jwidth_arcsec', np.nan):.2f}\" "
+            f"support={meta.get('support_radius_arcsec', np.nan):.2f}\""
+        )
+    if np.isfinite(meta.get("nominal_radial_fwhm_arcsec", np.nan)):
+        print(
+            f"{indent}nominal effective beam: "
+            f"radial={meta.get('nominal_radial_fwhm_arcsec'):.2f}\" "
+            f"bmaj={meta.get('bmaj_nominal_arcsec', np.nan):.2f}\" "
+            f"bmin={meta.get('bmin_nominal_arcsec', np.nan):.2f}\" "
+            f"bpa={meta.get('bpa_nominal_deg', np.nan):.2f} deg"
+        )
+    if np.isfinite(meta.get("empirical_radial_fwhm_arcsec", np.nan)):
+        print(
+            f"{indent}empirical center beam: "
+            f"radial={meta.get('empirical_radial_fwhm_arcsec'):.2f}\" "
+            f"bmaj={meta.get('bmaj_empirical_arcsec', np.nan):.2f}\" "
+            f"bmin={meta.get('bmin_empirical_arcsec', np.nan):.2f}\" "
+            f"bpa={meta.get('bpa_empirical_deg', np.nan):.2f} deg"
+        )
 
 
 def _write_otf_diagnostics(diag: dict, output_fits: str, diagnostics_prefix: str | None = None) -> tuple[str, str]:
@@ -612,6 +655,191 @@ def _prepare_projection_table_and_coords(
     return table, x_arcsec, y_arcsec, lon0, lat0
 
 
+def _resolve_projection_reference_for_scantables(
+    scantables,
+    *,
+    frame: str = "ICRS",
+    ref_coord=None,
+    ref_lon: float | None = None,
+    ref_lat: float | None = None,
+) -> tuple[float, float]:
+    if scantables is None:
+        raise ValueError('scantables must not be None.')
+    lon_parts = []
+    lat_parts = []
+    for idx, scantable in enumerate(scantables):
+        table = getattr(scantable, 'table', None)
+        if table is None:
+            raise ValueError(f'scantable at index {idx} does not have a .table attribute.')
+        table_df = _df_to_native_endian(table)
+        lon_deg, lat_deg = _extract_lon_lat_arrays(table_df, frame)
+        valid = np.isfinite(lon_deg) & np.isfinite(lat_deg)
+        if np.any(valid):
+            lon_parts.append(np.asarray(lon_deg[valid], dtype=float))
+            lat_parts.append(np.asarray(lat_deg[valid], dtype=float))
+    if not lon_parts:
+        raise ValueError('No finite coordinates found across the supplied scantables.')
+    lon_all = np.concatenate(lon_parts)
+    lat_all = np.concatenate(lat_parts)
+    return _resolve_reference_lonlat(ref_coord, frame, lon_all, lat_all, ref_lon=ref_lon, ref_lat=ref_lat)
+
+
+_VALID_OTF_INPUT_STATES = (
+    "with_turnarounds",
+    "scan_only",
+    "use_existing_labels",
+)
+
+
+def _normalize_otf_input_state(value):
+    text = None if value is None else str(value).strip().lower()
+    if text is None:
+        return None
+    if text not in _VALID_OTF_INPUT_STATES:
+        raise ValueError(
+            "otf_input_state must be one of 'with_turnarounds', 'scan_only', or 'use_existing_labels'."
+        )
+    return text
+
+
+
+
+def _normalize_existing_turn_labels(value):
+    text = None if value is None else str(value).strip().lower()
+    if text is None:
+        return None
+    if text not in {'ignore', 'respect'}:
+        raise ValueError("existing_turn_labels must be 'ignore' or 'respect'.")
+    return text
+
+
+def _normalize_legacy_existing_is_turn(value):
+    text = None if value is None else str(value).strip().lower()
+    if text is None:
+        return None
+    if text == 'prefer':
+        return 'respect'
+    if text == 'ignore':
+        return 'ignore'
+    raise ValueError("otf_scan_existing_is_turn must be 'prefer' or 'ignore'.")
+
+
+def _resolve_existing_turn_labels_policy(*, otf_state: str, existing_turn_labels=None, otf_scan_existing_is_turn=None):
+    new_val = _normalize_existing_turn_labels(existing_turn_labels)
+    legacy_given = otf_scan_existing_is_turn is not None
+    legacy_val = _normalize_legacy_existing_is_turn(otf_scan_existing_is_turn)
+    if otf_state == 'use_existing_labels':
+        if new_val is not None or legacy_given:
+            raise ValueError(
+                "otf_input_state='use_existing_labels' does not accept existing_turn_labels or deprecated otf_scan_existing_is_turn."
+            )
+        return None
+    if new_val is None and not legacy_given:
+        return 'ignore'
+    if new_val is None:
+        warnings.warn(
+            "otf_scan_existing_is_turn is deprecated; use existing_turn_labels='respect'|'ignore' instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return legacy_val
+    if legacy_given:
+        warnings.warn(
+            "otf_scan_existing_is_turn is deprecated; use existing_turn_labels instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        if legacy_val != new_val:
+            raise ValueError("existing_turn_labels conflicts with deprecated otf_scan_existing_is_turn.")
+    return new_val
+def _resolve_otf_processing_policy(*, otf_input_state=None, otf_scan_region=None):
+    state = _normalize_otf_input_state(otf_input_state)
+    legacy_mode = None
+    legacy_explicit = otf_scan_region is not None
+    if otf_scan_region not in (None, False):
+        legacy_mode = _normalize_otf_scan_region_mode(otf_scan_region)
+
+    if state is None:
+        if not legacy_explicit:
+            return ("with_turnarounds", "auto")
+        if otf_scan_region is False:
+            warnings.warn(
+                "otf_scan_region is deprecated; use otf_input_state='use_existing_labels' instead.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+            return ("use_existing_labels", None)
+        warnings.warn(
+            "otf_scan_region is deprecated; use otf_input_state instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return ("with_turnarounds", legacy_mode or "auto")
+
+    if state == "use_existing_labels":
+        if legacy_explicit and otf_scan_region not in (None, False):
+            raise ValueError(
+                "otf_input_state='use_existing_labels' conflicts with geometry-enabled otf_scan_region."
+            )
+        if otf_scan_region is False:
+            warnings.warn(
+                "otf_scan_region is deprecated; use otf_input_state='use_existing_labels' only.",
+                DeprecationWarning,
+                stacklevel=3,
+            )
+        return (state, None)
+
+    if otf_scan_region is False:
+        raise ValueError(
+            f"otf_input_state={state!r} conflicts with otf_scan_region=False. Use otf_input_state='use_existing_labels' instead."
+        )
+    if legacy_explicit:
+        warnings.warn(
+            "otf_scan_region is deprecated; use otf_input_state instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+    return (state, legacy_mode or "auto")
+
+
+def _build_existing_labels_summary(*, base_scan_id, existing_is_turn, flag_on, n_total, input_state: str):
+    scan_arr = np.asarray(base_scan_id, dtype=float)
+    turn_arr = np.asarray(existing_is_turn, dtype=bool)
+    flag_arr = np.asarray(flag_on, dtype=bool)
+    accepted = np.isfinite(scan_arr) & (~turn_arr) & flag_arr
+    accepted_ids = np.unique(scan_arr[accepted]).astype(np.int64) if np.any(accepted) else np.array([], dtype=np.int64)
+    return {
+        "summary_version": 2,
+        "kind": "single_table",
+        "reference_scan_id_semantics": "local for a single GridInput; global after merged basketweave inputs",
+        "mode": None,
+        "input_state": str(input_state),
+        "existing_turn_labels": None,
+        "existing_is_turn_mode": None,
+        "stream_group_columns": [],
+        "group_key_columns": ["SCAN"],
+        "formal_stream_columns_present": [],
+        "missing_formal_stream_columns": [],
+        "fallback_stream_columns": [],
+        "used_fallback_stream_key": False,
+        "stream_group_strategy": "existing_labels",
+        "num_groups": int(len(accepted_ids)),
+        "num_runs": int(len(accepted_ids)),
+        "num_points_total": int(n_total),
+        "num_points_flag_on": int(np.count_nonzero(flag_arr)),
+        "num_points_existing_turn": int(np.count_nonzero(turn_arr)),
+        "num_points_scan": int(np.count_nonzero(accepted)),
+        "num_points_turn": int(np.count_nonzero(turn_arr)),
+        "num_points_unresolved": 0,
+        "num_points_excluded": int(np.count_nonzero(~accepted)),
+        "has_existing_is_turn": True,
+        "accepted_scan_id_min": None if accepted_ids.size == 0 else int(accepted_ids.min()),
+        "accepted_scan_id_max": None if accepted_ids.size == 0 else int(accepted_ids.max()),
+        "accepted_scan_id_count": int(accepted_ids.size),
+        "geometry_mask_applied": False,
+    }
+
+
 def _normalize_otf_scan_region_mode(value):
     if value in (None, False):
         return None
@@ -644,9 +872,12 @@ def _assemble_grid_input(
     spec: np.ndarray,
     out_scale_norm: str | None = None,
     beameff_vec: np.ndarray | None = None,
-    otf_scan_region=False,
+    weight_mode: str = "uniform",
+    otf_input_state=None,
+    otf_scan_region=None,
     otf_scan_png=None,
-    otf_scan_existing_is_turn: str = "prefer",
+    existing_turn_labels: str | None = None,
+    otf_scan_existing_is_turn: str | None = None,
 ):
     obsmode = table["OBSMODE"].astype(str).str.upper().to_numpy() if "OBSMODE" in table.columns else np.full(len(table), "ON")
     flag_on = (obsmode == "ON")
@@ -659,26 +890,35 @@ def _assemble_grid_input(
     scan_dir = None
     otf_summary = None
 
-    mode = _normalize_otf_scan_region_mode(otf_scan_region)
-    if mode is not None:
-        from .otf_scan_region import identify_otf_scan_regions
+    otf_state, otf_mode = _resolve_otf_processing_policy(
+        otf_input_state=otf_input_state,
+        otf_scan_region=otf_scan_region,
+    )
+    existing_turn_policy = _resolve_existing_turn_labels_policy(
+        otf_state=otf_state,
+        existing_turn_labels=existing_turn_labels,
+        otf_scan_existing_is_turn=otf_scan_existing_is_turn,
+    )
+    from .otf_scan_region import identify_otf_scan_regions
 
-        otf_result = identify_otf_scan_regions(
-            table,
-            x_arcsec=x_arcsec,
-            y_arcsec=y_arcsec,
-            flag_on=flag_on,
-            time_arr=time_arr,
-            base_scan_id=base_scan_id,
-            existing_is_turn=existing_is_turn,
-            mode=mode,
-            existing_is_turn_mode=otf_scan_existing_is_turn,
-            png_path=_resolve_otf_scan_png_path(otf_scan_png),
-        )
-        scan_id = otf_result.effscan
-        is_turn = otf_result.is_turn
-        scan_dir = otf_result.scan_dir_deg
-        otf_summary = otf_result.summary
+    otf_result = identify_otf_scan_regions(
+        table,
+        x_arcsec=x_arcsec,
+        y_arcsec=y_arcsec,
+        flag_on=flag_on,
+        time_arr=time_arr,
+        base_scan_id=base_scan_id,
+        existing_is_turn=existing_is_turn,
+        mode=otf_mode,
+        existing_turn_labels=existing_turn_policy,
+        existing_is_turn_mode=otf_scan_existing_is_turn,
+        input_state=otf_state,
+        png_path=_resolve_otf_scan_png_path(otf_scan_png),
+    )
+    scan_id = otf_result.effscan
+    is_turn = otf_result.is_turn
+    scan_dir = otf_result.scan_dir_deg
+    otf_summary = otf_result.summary
 
     return GridInput(
         x=np.asarray(x_arcsec, dtype=float),
@@ -686,7 +926,7 @@ def _assemble_grid_input(
         spec=np.asarray(spec, dtype=float),
         flag=np.asarray(flag_on, dtype=bool),
         time=np.asarray(time_arr, dtype=float),
-        rms=_extract_rms(table, out_scale_norm, beameff_vec) if out_scale_norm is not None and beameff_vec is not None else None,
+        rms=_extract_rms_for_weighting(table, out_scale_norm, beameff_vec, weight_mode=weight_mode),
         tint=_extract_meta_col(table, ("EXPOSURE", "INTTIME", "DUR")),
         tsys=_extract_tsys_scalar(table),
         scan_id=scan_id,
@@ -702,16 +942,22 @@ def run_mapping_pipeline(
     projection: str = "SFL",
     out_scale: str = "TA*",
     dv_kms: float = None,
+    vmin_kms: float = None,
+    vmax_kms: float = None,
+    ref_coord=None,
     ref_lon: float = None,
     ref_lat: float = None,
     reproducible_mode: bool | None = None,
     workers: int | None = None,
     sort_neighbors: bool | None = None,
+    verbose: bool | None = None,
     write_diagnostics: bool = False,
     diagnostics_prefix: str | None = None,
-    otf_scan_region=False,
+    otf_input_state=None,
+    otf_scan_region=None,
     otf_scan_png=None,
-    otf_scan_existing_is_turn: str = "prefer",
+    existing_turn_labels: str | None = None,
+    otf_scan_existing_is_turn: str | None = None,
 ):
     """
     Scantable から 3D FITS キューブを生成する汎用統合パイプライン。
@@ -722,6 +968,7 @@ def run_mapping_pipeline(
         reproducible_mode=reproducible_mode,
         workers=workers,
         sort_neighbors=sort_neighbors,
+        verbose=verbose,
     )
 
     # 0. SIG_* を除去（coadd後にVRADへ確定している場合は残骸になる）
@@ -739,7 +986,12 @@ def run_mapping_pipeline(
     print("1. Regridding velocity axis (Standardizer)...")
     std = Standardizer(scantable, v_corr_col="VFRAME")
     dv_use = dv_kms if dv_kms is not None else getattr(config, "dv_kms", None)
-    full_matrix, v_tgt = std.get_matrix(dv=dv_use)
+    vmin_use = vmin_kms if vmin_kms is not None else getattr(config, "vmin_kms", None)
+    vmax_use = vmax_kms if vmax_kms is not None else getattr(config, "vmax_kms", None)
+    full_matrix, v_tgt = std.get_matrix(dv=dv_use, vmin=vmin_use, vmax=vmax_use)
+
+    if getattr(runtime_config, "verbose", False) and (vmin_use is not None or vmax_use is not None):
+        print(f"   requested velocity range: {vmin_use} to {vmax_use} km/s")
 
     if len(v_tgt) > 1:
         dv = float(np.nanmedian(np.diff(v_tgt)))
@@ -763,7 +1015,7 @@ def run_mapping_pipeline(
         scantable,
         frame=coord_sys,
         projection=projection,
-        ref_coord=None,
+        ref_coord=ref_coord,
         ref_lon=ref_lon,
         ref_lat=ref_lat,
     )
@@ -788,6 +1040,7 @@ def run_mapping_pipeline(
         rep_beameff = float(np.median(valid_beameff)) if len(valid_beameff) > 0 else np.nan
 
     # 4. GridInput の詳細な組み立て
+    weight_mode = _resolve_weight_mode(runtime_config)
     grid_input, otf_scan_summary = _assemble_grid_input(
         scantable=scantable,
         table=table,
@@ -796,14 +1049,31 @@ def run_mapping_pipeline(
         spec=full_matrix,
         out_scale_norm=out_scale_norm,
         beameff_vec=beameff_vec,
+        weight_mode=weight_mode,
+        otf_input_state=otf_input_state,
         otf_scan_region=otf_scan_region,
         otf_scan_png=_resolve_otf_scan_png_path(
             otf_scan_png,
             default_path=str(Path(output_fits).with_suffix(Path(output_fits).suffix + ".scan_region.png")),
         ),
+        existing_turn_labels=existing_turn_labels,
         otf_scan_existing_is_turn=otf_scan_existing_is_turn,
     )
     setattr(grid_input, "_otf_scan_summary", otf_scan_summary)
+    if getattr(runtime_config, "verbose", False) and otf_scan_summary is not None:
+        state_txt = otf_scan_summary.get("input_state")
+        if state_txt:
+            extra = ''
+            if state_txt != 'use_existing_labels':
+                etl = otf_scan_summary.get('existing_turn_labels')
+                if etl is not None:
+                    extra = f", existing_turn_labels={etl}"
+            print(f"   otf_input_state={state_txt}{extra}")
+        try:
+            from .otf_scan_region import format_otf_scan_summary
+            print(f"   {format_otf_scan_summary(otf_scan_summary)}")
+        except Exception:
+            print(f"   otf_scan_region: runs={otf_scan_summary.get('num_runs', '?')} kept={otf_scan_summary.get('num_points_scan', '?')}/{otf_scan_summary.get('num_points_total', '?')}")
 
     # 5. グリッディング実行
     print("4. Executing Gridding Engine...")
@@ -815,32 +1085,8 @@ def run_mapping_pipeline(
     res.meta["SPECSYS"] = "LSRK"
 
     beam_meta = res.meta or {}
-    if beam_meta:
-        print(
-            "   kernel resolved: "
-            f"kernel={beam_meta.get('kernel')} "
-            f"preset={beam_meta.get('kernel_preset')} "
-            f"sign={beam_meta.get('kernel_sign')} "
-            f"gwidth={beam_meta.get('gwidth_arcsec', np.nan):.2f}\" "
-            f"jwidth={beam_meta.get('jwidth_arcsec', np.nan):.2f}\" "
-            f"support={beam_meta.get('support_radius_arcsec', np.nan):.2f}\""
-        )
-    if np.isfinite(beam_meta.get("nominal_radial_fwhm_arcsec", np.nan)):
-        print(
-            "   nominal effective beam: "
-            f"radial={beam_meta.get('nominal_radial_fwhm_arcsec'):.2f}\" "
-            f"bmaj={beam_meta.get('bmaj_nominal_arcsec', np.nan):.2f}\" "
-            f"bmin={beam_meta.get('bmin_nominal_arcsec', np.nan):.2f}\" "
-            f"bpa={beam_meta.get('bpa_nominal_deg', np.nan):.2f} deg"
-        )
-    if np.isfinite(beam_meta.get("empirical_radial_fwhm_arcsec", np.nan)):
-        print(
-            "   empirical center beam: "
-            f"radial={beam_meta.get('empirical_radial_fwhm_arcsec'):.2f}\" "
-            f"bmaj={beam_meta.get('bmaj_empirical_arcsec', np.nan):.2f}\" "
-            f"bmin={beam_meta.get('bmin_empirical_arcsec', np.nan):.2f}\" "
-            f"bpa={beam_meta.get('bpa_empirical_deg', np.nan):.2f} deg"
-        )
+    _print_effective_beam_summary(beam_meta)
+
 
     # 6. FITS 書き出し
     print("5. Writing Multi-Extension FITS...")
@@ -896,6 +1142,36 @@ def _extract_rms(table, out_scale, beameff_vec):
     return rms
 
 
+def _extract_rms_for_weighting(table, out_scale, beameff_vec, *, weight_mode: str):
+    mode = str(weight_mode).strip().lower()
+    if mode == "uniform":
+        return None
+    if mode != "rms":
+        raise ValueError(f"Unknown weight_mode={mode!r}. Use 'uniform' or 'rms'.")
+    if "BSL_RMS" not in table.columns:
+        raise ValueError(
+            "weight_mode='rms' requires a BSL_RMS column for every dump, but the input table has no BSL_RMS column. "
+            "Run baseline statistics first, or set weight_mode='uniform'."
+        )
+    rms = pd.to_numeric(table["BSL_RMS"], errors="coerce").to_numpy(float, copy=True)
+    bad = (~np.isfinite(rms)) | (rms <= 0)
+    if np.any(bad):
+        n_bad = int(np.count_nonzero(bad))
+        raise ValueError(
+            "weight_mode='rms' requires valid positive BSL_RMS for every dump. "
+            f"Found {n_bad}/{len(rms)} invalid rows in BSL_RMS. "
+            "This often means some scantables lack BSL_RMS or contain NaN/non-positive values. "
+            "Provide BSL_RMS for all inputs, or set weight_mode='uniform'."
+        )
+    if str(out_scale).strip().upper() == "TR*":
+        if beameff_vec is None:
+            raise ValueError(
+                "weight_mode='rms' with out_scale='TR*' requires BEAMEFF information to scale BSL_RMS consistently."
+            )
+        rms /= np.where(beameff_vec > 0, beameff_vec, 1.0)
+    return rms
+
+
 def _extract_tsys_scalar(table):
     if "TSYS" not in table.columns:
         return None
@@ -926,11 +1202,16 @@ def _extract_meta_col(table, names):
 def create_grid_input(
     scantable,
     ref_coord=None,
+    ref_lon: float | None = None,
+    ref_lat: float | None = None,
     frame="ICRS",
     projection="SFL",
-    otf_scan_region=False,
+    weight_mode: str = "uniform",
+    otf_input_state=None,
+    otf_scan_region=None,
     otf_scan_png=None,
-    otf_scan_existing_is_turn: str = "prefer",
+    existing_turn_labels: str | None = None,
+    otf_scan_existing_is_turn: str | None = None,
 ):
     """
     Scantable から GridInput を安全に生成する。
@@ -941,6 +1222,8 @@ def create_grid_input(
         frame=frame,
         projection=projection,
         ref_coord=ref_coord,
+        ref_lon=ref_lon,
+        ref_lat=ref_lat,
     )
     grid_input, otf_scan_summary = _assemble_grid_input(
         scantable=scantable,
@@ -950,8 +1233,11 @@ def create_grid_input(
         spec=np.asarray(scantable.data, dtype=float),
         out_scale_norm=None,
         beameff_vec=None,
+        weight_mode=weight_mode,
+        otf_input_state=otf_input_state,
         otf_scan_region=otf_scan_region,
         otf_scan_png=_resolve_otf_scan_png_path(otf_scan_png),
+        existing_turn_labels=existing_turn_labels,
         otf_scan_existing_is_turn=otf_scan_existing_is_turn,
     )
     setattr(grid_input, "_otf_scan_summary", otf_scan_summary)

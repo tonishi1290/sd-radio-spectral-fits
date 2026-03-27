@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sd-radio-spectral-fits"
-version = "1.1.4" 
+version = "1.2.0" 
 description = "Single-dish radio spectral SDFITS writer"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
 authors = [{name = "Toshikazu Onishi"}]
 dependencies = [
-  "numpy>=1.20",
+  "numpy>=2.00",
   "astropy>=5.0",
   "pandas",
   "scipy",

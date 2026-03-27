@@ -38,6 +38,23 @@ class BaselineModel:
     frame: str = "LSRK"
 
 
+BSL_METADATA_COLUMNS = [
+    "BSL_DONE",
+    "BSL_APPLIED",
+    "BSL_STAGE",
+    "BSL_POLY",
+    "BSL_WINF",
+    "BSL_RMS",
+    "BSL_STAT",
+    "BSL_NUSED",
+    "BSL_COEF",
+    "BSL_SCALE",
+]
+
+
+def _drop_bsl_metadata_columns(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop(columns=[c for c in BSL_METADATA_COLUMNS if c in df.columns], errors="ignore")
+
 # =========================================================
 # 1. Low-level Fitting Logic (Core)
 # =========================================================
@@ -186,36 +203,71 @@ def fit_polynomial_baseline(
 
 def _apply_baseline_to_table(
     df: pd.DataFrame,
-    coeffs_list: List[np.ndarray],
+    coeffs_list: List[Optional[np.ndarray]],
     rms_list: List[float],
     poly_orders: Union[int, List[int]],
     win_f_list: Union[str, List[str]] = "",
+    *,
+    applied: bool = True,
+    stage: str = "baseline_fit",
+    done_list: Optional[List[bool]] = None,
+    nused_list: Optional[List[int]] = None,
 ) -> pd.DataFrame:
     """Add baseline results to the dataframe."""
     n = len(df)
-    df = df.copy()
-    df["BSL_DONE"] = True
-    
-    if isinstance(poly_orders, (list, np.ndarray)):
-        df["BSL_POLY"] = np.array(poly_orders, dtype=np.int16)
+    df = _drop_bsl_metadata_columns(df.copy())
+
+    if done_list is None:
+        done_arr = np.ones(n, dtype=bool)
     else:
-        df["BSL_POLY"] = int(poly_orders)
-    
-    df["BSL_RMS"] = np.array(rms_list, dtype=np.float32)
-    
-    if isinstance(win_f_list, list):
-        df["BSL_WINF"] = win_f_list
+        done_arr = np.asarray(done_list, dtype=bool)
+        if done_arr.size != n:
+            raise ValueError(f"done_list size mismatch: {done_arr.size} != {n}")
+
+    if nused_list is None:
+        nused_arr = np.zeros(n, dtype=np.int32)
     else:
-        df["BSL_WINF"] = [str(win_f_list)] * n
-        
-    df["BSL_COEF"] = list(coeffs_list)
-    
-    # [MODIFIED] Baseline scale should match input TEMPSCAL (we no longer force TA*)
-    if "TEMPSCAL" in df.columns:
-        df["BSL_SCALE"] = df["TEMPSCAL"]
-    else:
-        df["BSL_SCALE"] = "TA*"
-        
+        nused_arr = np.asarray(nused_list, dtype=np.int32)
+        if nused_arr.size != n:
+            raise ValueError(f"nused_list size mismatch: {nused_arr.size} != {n}")
+
+    df["BSL_DONE"] = done_arr
+    df["BSL_APPLIED"] = (done_arr & bool(applied))
+    df["BSL_STAGE"] = [str(stage)] * n
+    df["BSL_RMS"] = np.asarray(rms_list, dtype=np.float32)
+    df["BSL_STAT"] = ["std"] * n
+    df["BSL_NUSED"] = nused_arr
+
+    if applied:
+        if isinstance(poly_orders, (list, np.ndarray)):
+            poly_arr = np.asarray(poly_orders, dtype=np.int16)
+            if poly_arr.size != n:
+                raise ValueError(f"poly_orders size mismatch: {poly_arr.size} != {n}")
+        else:
+            poly_arr = np.full(n, int(poly_orders), dtype=np.int16)
+        df["BSL_POLY"] = poly_arr
+
+        if isinstance(win_f_list, list):
+            if len(win_f_list) != n:
+                raise ValueError(f"win_f_list size mismatch: {len(win_f_list)} != {n}")
+            win_list = [str(v) for v in win_f_list]
+        else:
+            win_list = [str(win_f_list)] * n
+        df["BSL_WINF"] = win_list
+
+        coef_out: list[Optional[np.ndarray]] = []
+        for c, done in zip(coeffs_list, done_arr):
+            if (not done) or c is None:
+                coef_out.append(None)
+            else:
+                coef_out.append(np.asarray(c, dtype=float))
+        df["BSL_COEF"] = coef_out
+
+        if "TEMPSCAL" in df.columns:
+            df["BSL_SCALE"] = df["TEMPSCAL"]
+        else:
+            df["BSL_SCALE"] = "TA*"
+
     return df
 
 def _row_or_meta(row: pd.Series, meta: dict, key: str, default: Any = None) -> Any:
@@ -225,6 +277,20 @@ def _row_or_meta(row: pd.Series, meta: dict, key: str, default: Any = None) -> A
             return val
     if key in meta:
         val = meta.get(key)
+        if val is not None and not pd.isna(val):
+            return val
+    return default
+
+
+def _row_only_value(row: pd.Series, key: str, default: Any = None) -> Any:
+    """Return a row value only; ignore meta/header fallbacks.
+
+    VELOSYS / VFRAME are row-wise metadata in this package. We intentionally do not
+    fall back to global meta/header values because those can only represent a single
+    value and are therefore ambiguous for multi-row data.
+    """
+    if key in row.index:
+        val = row[key]
         if val is not None and not pd.isna(val):
             return val
     return default
@@ -246,18 +312,29 @@ def _vcorr_scale_to_kms(key: str) -> float:
     return 1.0e-3
 
 
-def _extract_vcorr_kms(row: pd.Series, meta: dict, preferred_key: str = "VELOSYS") -> tuple[float, str | None]:
-    candidates = ["VELOSYS"]
-    pk = str(preferred_key or "").strip()
-    if pk and pk not in candidates:
-        candidates.append(pk)
-    for key in ("VFRAME", "V_CORR_KMS"):
-        if key not in candidates:
+def _vcorr_candidate_names(preferred_key: str = "VELOSYS") -> list[str]:
+    candidates: list[str] = []
+    pk = str(preferred_key or "").strip().upper()
+    for key in (pk, "VELOSYS", "VFRAME", "V_CORR_KMS"):
+        if key and key not in candidates:
             candidates.append(key)
+    return candidates
+
+
+def _extract_vcorr_kms(row: pd.Series, preferred_key: str = "VELOSYS") -> tuple[float, str | None]:
+    """Return row-wise unapplied velocity correction in km/s.
+
+    Policy:
+      - VELOSYS / VFRAME / V_CORR_KMS are row-only metadata.
+      - Global meta/header values must not be used here because a single header value
+        cannot represent row-varying corrections safely.
+      - 0.0 is a valid stored correction and must not be treated as missing.
+    """
+    candidates = _vcorr_candidate_names(preferred_key)
 
     found: list[tuple[str, float]] = []
     for key in candidates:
-        val = _row_or_meta(row, meta, key, None)
+        val = _row_only_value(row, key, None)
         if val is None or pd.isna(val):
             continue
         found.append((key, float(val) * _vcorr_scale_to_kms(key)))
@@ -274,14 +351,25 @@ def _extract_vcorr_kms(row: pd.Series, meta: dict, preferred_key: str = "VELOSYS
 
 def _row_wcs_meta(row: pd.Series, meta: dict, nchan: int) -> dict:
     row_meta = dict(meta)
+    # VELOSYS / VFRAME / V_CORR_KMS are intentionally row-only metadata.
+    # Remove any stale global values first so they can never leak into the per-row WCS.
+    for key in ("VELOSYS", "VFRAME", "V_CORR_KMS"):
+        row_meta.pop(key, None)
+
     for key in (
         "CRVAL1", "CDELT1", "CRPIX1", "CTYPE1", "CUNIT1",
         "RESTFRQ", "RESTFREQ", "SPECSYS", "SSYSOBS", "VELDEF",
-        "VELOSYS", "VFRAME", "NAXIS1"
+        "NAXIS1"
     ):
         val = _row_or_meta(row, meta, key, None)
         if val is not None and not pd.isna(val):
             row_meta[key] = val
+
+    for key in ("VELOSYS", "VFRAME", "V_CORR_KMS"):
+        val = _row_only_value(row, key, None)
+        if val is not None and not pd.isna(val):
+            row_meta[key] = val
+
     row_meta["NAXIS1"] = int(nchan)
 
     # Keep RESTFRQ/RESTFREQ synchronized
@@ -307,6 +395,12 @@ def _row_wcs_meta(row: pd.Series, meta: dict, nchan: int) -> dict:
 
 
 def _physical_axis_for_row(row: pd.Series, meta: dict, nchan_full: int, *, v_corr_kms: float, ch_slice: slice | None = None) -> np.ndarray:
+    """Return the per-row auxiliary VLSR axis used for BSL_WINF interpretation.
+
+    This helper does *not* regrid or rewrite the spectrum WCS. It only computes the
+    row-specific VLSR velocity axis needed to interpret baseline windows when the
+    stored spectrum is still in native FREQ/TOPOCENT.
+    """
     row_meta = _row_wcs_meta(row, meta, nchan_full)
     axis = vlsrk_axis_for_spectrum(row_meta, v_corr_kms=float(v_corr_kms), nchan=int(nchan_full))
     if ch_slice is not None:
@@ -416,13 +510,20 @@ def run_baseline_fit(
     # Standard policy: VELOSYS is the canonical unapplied velocity column [m/s].
     v_corr_col: str = "VELOSYS",
     rest_freq: Optional[float] = None,
+    apply: bool = True,
+    bsl_overwrite: str = "replace",
     on_fail: str = "exit",
     overwrite: bool = True
 ) -> Scantable:
     """
-    Apply polynomial baseline subtraction to a Scantable (VLA supported).
+    Apply or evaluate a polynomial baseline on a Scantable (VLA supported).
     """
     policy = FailPolicy(on_fail)
+
+    apply = bool(apply)
+    bsl_overwrite = str(bsl_overwrite).strip().lower()
+    if bsl_overwrite not in {"replace", "error"}:
+        raise ValueError("bsl_overwrite must be 'replace' or 'error'.")
 
     # 1. Load Data
     if isinstance(input_data, str):
@@ -437,6 +538,9 @@ def run_baseline_fit(
     data_source = sc.data 
     table = sc.table.copy()      # [MODIFIED] コピーして汚染防止
     hist = dict(sc.history)      # [MODIFIED] コピーして汚染防止
+
+    if bsl_overwrite == "error" and any(str(c).startswith("BSL_") for c in table.columns):
+        raise ValueError("BSL_* columns already exist; bsl_overwrite='error' forbids replacing them.")
     
     # [ADDED] Ensure table is native endian immediately to prevent iloc issues
     table = _df_to_native_endian(table)
@@ -530,6 +634,8 @@ def run_baseline_fit(
     new_data_list = []
     coeffs_list = []
     rms_list = []
+    nused_list = []
+    done_list = []
     sliced_flags = []
     keep_mask = [] # For skipping rows if policy=skip
 
@@ -549,12 +655,13 @@ def run_baseline_fit(
             rest_hz = row_meta.get("RESTFRQ", row_meta.get("RESTFREQ", None))
             if rest_hz in (None, ""):
                 raise ValueError("Missing RESTFRQ/RESTFREQ; baseline fitting in velocity windows requires a rest frequency.")
-            v_corr_kms, v_corr_source = _extract_vcorr_kms(row_i, row_meta, preferred_key=v_corr_col)
+            v_corr_kms, v_corr_source = _extract_vcorr_kms(row_i, preferred_key=v_corr_col)
 
             if "TOPO" in specsys and v_corr_source is None:
+                cand_txt = ", ".join(_vcorr_candidate_names(v_corr_col))
                 raise ValueError(
-                    f"Row {i} has SPECSYS={specsys} but no usable velocity correction column "
-                    f"({v_corr_col}, VELOSYS, VFRAME, V_CORR_KMS)."
+                    f"Row {i} has SPECSYS={specsys} but no usable row-wise velocity correction column "
+                    f"({cand_txt})."
                 )
             if "LSR" in specsys and abs(v_corr_kms) > 1.0e-9:
                 raise ValueError(
@@ -601,9 +708,12 @@ def run_baseline_fit(
             resid = spec - baseline
             rms_val = info.get("std", np.nan) # Use STD as RMS
 
-            new_data_list.append(resid.astype(np.float32))
-            coeffs_list.append(coeffs)
+            out_spec = resid if apply else spec
+            new_data_list.append(np.asarray(out_spec, dtype=np.float32))
+            coeffs_list.append(np.asarray(coeffs, dtype=float))
             rms_list.append(rms_val)
+            nused_list.append(int(np.count_nonzero(info.get("mask", np.zeros_like(spec, dtype=bool)))))
+            done_list.append(True)
             sliced_flags.append(did_apply_channel_slice)
             keep_mask.append(True)
 
@@ -616,9 +726,11 @@ def run_baseline_fit(
                 # If "skip", we remove it later.
                 # If "warn", we keep original data.
                 keep_mask.append(False if policy.mode == "skip" else True)
-                new_data_list.append(spec.astype(np.float32)) # No subtract
-                coeffs_list.append(np.zeros(int(poly_order) + 1))
+                new_data_list.append(np.asarray(spec, dtype=np.float32)) # No subtract
+                coeffs_list.append(None)
                 rms_list.append(np.nan)
+                nused_list.append(0)
+                done_list.append(False)
                 sliced_flags.append(did_apply_channel_slice)
                 if policy.mode == "warn":
                     print(f"Warning: Baseline fit failed row {i}, kept original.")
@@ -631,6 +743,8 @@ def run_baseline_fit(
             new_data_list = [d for d, k in zip(new_data_list, keep_bool) if k]
             coeffs_list = [c for c, k in zip(coeffs_list, keep_bool) if k]
             rms_list = [r for r, k in zip(rms_list, keep_bool) if k]
+            nused_list = [u for u, k in zip(nused_list, keep_bool) if k]
+            done_list = [d for d, k in zip(done_list, keep_bool) if k]
             sliced_flags = [f for f, k in zip(sliced_flags, keep_bool) if k]
             n_rows = len(table)
 
@@ -655,13 +769,18 @@ def run_baseline_fit(
     table, meta = _update_wcs_after_channel_slice(table, meta, new_data_list, ch_start, ch_stop, sliced_flags)
 
     # 7. Update Table & History
+    table = _drop_bsl_metadata_columns(table)
     vwin_str = ";".join(vwin) if vwin else ""
     table = _apply_baseline_to_table(
         table, 
         coeffs_list, 
         rms_list, 
         poly_orders=poly_order,
-        win_f_list=vwin_str
+        win_f_list=vwin_str,
+        applied=apply,
+        stage="baseline_fit",
+        done_list=done_list,
+        nused_list=nused_list,
     )
 
     history_entry = {
@@ -682,6 +801,10 @@ def run_baseline_fit(
             "ch_stop": None if ch_stop is None else int(ch_stop),
             "v_corr_col": str(v_corr_col),
             "rest_freq": None if rest_freq is None else float(rest_freq),
+            "apply": bool(apply),
+            "bsl_overwrite": str(bsl_overwrite),
+            "window_frame": "VLSR",
+            "vcorr_source_policy": "row_only",
         }
     }
     

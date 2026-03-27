@@ -1,6 +1,7 @@
 from __future__ import annotations
 import builtins
 import logging
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Sequence
 import numpy as np
@@ -8,11 +9,114 @@ import scipy.sparse as sp
 from scipy.sparse.linalg import lsqr
 from scipy.spatial import cKDTree
 from .config import GridInput
-from .gridder import create_grid_input
-from ..utils import parse_windows, in_any_windows
+from .gridder import create_grid_input, _resolve_otf_processing_policy, _resolve_projection_reference_for_scantables
+from ..ranges import parse_windows, window_to_mask
 
 
 C_KMS = 299792.458
+
+
+_FORMAL_STREAM_COLS_BW = ('FDNUM', 'IFNUM', 'PLNUM')
+_FALLBACK_STREAM_COLS_BW = ('BEAM', 'POL', 'IF', 'ARRAYID', 'FEED', 'STREAM', 'SIDEBAND', 'BAND', 'RX', 'SAMPLER', 'BOARD', 'XFFTSBOARD')
+
+
+def _normalize_otf_scan_png_path(path_like, *, default_path: str | None = None):
+    if path_like in (None, False):
+        return None
+    if path_like is True:
+        return str(default_path if default_path is not None else 'otf_scan_region.png')
+    return str(path_like)
+
+
+def _indexed_otf_scan_png_path(path_like, index: int, total: int, *, default_path: str | None = None):
+    resolved = _normalize_otf_scan_png_path(path_like, default_path=default_path)
+    if resolved is None:
+        return None
+    path = Path(str(resolved))
+    if total <= 1:
+        return str(path)
+    return str(path.with_name(f'{path.stem}.{index:03d}{path.suffix}'))
+
+
+def _resolve_otf_scan_png_sequence(otf_scan_png, count: int, *, default_path: str | None = None):
+    if count <= 0:
+        return []
+    if isinstance(otf_scan_png, (list, tuple)):
+        if len(otf_scan_png) != count:
+            raise ValueError('otf_scan_png sequence length must match the number of inputs.')
+        out = []
+        for i, item in enumerate(otf_scan_png):
+            if item is True:
+                out.append(_indexed_otf_scan_png_path(item, i, count, default_path=default_path))
+            else:
+                out.append(_normalize_otf_scan_png_path(item, default_path=default_path))
+        return out
+    return [
+        _indexed_otf_scan_png_path(otf_scan_png, i, count, default_path=default_path)
+        for i in range(count)
+    ]
+
+
+def _ensure_not_all_empty_inputs(dataset_or_input_data):
+    items = dataset_or_input_data if isinstance(dataset_or_input_data, (list, tuple)) else [dataset_or_input_data]
+    lengths = []
+    for idx, item in enumerate(items):
+        if isinstance(item, GridInput):
+            lengths.append(int(len(np.asarray(item.x))))
+            continue
+        table = getattr(item, 'table', None)
+        if table is None:
+            continue
+        lengths.append(int(len(table)))
+    if lengths and not any(n > 0 for n in lengths):
+        raise ValueError('All input scantables/GridInputs are empty; at least one non-empty input is required for basketweave.')
+
+def _input_row_count_for_basketweave(item) -> int | None:
+    if isinstance(item, GridInput):
+        return int(len(np.asarray(item.x)))
+    table = getattr(item, 'table', None)
+    if table is None:
+        return None
+    return int(len(table))
+
+def _filter_nonempty_inputs_for_basketweave(dataset_or_input_data):
+    items = dataset_or_input_data if isinstance(dataset_or_input_data, (list, tuple)) else [dataset_or_input_data]
+    kept = []
+    skipped = []
+    for idx, item in enumerate(items):
+        nrow = _input_row_count_for_basketweave(item)
+        if nrow is None or int(nrow) > 0:
+            kept.append((idx, item))
+        else:
+            skipped.append(int(idx))
+    if skipped:
+        import warnings
+        warnings.warn(
+            f'basketweave is skipping empty inputs at indices {skipped}.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return kept, skipped
+
+
+
+def _ensure_safe_basketweave_input(dataset_or_input_data, *, otf_input_state=None, otf_scan_region=None):
+    state, _ = _resolve_otf_processing_policy(otf_input_state=otf_input_state, otf_scan_region=otf_scan_region)
+    if state != "use_existing_labels":
+        return
+    items = dataset_or_input_data if isinstance(dataset_or_input_data, (list, tuple)) else [dataset_or_input_data]
+    required_cols = {"SCAN", "IS_TURN", "FDNUM", "IFNUM", "PLNUM"}
+    for idx, item in enumerate(items):
+        if isinstance(item, GridInput):
+            continue
+        table = getattr(item, 'table', None)
+        cols = set(getattr(table, 'columns', [])) if table is not None else set()
+        missing = sorted(required_cols - cols)
+        if missing:
+            raise ValueError(
+                "otf_input_state='use_existing_labels' requires SCAN, IS_TURN, FDNUM, IFNUM, and PLNUM in every raw scantable "
+                f"before basketweave. Input {idx} is missing: {', '.join(str(c) for c in missing)}."
+            )
 
 def _normalize_unit_local(unit_str: str) -> str:
     u = str(unit_str).strip().lower()
@@ -116,6 +220,8 @@ def _infer_velocity_axis_kms_from_dataset(dataset) -> np.ndarray:
 
 def _infer_velocity_axis_kms_for_input(dataset_or_input_data) -> np.ndarray | None:
     if isinstance(dataset_or_input_data, (list, tuple)):
+        _ensure_not_all_empty_inputs(dataset_or_input_data)
+        _validate_grid_input_contract(dataset_or_input_data)
         axes = []
         for item in dataset_or_input_data:
             if isinstance(item, GridInput):
@@ -248,7 +354,7 @@ def _build_channel_mask(*, spec: np.ndarray, v_axis: np.ndarray | None, linefree
             windows = parse_windows(linefree_velocity_windows_kms)
         else:
             windows = linefree_velocity_windows_kms
-        resolved_mask = in_any_windows(v_axis, windows)
+        resolved_mask = window_to_mask(np.asarray(v_axis, dtype=float), windows)
         if not np.any(resolved_mask):
             logging.error('Basket-weave aborted: No channels found in windows %s.', linefree_velocity_windows_kms)
             logging.error('(Available velocity range is approx %.1f to %.1f km/s)', np.nanmin(v_axis), np.nanmax(v_axis))
@@ -724,10 +830,10 @@ def estimate_basket_weave_search_radius_arcsec(input_data: GridInput, *, cross_s
             return radius
     return float(fallback_arcsec)
 
-def _as_grid_input(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_scan_region=False, otf_scan_png=None, otf_scan_existing_is_turn: str='prefer') -> GridInput:
+def _as_grid_input(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None) -> GridInput:
     if isinstance(dataset_or_input_data, GridInput):
         return dataset_or_input_data
-    return create_grid_input(dataset_or_input_data, ref_coord=ref_coord, frame=frame, projection=projection, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
+    return create_grid_input(dataset_or_input_data, ref_coord=ref_coord, frame=frame, projection=projection, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
 
 def _concatenate_optional_numeric(arrays: list[np.ndarray | None], lengths: list[int]) -> np.ndarray | None:
     if all((a is None for a in arrays)):
@@ -750,6 +856,52 @@ def _concatenate_optional_bool(arrays: list[np.ndarray | None], lengths: list[in
         else:
             out_list.append(_safe_bool_array(arr, default=default))
     return np.concatenate(out_list, axis=0)
+
+
+def _summarize_global_scan_ranges(scan_id_chunks: list[np.ndarray], inputs: Sequence[GridInput]) -> list[dict]:
+    out: list[dict] = []
+    for idx, (sid, inp) in enumerate(zip(scan_id_chunks, inputs)):
+        sid = np.asarray(sid, dtype=np.int64)
+        valid = sid[sid >= 0]
+        uniq = np.unique(valid) if valid.size else np.empty(0, dtype=np.int64)
+        source_input_index = getattr(inp, '_source_input_index', idx)
+        entry = {
+            'input_index': int(source_input_index),
+            'global_scan_id_min': None if uniq.size == 0 else int(uniq.min()),
+            'global_scan_id_max': None if uniq.size == 0 else int(uniq.max()),
+            'num_global_scan_ids': int(uniq.size),
+            'num_points_total': int(sid.size),
+            'num_points_scan': int(valid.size),
+            'source_summary': getattr(inp, '_otf_scan_summary', None),
+        }
+        out.append(entry)
+    return out
+
+
+def _validate_grid_input_contract(dataset_or_input_data):
+    items = dataset_or_input_data if isinstance(dataset_or_input_data, (list, tuple)) else [dataset_or_input_data]
+    for idx, item in enumerate(items):
+        if not isinstance(item, GridInput):
+            continue
+        if item.scan_id is None:
+            raise ValueError(f'GridInput input {idx} is missing scan_id. When passing GridInput directly to basketweave, the caller must materialize scan_id / is_turnaround / scan_dir consistently in advance.')
+        if item.is_turnaround is None:
+            raise ValueError(f'GridInput input {idx} is missing is_turnaround. When passing GridInput directly to basketweave, the caller must materialize scan_id / is_turnaround / scan_dir consistently in advance.')
+
+
+def _validate_reference_scan_id_requested(reference_mode, reference_scan_id: int | None, uniq_scan_ids: np.ndarray):
+    mode = None if reference_mode is None else str(reference_mode).strip().lower()
+    if mode != 'scan_zero' or reference_scan_id is None:
+        return
+    uniq = np.asarray(uniq_scan_ids, dtype=np.int64)
+    if uniq.size == 0:
+        raise ValueError('reference_scan_id was given, but no valid scan_id exists in the basketweave input.')
+    ref_id = int(reference_scan_id)
+    if not np.any(uniq == ref_id):
+        lo = int(uniq.min())
+        hi = int(uniq.max())
+        raise ValueError(f'reference_scan_id={ref_id} is not present in the basketweave input. Valid global scan_id range is {lo}..{hi}.')
+
 
 def _merge_grid_inputs(inputs: Sequence[GridInput]) -> GridInput:
     if len(inputs) == 0:
@@ -808,6 +960,7 @@ def _merge_grid_inputs(inputs: Sequence[GridInput]) -> GridInput:
             next_scan_id += len(uniq)
         scan_id_chunks.append(out_sid)
     scan_id = np.concatenate(scan_id_chunks, axis=0)
+    global_scan_ranges = _summarize_global_scan_ranges(scan_id_chunks, inputs)
     subscan_id = None
     if any((inp.subscan_id is not None for inp in inputs)):
         subscan_list = []
@@ -826,9 +979,26 @@ def _merge_grid_inputs(inputs: Sequence[GridInput]) -> GridInput:
             else:
                 scan_dir_list.append(np.asarray(inp.scan_dir, dtype=object))
         scan_dir = np.concatenate(scan_dir_list, axis=0)
-    return GridInput(x=x, y=y, spec=spec, flag=flag, time=time, rms=rms, tint=tint, tsys=tsys, scan_id=scan_id, subscan_id=subscan_id, scan_dir=scan_dir, is_turnaround=is_turnaround)
+    merged = GridInput(x=x, y=y, spec=spec, flag=flag, time=time, rms=rms, tint=tint, tsys=tsys, scan_id=scan_id, subscan_id=subscan_id, scan_dir=scan_dir, is_turnaround=is_turnaround)
+    child_summaries = [getattr(inp, '_otf_scan_summary', None) for inp in inputs]
+    merged_summary = {
+        'summary_version': 2,
+        'kind': 'multi_input',
+        'reference_scan_id_semantics': 'global after merge',
+        'num_inputs': int(len(inputs)),
+        'num_points_total': int(len(scan_id)),
+        'num_points_scan_total': int(np.count_nonzero(scan_id >= 0)),
+        'num_runs_total': int(len(np.unique(scan_id[scan_id >= 0]))) if np.any(scan_id >= 0) else 0,
+        'global_scan_id_ranges': global_scan_ranges,
+        'inputs': child_summaries,
+    }
+    input_states = sorted({str(s.get('input_state')) for s in child_summaries if isinstance(s, dict) and s.get('input_state') is not None})
+    if len(input_states) == 1:
+        merged_summary['input_state'] = input_states[0]
+    setattr(merged, '_otf_scan_summary', merged_summary)
+    return merged
 
-def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_scan_region=False, otf_scan_png=None, otf_scan_existing_is_turn: str='prefer') -> tuple[GridInput, object | None, bool, list[int] | None]:
+def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None) -> tuple[GridInput, object | None, bool, list[int] | None]:
     """
     Normalize input into a single GridInput.
 
@@ -843,12 +1013,57 @@ def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, fr
         Lengths of the merged segments when the input was a list/tuple.
     """
     if isinstance(dataset_or_input_data, (list, tuple)):
-        grid_inputs = [_as_grid_input(item, projection=projection, ref_coord=ref_coord, frame=frame, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn) for item in dataset_or_input_data]
+        _ensure_not_all_empty_inputs(dataset_or_input_data)
+        kept_items, skipped_empty_indices = _filter_nonempty_inputs_for_basketweave(dataset_or_input_data)
+        used_items = [item for _, item in kept_items]
+        _validate_grid_input_contract(used_items)
+        raw_items = [item for item in used_items if not isinstance(item, GridInput)]
+        grid_items = [item for item in used_items if isinstance(item, GridInput)]
+        ref_coord_use = ref_coord
+        if ref_coord_use is None and raw_items:
+            if grid_items:
+                raise ValueError(
+                    'When multi-input basketweave mixes GridInput and scantable objects, an explicit ref_coord is required '
+                    'so that all inputs share the same projection reference.'
+                )
+            lon0, lat0 = _resolve_projection_reference_for_scantables(raw_items, frame=frame)
+            ref_coord_use = (float(lon0), float(lat0))
+        png_paths_all = _resolve_otf_scan_png_sequence(otf_scan_png, len(dataset_or_input_data))
+        grid_inputs = []
+        for orig_idx, item in kept_items:
+            gi = _as_grid_input(
+                item,
+                projection=projection,
+                ref_coord=ref_coord_use,
+                frame=frame,
+                otf_input_state=otf_input_state,
+                otf_scan_region=otf_scan_region,
+                otf_scan_png=png_paths_all[orig_idx],
+                existing_turn_labels=existing_turn_labels,
+                otf_scan_existing_is_turn=otf_scan_existing_is_turn,
+            )
+            setattr(gi, '_source_input_index', int(orig_idx))
+            grid_inputs.append(gi)
         lengths = [int(len(np.asarray(gi.x))) for gi in grid_inputs]
-        return (_merge_grid_inputs(grid_inputs), dataset_or_input_data, False, lengths)
+        merged = _merge_grid_inputs(grid_inputs)
+        if not hasattr(merged, '_otf_scan_summary'):
+            merged_summary = {
+                'summary_version': 2,
+                'kind': 'multi_input',
+                'reference_scan_id_semantics': 'global after merge',
+                'num_inputs': int(len(grid_inputs)),
+                'inputs': [getattr(gi, '_otf_scan_summary', None) for gi in grid_inputs],
+                'num_inputs_original': int(len(dataset_or_input_data)),
+                'num_inputs_used': int(len(grid_inputs)),
+                'used_input_indices': [int(v) for v, _ in kept_items],
+                'skipped_empty_input_indices': [int(v) for v in skipped_empty_indices],
+            }
+            setattr(merged, '_otf_scan_summary', merged_summary)
+        return (merged, dataset_or_input_data, False, lengths)
     if isinstance(dataset_or_input_data, GridInput):
+        _validate_grid_input_contract(dataset_or_input_data)
         return (dataset_or_input_data, None, False, None)
-    input_data = _as_grid_input(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
+    input_data = _as_grid_input(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
     return (input_data, dataset_or_input_data, True, None)
 
 def _sort_scan_sample_indices(indices: np.ndarray, time_values: np.ndarray | None) -> np.ndarray:
@@ -1430,6 +1645,7 @@ def _solve_basket_weave_core(input_data: GridInput, search_radius_arcsec: float 
     d = d_all[good]
     scan_ids = scan_ids_all[good]
     uniq_scan_ids, inv_scan = np.unique(scan_ids, return_inverse=True)
+    _validate_reference_scan_id_requested(reference_mode, reference_scan_id, uniq_scan_ids)
     diagnostics['num_scans'] = int(len(uniq_scan_ids))
     scan_dir_good = None
     if input_data.scan_dir is not None:
@@ -1601,14 +1817,15 @@ def apply_basket_weave_correction(input_data: GridInput, offsets_or_solution) ->
     else:
         input_data.spec -= correction_vector[:, np.newaxis]
 
-def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only', otf_scan_region=False, otf_scan_png=None, otf_scan_existing_is_turn: str='prefer') -> BasketWeaveResult:
+def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only', otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None) -> BasketWeaveResult:
+    _ensure_safe_basketweave_input(dataset_or_input_data, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region)
     effective_v_axis = None if v_axis is None else np.asarray(v_axis, dtype=float)
     resolved_windows = _resolve_linefree_velocity_windows(linefree_velocity_windows_kms=linefree_velocity_windows_kms, v_windows_kms=v_windows_kms)
     if effective_v_axis is None and channel_mask is None and resolved_windows is not None:
         inferred_v_axis = _infer_velocity_axis_kms_for_input(dataset_or_input_data)
         if inferred_v_axis is not None:
             effective_v_axis = np.asarray(inferred_v_axis, dtype=float)
-    input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
+    input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
     spec = np.asarray(input_data.spec)
     solution, diagnostics = _solve_basket_weave_core(input_data, search_radius_arcsec=search_radius_arcsec, damp=damp, v_axis=effective_v_axis, linefree_velocity_windows_kms=linefree_velocity_windows_kms, channel_mask=channel_mask, v_windows_kms=v_windows_kms, cross_direction_only=cross_direction_only, orthogonality_tolerance_deg=orthogonality_tolerance_deg, fallback_to_all_cross_scan_pairs=fallback_to_all_cross_scan_pairs, pair_mode=pair_mode, offset_model=offset_model, reference_mode=reference_mode, reference_direction=reference_direction, reference_scan_id=reference_scan_id, reference_constraint_weight=reference_constraint_weight, reference_constrain_terms=reference_constrain_terms)
     apply_basket_weave_correction(input_data, solution)
@@ -1680,3 +1897,112 @@ def plot_basket_weave_scan_coefficients(result: BasketWeaveResult, *, term: int=
     ax.set_ylabel(label)
     ax.set_title('Basket-weave scan coefficients')
     return fig if created else ax
+
+# -----------------------------------------------------------------------------
+# FFT/PLAIT public wrappers (new standard path)
+# -----------------------------------------------------------------------------
+from .otf_bundle import OTFBundle  # noqa: E402
+from .otf_bundle_io import read_otf_bundle, write_otf_bundle  # noqa: E402
+from .otf_family_grid import grid_otf_family  # noqa: E402
+from .cube_coadd import coadd_family_cubes  # noqa: E402
+from .plait_fft import plait_fft_cubes  # noqa: E402
+
+
+def basketweave_cubes(
+    x_bundle: OTFBundle,
+    y_bundle: OTFBundle,
+    *,
+    linefree_velocity_windows_kms,
+    output_fits: str | None = None,
+    overwrite: bool = False,
+    **kwargs,
+) -> OTFBundle:
+    """User-facing FFT/PLAIT basket-weave wrapper."""
+    out = plait_fft_cubes(
+        x_bundle,
+        y_bundle,
+        linefree_velocity_windows_kms=linefree_velocity_windows_kms,
+        **kwargs,
+    )
+    if output_fits is not None:
+        write_otf_bundle(out, output_fits, overwrite=overwrite)
+    return out
+
+
+def basketweave_fits(
+    x_fits: str,
+    y_fits: str,
+    output_fits: str,
+    *,
+    linefree_velocity_windows_kms,
+    overwrite: bool = False,
+    **kwargs,
+) -> OTFBundle:
+    """FITS wrapper for FFT/PLAIT basket-weaving."""
+    x_bundle = read_otf_bundle(x_fits)
+    y_bundle = read_otf_bundle(y_fits)
+    return basketweave_cubes(
+        x_bundle,
+        y_bundle,
+        linefree_velocity_windows_kms=linefree_velocity_windows_kms,
+        output_fits=output_fits,
+        overwrite=overwrite,
+        **kwargs,
+    )
+
+
+def run_otf_plait_pipeline(
+    x_inputs,
+    y_inputs,
+    config,
+    *,
+    linefree_velocity_windows_kms,
+    output_fits: str | None = None,
+    x_family_label: str = "X",
+    y_family_label: str = "Y",
+    x_output_fits: str | None = None,
+    y_output_fits: str | None = None,
+    overwrite: bool = False,
+    grid_kwargs: dict | None = None,
+    plait_kwargs: dict | None = None,
+    **legacy_kwargs,
+) -> OTFBundle:
+    """High-level X/Y family gridding + FFT/PLAIT basket-weave pipeline."""
+    plait_only_keys = {
+        'noise_mode', 'plait_noise_mode', 'pad_frac', 'apodize', 'apodize_alpha', 'support_taper',
+        'support_taper_width_pix', 'science_mask_mode', 'fft_workers', 'dtype',
+        'diagnostics', 'min_plait_size_pix', 'small_map_policy',
+        'quality_gate_mode', 'min_improvement_frac',
+    }
+    grid_kwargs = {} if grid_kwargs is None else dict(grid_kwargs)
+    plait_kwargs = {} if plait_kwargs is None else dict(plait_kwargs)
+    for key, value in legacy_kwargs.items():
+        if key in plait_only_keys:
+            plait_kwargs.setdefault(key, value)
+        else:
+            grid_kwargs.setdefault(key, value)
+
+    x_bundle = grid_otf_family(
+        x_inputs,
+        config,
+        family_label=x_family_label,
+        output_fits=x_output_fits,
+        overwrite=overwrite,
+        **grid_kwargs,
+    )
+    y_bundle = grid_otf_family(
+        y_inputs,
+        config,
+        family_label=y_family_label,
+        output_fits=y_output_fits,
+        overwrite=overwrite,
+        **grid_kwargs,
+    )
+    return basketweave_cubes(
+        x_bundle,
+        y_bundle,
+        linefree_velocity_windows_kms=linefree_velocity_windows_kms,
+        output_fits=output_fits,
+        overwrite=overwrite,
+        **plait_kwargs,
+    )

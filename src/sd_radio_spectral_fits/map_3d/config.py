@@ -60,10 +60,14 @@ class MapConfig:
     dtype: str = "float32"
 
     # --- 3. 重み付け・品質管理 ---
-    # 論文向けの既定: RMS が信頼できる場合の逆分散重みを既定にする。
-    # q *= (1 / rms^2)^alpha_rms なので、alpha_rms=1.0 -> q \propto 1/rms^2。
+    # weight_mode は dump ごとの追加重み q_i の作り方を決める。
+    #   uniform : q_i = 1
+    #   rms     : q_i *= (1 / rms_i^2)^alpha_rms
+    #             ここで rms_i は BSL_RMS 列から与える。
+    #             weight_mode='rms' のとき BSL_RMS 欠落・NaN・非正値は error。
     # beta_tint は RMS に積分時間の効果がすでに入っている前提で既定 0.0 とする。
     # weight_clip_quantile は既定では無効化し、必要時のみ明示指定で使う。
+    weight_mode: Literal['uniform', 'rms'] = 'uniform'
     alpha_rms: float = 1.0
     beta_tint: float = 0.0
     weight_clip_quantile: Optional[float] = None
@@ -122,6 +126,8 @@ class MapConfig:
     # 運用・出力用
     mask_compression: Optional[str] = 'PLIO_1' # FITS保存時の圧縮形式 (互換性重視ならNoneも可)
     dv_kms: Optional[float] = None   # 速度リグリッドの分解能 [km/s]
+    vmin_kms: Optional[float] = None # 出力速度軸の下限 [km/s]
+    vmax_kms: Optional[float] = None # 出力速度軸の上限 [km/s]
     output_prefix: str = "map"      # 出力ファイルの接頭辞
 
     # --- 7. 実行バックエンド ---

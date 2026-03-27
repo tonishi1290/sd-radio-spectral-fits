@@ -180,6 +180,9 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, float | str | b
         raise ValueError("chunk_ch must be positive")
     if runtime["dtype_name"] not in ("float32", "float64"):
         raise ValueError("dtype must be 'float32' or 'float64'")
+    weight_mode = str(getattr(config, 'weight_mode', 'uniform')).strip().lower()
+    if weight_mode not in ('uniform', 'rms'):
+        raise ValueError("weight_mode must be 'uniform' or 'rms'")
     if config.weight_clip_quantile is not None and not (0.0 <= float(config.weight_clip_quantile) <= 1.0):
         raise ValueError("weight_clip_quantile must be within [0, 1]")
     if config.weight_clip_max is not None and float(config.weight_clip_max) <= 0:
@@ -734,10 +737,19 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
     valid &= np.isfinite(x_all) & np.isfinite(y_all)
     valid &= np.any(np.isfinite(spec_all), axis=1)
 
+    weight_mode = str(getattr(config, 'weight_mode', 'uniform')).strip().lower()
     rms_all, tint_all, tsys_all = None, None, None
     if input_data.rms is not None:
         rms_all = np.asarray(input_data.rms)
-        valid &= np.isfinite(rms_all) & (rms_all > 0)
+        if weight_mode == 'rms':
+            bad_rms = (~np.isfinite(rms_all)) | (rms_all <= 0)
+            if np.any(bad_rms):
+                n_bad = int(np.count_nonzero(bad_rms))
+                raise ValueError(
+                    "weight_mode='rms' requires finite positive GridInput.rms for every dump. "
+                    f"Found {n_bad}/{len(rms_all)} invalid dumps. "
+                    "Provide valid BSL_RMS for all inputs, or set weight_mode='uniform'."
+                )
     if input_data.tint is not None:
         tint_all = np.asarray(input_data.tint)
         valid &= np.isfinite(tint_all) & (tint_all >= 0)
@@ -758,7 +770,12 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
 
     # 重み (q) の計算
     q = np.ones(len(x), dtype=dtype_np)
-    if rms is not None:
+    if weight_mode == 'rms':
+        if rms is None:
+            raise ValueError(
+                "weight_mode='rms' requires GridInput.rms for every dump. "
+                "Provide valid BSL_RMS through the OTF pipeline, or set weight_mode='uniform'."
+            )
         q *= (1.0 / (rms * rms + dtype_np(1e-12))) ** dtype_np(config.alpha_rms)
     if tint is not None and config.beta_tint > 0:
         q *= tint ** dtype_np(config.beta_tint)
@@ -1066,6 +1083,7 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
             "jwidth_source": str(kernel_resolved.get("jwidth_source", "")),
             "support_source": str(kernel_resolved.get("support_source", "")),
             "mask_map_semantics": "spatial_valid_pre_chanmask",
+            "weight_mode": str(getattr(config, 'weight_mode', 'uniform')).lower(),
             "alpha_rms": float(config.alpha_rms),
             "beta_tint": float(config.beta_tint),
             "support_radius_pix": float(kernel_resolved["support_radius_pix"]),

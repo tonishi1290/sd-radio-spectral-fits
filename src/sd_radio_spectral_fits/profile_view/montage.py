@@ -39,6 +39,20 @@ from ..tempscale import (
     tr_to_ta
 )
 
+
+
+def _row_has_display_baseline(row: pd.Series) -> bool:
+    applied = row.get("BSL_APPLIED", False)
+    try:
+        if pd.isna(applied):
+            applied = False
+    except Exception:
+        pass
+    if not bool(applied):
+        return False
+    arr = _parse_list_like(row.get("BSL_COEF")) if "BSL_COEF" in row.index else None
+    return arr is not None
+
 # -----------------------------------------------------------------------------
 # Row Selection Helper
 # -----------------------------------------------------------------------------
@@ -620,8 +634,8 @@ class ProfileMapMontageViewer:
                     spec_val = tr_to_ta(spec_val, np.array([eff]))[0]
 
             # Baseline Reconstruction (viewer-compatible)
-            arr = _parse_list_like(row.get("BSL_COEF")) if "BSL_COEF" in row.index else None
-            has_bsl = arr is not None
+            has_bsl = _row_has_display_baseline(row)
+            arr = _parse_list_like(row.get("BSL_COEF")) if has_bsl and "BSL_COEF" in row.index else None
             baseline_curve = None
 
             if has_bsl:
@@ -676,7 +690,7 @@ class ProfileMapMontageViewer:
                 ax.axhline(0, lw=0.4, color="gray", ls="--")
                 
             # [MODIFIED] Draw Fit Windows
-            win_str = str(row.get("BSL_WINF", ""))
+            win_str = str(row.get("BSL_WINF", "")) if has_bsl else ""
             if self.show_fit_windows and win_str and str(win_str).lower() not in ("nan", "none", ""):
                 try:
                     wins_x = fit_windows_xaxis(
@@ -809,7 +823,12 @@ class ProfileMapMontageViewer:
             self.page = (self.page - 1 + builtins.max(n_pages, 1)) % builtins.max(n_pages, 1)
             self.update_plot()
         elif key == "b":
-            self.view_mode = "baseline_added" if self.view_mode == "original" else "original"
+            has_any_bsl = any(_row_has_display_baseline(self.st.table.iloc[int(i)]) for i in self.indices) if len(self.indices) else False
+            if not has_any_bsl:
+                print("⚠️ BSL_APPLIED=True の baseline 情報が無いため Baseline View は切替できません。")
+                self.view_mode = "original"
+            else:
+                self.view_mode = "baseline_added" if self.view_mode == "original" else "original"
             self.update_plot()
         elif key == "w":
             self.show_fit_windows = not self.show_fit_windows

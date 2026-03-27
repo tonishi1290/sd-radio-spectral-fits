@@ -37,6 +37,20 @@ from ..tempscale import (
     tr_to_ta
 )
 
+
+
+def _row_has_display_baseline(row: pd.Series) -> bool:
+    applied = row.get("BSL_APPLIED", False)
+    try:
+        if pd.isna(applied):
+            applied = False
+    except Exception:
+        pass
+    if not bool(applied):
+        return False
+    arr = _parse_list_like(row.get("BSL_COEF")) if "BSL_COEF" in row.index else None
+    return arr is not None
+
 # -----------------------------------------------------------------------------
 # Row Selection Helper
 # -----------------------------------------------------------------------------
@@ -801,11 +815,10 @@ class ProfileMapGridViewer:
         self.page = 0
 
         self._has_any_baseline = False
-        if "BSL_COEF" in self.st.table.columns:
-            for _v in self.st.table["BSL_COEF"].tolist():
-                if _parse_list_like(_v) is not None:
-                    self._has_any_baseline = True
-                    break
+        for _, _row in self.st.table.iterrows():
+            if _row_has_display_baseline(_row):
+                self._has_any_baseline = True
+                break
 
         # --- Layout & Figure Setup ---
         
@@ -1085,10 +1098,9 @@ class ProfileMapGridViewer:
         return None
 
     def _baseline_curve_for_row(self, i: int, vel_axis: np.ndarray, row_scale: Optional[str] = None) -> Optional[np.ndarray]:
-        if "BSL_COEF" not in self.st.table.columns:
-            return None
-
         row = self.st.table.iloc[int(i)]
+        if not _row_has_display_baseline(row):
+            return None
         arr = _parse_list_like(row.get("BSL_COEF")) if "BSL_COEF" in row.index else None
         if arr is None:
             return None
@@ -1345,7 +1357,7 @@ class ProfileMapGridViewer:
                             ax.axhline(0, lw=0.3, color="gray", ls="--")
                         elif self.view_mode != "baseline_added":
                             ax.axhline(0, lw=0.3, color="gray", ls="--")
-                        win_str = str(row.get("BSL_WINF", ""))
+                        win_str = str(row.get("BSL_WINF", "")) if _row_has_display_baseline(row) else ""
 
                         # Windows Display
                         if self.show_fit_windows and win_str and str(win_str).lower() not in ("nan", "none", ""):
@@ -1519,7 +1531,7 @@ class ProfileMapGridViewer:
             self.rms_on = "display" if self.rms_on == "raw" else "raw"; self.update_plot()
         elif key in ("b", "B"):
             if not getattr(self, "_has_any_baseline", False):
-                print("⚠️ BSL_COEF が無いため Baseline View は切替できません。")
+                print("⚠️ BSL_APPLIED=True の baseline 情報が無いため Baseline View は切替できません。")
                 self.view_mode = "original"
             else:
                 self.view_mode = "baseline_added" if self.view_mode == "original" else "original"
