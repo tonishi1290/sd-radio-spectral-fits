@@ -1,16 +1,5 @@
 # OTF gridding + FFT/PLAIT basketweave 実装マニュアル（現在の実装版 + 2026-03-26 増補改訂）
 
-## 0. この改訂版の位置づけ
-
-
-方針は次の通りです。
-
-- 元の OTF gridding / coadd / FFT/PLAIT の説明は可能な限り残す
-- 旧記述のうち、現在の実装とずれる箇所は **2026-03-26 増補** としてその場で修正する
-- ここで追加された `mosaic.py` 系の関数、`MOSAIC_*` ext、`plait_noise_mode`、BW 後 provenance ext も本文に統合する
-- まだ未対応の事項（reprojection / union-WCS / 完全な channel 依存 gain など）は制限として明記する
-
-したがって、本書は「r2 を捨てて短く作り直したもの」ではなく、**r2 を尊重しつつ、実装済み追加分を上に積んだ詳細版**です。
 
 ## 1. この文書の対象
 
