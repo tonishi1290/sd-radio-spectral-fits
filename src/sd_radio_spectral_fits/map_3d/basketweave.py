@@ -8,7 +8,7 @@ import numpy as np
 import scipy.sparse as sp
 from scipy.sparse.linalg import lsqr
 from scipy.spatial import cKDTree
-from .config import GridInput
+from .config import GridInput, normalize_row_flag_mask
 from .gridder import create_grid_input, _resolve_otf_processing_policy, _resolve_projection_reference_for_scantables
 from ..ranges import parse_windows, window_to_mask
 
@@ -328,7 +328,7 @@ def _sorted_pairs_array(pairs_arr) -> np.ndarray:
 def _base_geometry_mask(input_data: GridInput, *, x_all: np.ndarray, y_all: np.ndarray, scan_ids_all: np.ndarray) -> np.ndarray:
     good = np.ones_like(x_all, dtype=bool)
     if input_data.flag is not None:
-        good &= np.asarray(input_data.flag) > 0
+        good &= normalize_row_flag_mask(input_data.flag, ndump=x_all.shape[0], allow_none=True, name='flag')
     if input_data.is_turnaround is not None:
         good &= ~_safe_bool_array(input_data.is_turnaround, default=False)
     good &= np.isfinite(x_all) & np.isfinite(y_all)
@@ -931,7 +931,7 @@ def _merge_grid_inputs(inputs: Sequence[GridInput]) -> GridInput:
         if inp.flag is None:
             flag_arrays.append(np.ones(n, dtype=bool))
         else:
-            flag_arrays.append(np.asarray(inp.flag) > 0)
+            flag_arrays.append(normalize_row_flag_mask(inp.flag, ndump=n, allow_none=True, name='flag'))
     flag = np.concatenate(flag_arrays, axis=0)
     time_arrays = []
     for inp, n in zip(inputs, lengths):

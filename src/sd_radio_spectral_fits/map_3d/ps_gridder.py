@@ -9,7 +9,7 @@ from astropy.io import fits
 
 from ..regrid_vlsrk import Standardizer
 from .wcs_proj import project_to_plane
-from .config import GridInput, GridResult
+from .config import GridInput, GridResult, normalize_row_flag_mask
 from ..tempscale import beameff_array, tempscal_array, ta_to_tr
 from ..scantable_utils import _df_to_native_endian
 from .gridder import _extract_rms, _extract_tsys_scalar, _extract_meta_col, _resolve_time_array
@@ -51,7 +51,7 @@ def grid_ps(input_data: GridInput, config: PSMapConfig) -> GridResult:
     spec = np.asarray(input_data.spec, dtype=float)
     
     # フィルタリング (不正なデータや折り返しスキャンを除外)
-    valid = np.asarray(input_data.flag) > 0 if input_data.flag is not None else np.ones(len(x), dtype=bool)
+    valid = normalize_row_flag_mask(input_data.flag, ndump=len(x), allow_none=True, name='flag')
     if input_data.is_turnaround is not None:
         valid &= ~np.asarray(input_data.is_turnaround, dtype=bool)
     valid &= np.isfinite(x) & np.isfinite(y)

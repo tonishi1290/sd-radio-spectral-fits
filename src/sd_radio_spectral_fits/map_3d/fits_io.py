@@ -75,7 +75,7 @@ def _fill_header_metadata(header, coord_sys, lon0, lat0, out_scale, rep_beameff,
         meta = grid_res.meta
         if "kernel" in meta:
             header["KERNEL"] = (str(meta["kernel"]), "Gridding kernel")
-        if "kernel_preset" in meta:
+        if meta.get("kernel_preset") is not None:
             header["KPRESET"] = (str(meta["kernel_preset"]), "Kernel default preset")
         if "kernel_sign" in meta:
             header["KSIGN"] = (str(meta["kernel_sign"]), "Kernel sign handling mode")
@@ -85,6 +85,8 @@ def _fill_header_metadata(header, coord_sys, lon0, lat0, out_scale, rep_beameff,
             header["JWIDTH"] = (float(meta["jwidth_arcsec"]) / 3600.0, "Jinc width [deg]")
         if np.isfinite(meta.get("support_radius_arcsec", np.nan)):
             header["SUPPORTR"] = (float(meta["support_radius_arcsec"]) / 3600.0, "Kernel support radius [deg]")
+        if meta.get("convsupport") is not None:
+            header["CONVSUP"] = (int(meta["convsupport"]), "SF cutoff radius [pixel]")
         if "weight_map_semantics" in meta:
             header["WGTSEM"] = (str(meta["weight_map_semantics"]), "WEIGHT semantics")
         if "hit_map_semantics" in meta:

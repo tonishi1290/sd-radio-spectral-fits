@@ -15,7 +15,7 @@ import pandas as pd
 from ..regrid_vlsrk import Standardizer
 from .core import grid_otf
 from .wcs_proj import project_to_plane
-from .config import MapConfig, GridInput
+from .config import MapConfig, GridInput, normalize_row_flag_mask
 from .fits_io import save_map_fits
 from ..tempscale import beameff_array, tempscal_array, ta_to_tr
 from ..scantable_utils import _df_to_native_endian
@@ -214,7 +214,8 @@ def _collect_otf_diagnostics(
             "cell_arcsec": float(config.cell_arcsec),
             "beam_fwhm_arcsec": float(config.beam_fwhm_arcsec),
             "kernel": str(config.kernel),
-            "kernel_preset": str(getattr(config, "kernel_preset", "mangum2007")),
+            "kernel_preset": getattr(config, "kernel_preset", None),
+            "convsupport": None if getattr(config, "kernel", None) != "sf" else getattr(config, "convsupport", None),
             "kernel_sign": str(getattr(config, "kernel_sign", "auto")),
             "dtype": str(config.dtype),
             "backend": str(config.backend),
@@ -263,7 +264,7 @@ def _collect_otf_diagnostics(
             "y_stats": _nan_stats(grid_input.y),
         },
         "grid_input": {
-            "flag_on_count": int(np.count_nonzero(np.asarray(grid_input.flag) > 0)),
+            "flag_on_count": int(np.count_nonzero(normalize_row_flag_mask(grid_input.flag, ndump=len(grid_input.x), allow_none=True, name='flag'))),
             "time_stats": _nan_stats(grid_input.time),
             "rms_stats": None if grid_input.rms is None else _nan_stats(grid_input.rms),
             "tint_stats": None if grid_input.tint is None else _nan_stats(grid_input.tint),
@@ -368,6 +369,7 @@ def _format_otf_diag_text(diag: dict) -> str:
         if meta.get("kernel") is not None:
             lines.append(
                 f"kernel_resolved: kernel={meta.get('kernel')} preset={meta.get('kernel_preset')} sign={meta.get('kernel_sign')} "
+                f"convsupport={meta.get('convsupport')} "
                 f"gwidth={meta.get('gwidth_arcsec', np.nan):.3f} arcsec "
                 f"jwidth={meta.get('jwidth_arcsec', np.nan):.3f} arcsec "
                 f"support={meta.get('support_radius_arcsec', np.nan):.3f} arcsec "
