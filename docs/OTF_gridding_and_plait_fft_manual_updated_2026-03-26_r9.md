@@ -17,6 +17,8 @@
 
 この文書では、**現在の推奨経路**だけを扱います。過去の設計経緯や旧方式の説明は入れていません。
 
+この版では、kernel に関する記述を **現在の code / spec / kernel 詳細説明書** に合わせて再点検し、特に `sf` の formal default を `convsupport=3`、推奨の 2 本立てを `sf + convsupport=3` と `gjinc + mangum + signed` にそろえています。
+
 ---
 
 ## 2. 全体像
@@ -27,9 +29,9 @@
 
 X 方向群、Y 方向群のように、**走査方向ごとに分けた入力**をそれぞれ gridding し、family cube を作ります。
 
-\[
-\text{raw/scantable} \rightarrow \texttt{grid\_otf\_family(...)} \rightarrow \text{family cube}
-\]
+```text
+raw/scantable -> grid_otf_family(...) -> family cube
+```
 
 ここでの重みは、各 dump の `BSL_RMS` に基づく inverse-variance weighting が基本です。
 
@@ -38,8 +40,7 @@ X 方向群、Y 方向群のように、**走査方向ごとに分けた入力**
 同じ family に属する既存 cube や追加観測分の cube を、**各スペクトルごとの empirical RMS map** を使って coadd します。
 
 \[
-T_{\rm out}(k,y,x)
-=
+T_{\rm out}(k,y,x)=
 \frac{\sum_n w_n(y,x)\,T_n(k,y,x)}{\sum_n w_n(y,x)}
 \]
 
@@ -88,17 +89,54 @@ T(k,p)=
 
 ここで \(\sigma_i\) は通常 `BSL_RMS` です。
 
+現在の実装では、`estimator='avg'` のとき、この平均を**何点以上の dump で支えるか**を `n_min_avg` で制御します。概念的には、各 output pixel \(p\) について、実際にその pixel に寄与した有効サンプル数を \(N_{\rm eff}(p)\) とすると、
+
+\[
+N_{\rm eff}(p) < n_{\rm min,avg}
+\]
+
+の pixel は、平均値を採用せず invalid とみなします。したがって、
+
+- `n_min_avg=1`
+  - 1 dump でも値を出す
+- `n_min_avg=2`
+  - 少なくとも 2 dump 必要
+- `n_min_avg` を大きくする
+  - edge や sparse coverage の pixel は落ちやすくなるが、信頼性は上がる
+
+という意味になります。現在の既定は `n_min_avg=2` です。したがって、synthetic な 1 点だけの入力では、kernel が正常でも出力 pixel が invalid になって NaN になることがあります。これは kernel バグではなく、QC 条件による動作です。
+
+### 3.1.1 row flag と channel 欠損の扱い
+
+現在の実装では、gridding 前の入力 `GridInput` は少なくとも次を持つと考えてください。
+
+- `spec`: shape `(ndump, nchan)` の 2D 配列
+- `x`, `y`, `time`, `flag`: shape `(ndump,)` の 1D 配列
+
+ここで `flag` は **dump 行全体を使うかどうか**を表す row mask です。公開仕様としては
+
+- `True` = その dump 行を gridding に使う
+- `False` = その dump 行全体を除外する
+
+です。現在の実装は後方互換のため `0/1` や `0.0/1.0` も受け付けますが、意味は同じです。`-1`, `2`, `0.5` のような曖昧な値や、`(ndump, nchan)` の 2D flag は想定していません。
+
+重要なのは、`flag` は **channel ごとの mask ではない**という点です。ある dump の一部 channel だけを無効にしたい場合は、`flag` ではなく `spec[i, k] = NaN` を使います。実務上の役割分担は次です。
+
+- 行全体を落としたい → `flag[i] = False`
+- 一部 channel だけ落としたい → `spec[i, bad_channels] = NaN`
+
+この仕様は `core.grid_otf(...)` だけでなく、OTF 入力の merge、basketweave 前段の geometry mask、`ps_gridder` でも同じです。したがって、行単位の採否と channel 欠損を分けて扱うことが、現在の実装を安全に使う上で重要です。
+
 ## 3.2 cube coadd
 
 coadd 前に、各 cube の各 spatial pixel \((y,x)\) にある 1 本のスペクトル
 \(T(:,y,x)\) から、line-free channel 集合 \(L\) を使って empirical RMS を計算します。
 
 \[
-\sigma_n(y,x)
-=
+\sigma_n(y,x)=
 \mathrm{robust\_rms}
 \left(
-\{T_n(k,y,x)\mid k\in L,\ \text{finite}\}
+\{T_n(k,y,x)\mid k\in L,\ \mathrm{finite}\}
 \right)
 \]
 
@@ -111,8 +149,7 @@ w_n(y,x)=1/\sigma_n(y,x)^2
 を作り、channel ごとに
 
 \[
-T_{\rm out}(k,y,x)
-=
+T_{\rm out}(k,y,x)=
 \frac{\sum_n w_n(y,x)\,T_n(k,y,x)}{\sum_n w_n(y,x)}
 \]
 
@@ -133,6 +170,7 @@ X family, Y family それぞれについて、まず各スペクトルごとの 
 \[
 \bar\sigma_X = \mathrm{robust\_median}\{\sigma_X(y,x)\}
 \]
+
 \[
 \bar\sigma_Y = \mathrm{robust\_median}\{\sigma_Y(y,x)\}
 \]
@@ -159,6 +197,7 @@ DC 原点 \((u,v)=(0,0)\) だけは inverse-variance 平均にします。
 W_X(0,0)=
 \frac{1/\bar\sigma_X^2}{1/\bar\sigma_X^2+1/\bar\sigma_Y^2}
 \]
+
 \[
 W_Y(0,0)=
 \frac{1/\bar\sigma_Y^2}{1/\bar\sigma_X^2+1/\bar\sigma_Y^2}
@@ -437,6 +476,50 @@ valid は channel ごとの 3D mask です。
 
 - stripe 除去が主目的で、edge を mosaic overlap で捨てられるなら既定設定のままでよい
 - edge まで flux 保存を見たい場合は、既定設定と no-taper/no-apodize を並べて比較する
+
+## 7.5 `GridInput.flag` と `spec` の NaN
+
+この節は、OTF gridding の入力段で最も間違えやすい点をまとめたものです。現在の実装では、入力 `GridInput` の `flag` と `spec` の NaN は別の役割を持ちます。
+
+### 7.5.1 `flag` は 1D の row mask
+
+`GridInput.flag` は shape `(ndump,)` の 1D 配列です。意味は
+
+- `True` = その dump 行を使う
+- `False` = その dump 行を除外する
+
+です。`basketweave` の geometry mask、複数 `GridInput` の merge、`ps_gridder` でも同じ意味で扱われます。
+
+後方互換として `0/1` や `0.0/1.0` も受け付けますが、これは bool row mask の別表現と考えてください。公開仕様としては bool を使うのが安全です。
+
+### 7.5.2 `flag` は channel mask ではない
+
+`flag` で指定できるのは **行全体の採否**だけです。したがって、例えば RFI で一部 channel だけ無効にしたい場合に、`flag` を 2D `(ndump, nchan)` で与える使い方は現在の実装では想定していません。
+
+一部 channel を落としたい場合は、`spec[i, k] = NaN` を使います。現在の実装では finite な channel だけが gridding に寄与するので、row 全体を落とさずに channel 欠損だけを表現できます。
+
+### 7.5.3 実務上の使い分け
+
+- 行全体を捨てたい
+  - `flag[i] = False`
+- 一部 channel だけ捨てたい
+  - `spec[i, bad_channels] = NaN`
+- 全行を使う
+  - `flag = np.ones(ndump, dtype=bool)`
+
+この役割分担を守ると、`core.grid_otf(...)`, `basketweave`, `ps_gridder` の全てで一貫した挙動になります。
+
+### 7.5.4 `n_min_avg` との関係
+
+`flag=False` の行や、全 channel が NaN の行は、その output pixel に寄与しません。したがって sparse な観測や synthetic test では、kernel の形だけでなく `flag` と `spec` の NaN によって有効サンプル数が減り、`n_min_avg` に引っかかって pixel が invalid になることがあります。
+
+つまり、pixel が NaN になったときに疑う順序は
+
+1. 行全体が `flag=False` で落ちていないか
+2. `spec` の NaN が多すぎないか
+3. その結果 `n_min_avg` に届いているか
+
+です。kernel を疑う前に、この 3 点を確認してください。
 
 ## 8. 現在の推奨ワークフロー
 
@@ -722,6 +805,10 @@ OTF scan 領域の扱いを決める。
 - `BSL_RMS` 重みは upstream `grid_otf(...)` の責務
 - `linefree_velocity_windows_kms` はこの関数ではまだ使わない
 - `baseline_subtracted` は `False` で bundle meta に入る
+- `GridInput.flag` は 1D row mask として扱われる
+  - `True` / `1` / `1.0` = 採用
+  - `False` / `0` / `0.0` = 除外
+- dump の一部 channel を落とす場合は `flag` ではなく `spec=NaN` を使う
 
 ---
 
@@ -1156,7 +1243,7 @@ S_{\mathrm{mosaic}}(k,y,x)=\frac{\sum_m N_m(k,y,x)}{\sum_m W_m(y,x)}
 ここで重要なのは、`MOSAIC_GAIN` は**重みではなく保存値に掛かっている multiplicative response** だという点です。したがって `MOSAIC_WEIGHT=1/rms^2` だけでは不十分で、現在の実装では
 
 \[
-\texttt{MOSAIC\_WEIGHT}=\texttt{MOSAIC\_TRUST}\times\frac{\texttt{MOSAIC\_GAIN}^2}{\texttt{MOSAIC\_RMS\_OBS}^2}
+\mathrm{MOSAIC\_WEIGHT}=\mathrm{MOSAIC\_TRUST}\times\frac{\mathrm{MOSAIC\_GAIN}^2}{\mathrm{MOSAIC\_RMS\_OBS}^2}
 \]
 
 を採用しています。
@@ -1237,20 +1324,176 @@ S_{\mathrm{mosaic}}(k,y,x)=\frac{\sum_m N_m(k,y,x)}{\sum_m W_m(y,x)}
 
 これらは X family / Y family で**完全に同じ**にする必要があります。
 
+実務上は、`beam_fwhm_arcsec` を先に決め、そのうえで **`cell_arcsec ≈ beam_fwhm_arcsec / 3`** を最初の標準値にしてください。kernel の public preset は pixel-based なので、`cell_arcsec` は gridding kernel の物理幅に直接効きます。
+
 ## 10.2 kernel 関連
 
+現在の実装では、OTF gridding に使う public kernel は
+
+- `kernel='sf'`
+- `kernel='gjinc'`
+- `kernel='gauss'`
+
+です。
+
+このうち、実務上まず考えるべきなのは **`sf` と `gjinc`** です。`gauss` は比較用・単純参照用としては有用ですが、通常の標準推奨 kernel として最初に選ぶものではありません。
+
+### 10.2.1 まず最初に知っておくべき推奨
+
+OTF gridding の kernel は、最終 map の
+
+- 空間分解能
+- ノイズの平均化のされ方
+- aliasing や gap への頑健性
+- signed kernel を使う場合の ringing / noise amplification
+
+に直接効きます。
+
+このパッケージで、まずユーザーに推奨する設定は次の 2 つです。
+
+#### A. 標準推奨（まず安全に全体像を見る）
+
+```python
+cfg = MapConfig(
+    ...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=B / 3,
+    kernel='sf',
+    convsupport=3,
+)
+```
+
+意味:
+
+- `cell_arcsec` は **入力ビーム FWHM の 1/3 を目安**にする
+- `sf` は positive-only の spheroidal kernel
+- `convsupport=3` は現在の formal default
+- aliasing / gap / local instability に比較的強く、まず破綻しにくい
+
+#### B. 分解能重視の再イメージング
+
+```python
+cfg = MapConfig(
+    ...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=B / 3,
+    kernel='gjinc',
+    kernel_preset='mangum',
+    kernel_sign='signed',
+)
+```
+
+意味:
+
+- `gjinc` のうち、Mangum 系の signed kernel を使う
+- 分解能寄りで、細い構造をできるだけ sharp に出したいときに向く
+- 一方で、signed kernel なので noise amplification や ringing の評価が必要
+
+現在の内部比較では、代表条件 `B=350 arcsec`, `cell=B/3` に対して nominal output PSF FWHM は概ね
+
+- `gjinc + mangum` : 約 **383 arcsec**（入力ビーム 350 arcsec に対して **+9 % 程度**）
+- `gjinc + casa`   : 約 **401 arcsec**（**+14 % 程度**）
+- `sf + convsupport=3` : 約 **426 arcsec**（**+22 % 程度**）
+- `sf + convsupport=6` : 約 **563 arcsec**（**+61 % 程度**）
+
+でした。したがって、
+
+- **まずは安全に作る**なら `sf + convsupport=3`
+- **少しでも sharpness を詰めたい**なら `gjinc + mangum + signed`
+
+という 2 段階運用が実務上分かりやすいです。
+
+ここでの数値は、本パッケージ内部での nominal comparison です。kernel 理論、`SF` / `GJINC` の数式、`convsupport` / `truncate` の意味、CASA / casacore との対応、未実装項目、内部比較表の詳細は、**別文書の kernel 詳細説明書**を参照してください。この OTF + FFT/PLAIT マニュアルでは、解析ユーザーが workflow 上すぐ使える要点だけに絞って書きます。
+
+### 10.2.2 現在の public パラメータ
+
 - `kernel`
-  - `'gjinc'` or `'gauss'`
+  - `'sf'`, `'gjinc'`, `'gauss'`
 - `kernel_preset`
-  - `'mangum2007'` or `'legacy'`
+  - `gjinc` に対して主に `'mangum'` または `'casa'`
+  - 後方互換 alias として `'mangum2007' -> 'mangum'`, `'legacy' -> 'casa'`
 - `kernel_sign`
   - `'auto'`, `'signed'`, `'positive_only'`
+- `convsupport`
+  - `sf` の cutoff/support を表す public パラメータ
+  - 現在の formal default は `3`
+  - 現在実装では integer 的な値を想定し、`convsupport < 3` は warning 対象
 - `gwidth_pix`, `gwidth_beam`
 - `jwidth_pix`, `jwidth_beam`
 - `truncate`
 - `support_radius_pix`, `support_radius_beam`
 
-通常は preset 既定に任せればよいです。FFT/PLAIT 側は **family cube がすでに同じ kernel で gridding されていること**を前提にします。
+重要な現実装上の注意:
+
+- `sf` では、public には `convsupport` を使います
+- `sf` に対して `support_radius_pix`, `support_radius_beam`, `truncate` を与える使い方は、現在実装では禁止です
+- `gjinc` では `kernel_preset`, `kernel_sign`, `jwidth_*`, `gwidth_*`, `truncate`, `support_radius_*` が意味を持ちます
+- `gauss` と `sf` は正の kernel なので、`kernel_sign='signed'` を明示しても、現在実装では `positive_only` と同等に扱います
+
+通常は、explicit width を細かくいじる前に、まず
+
+- `sf, convsupport=3`
+- `gjinc, kernel_preset='mangum', kernel_sign='signed'`
+
+のどちらかから始めるのが安全です。
+
+### 10.2.3 `cell_arcsec` と `beam_fwhm_arcsec`
+
+kernel を理解するときに最も間違えやすいのは、`beam_fwhm_arcsec` と `cell_arcsec` の役割です。
+
+- `beam_fwhm_arcsec`
+  - 入力望遠鏡ビームの FWHM [arcsec]
+- `cell_arcsec`
+  - 出力 map の pixel size [arcsec/pixel]
+
+現在の kernel 実装は public preset としては **pixel-based** です。したがって kernel の物理幅は `cell_arcsec` を通して決まります。一方、最終的な nominal effective beam は
+
+- 入力ビーム
+- gridding kernel の物理幅
+
+の両方で決まります。
+
+このため、`cell_arcsec` は小さすぎても大きすぎてもよくありません。実務上の第一近似として、**`cell_arcsec ≈ beam_fwhm_arcsec / 3`** を基本にしてください。現在実装では `cell_arcsec=None` のとき、この目安が既定として解決されます。
+
+### 10.2.4 `sf` と `gjinc` の簡単な使い分け
+
+#### `kernel='sf', convsupport=3`
+
+- positive-only
+- aliasing や局所的な不安定性に比較的強い
+- signed kernel より安全で、まず全体像を作りやすい
+- ただし `gjinc + mangum` よりは broad
+
+#### `kernel='gjinc', kernel_preset='mangum', kernel_sign='signed'`
+
+- Gaussian-tapered jinc
+- signed kernel を使い、高域保持を狙う
+- このパッケージ内比較では最も sharp
+- ただしノイズ増幅や負ローブ由来の ringing に注意
+
+#### `kernel='gjinc', kernel_preset='casa'`
+
+- first-null cutoff の safe な GJINC
+- `mangum` より broad
+- `legacy` は現在この `casa` の互換 alias として読む
+
+#### `kernel='sf', convsupport=6`
+
+- 背景的には重要な値だが、現在の内部比較では broadening がかなり大きい
+- formal default ではなく、明示的に broadening を許容する場合に限って使う
+
+### 10.2.5 FFT/PLAIT との関係
+
+FFT/PLAIT 側は **family cube がすでに同じ kernel で gridding されていること**を前提にします。したがって X family / Y family の両方で、
+
+- `beam_fwhm_arcsec`
+- `cell_arcsec`
+- `kernel`
+- `kernel_preset` / `kernel_sign` / `convsupport`
+
+は揃えてください。
+
+また、`grid_otf_family(..., verbose=True)` では kernel summary, nominal effective beam, empirical center beam が表示されます。kernel を切り替えたときは、この表示も確認してください。
 
 ## 10.3 chunk / dtype
 
@@ -1271,6 +1514,15 @@ S_{\mathrm{mosaic}}(k,y,x)=\frac{\sum_m N_m(k,y,x)}{\sum_m W_m(y,x)}
 
 通常は **`weight_mode='rms'`** が推奨です。
 
+### 10.4.1 `GridInput.flag` の前提
+
+`weight_mode` や `exclude_turnaround` を評価する前段で、入力 row 自体を `flag` で落とすことができます。現在の実装では `flag` は 1D bool row mask と考えるのが基本です。
+
+- `True` = 使う
+- `False` = 落とす
+
+したがって、turnaround を除くかどうかは `exclude_turnaround`、観測条件や upstream 判定で row 自体を使うかどうかは `flag`、という役割分担になります。
+
 ## 10.5 estimator / QC
 
 - `estimator`
@@ -1283,6 +1535,29 @@ S_{\mathrm{mosaic}}(k,y,x)=\frac{\sum_m N_m(k,y,x)}{\sum_m W_m(y,x)}
 - `eps_weight_sum`
 - `min_abs_weight_ratio`
 - `min_cancel_ratio`
+
+### 10.5.1 `n_min_avg` とは何か
+
+`n_min_avg` は、`estimator='avg'` のときに、ある output pixel を**平均値として採用するために必要な最小寄与サンプル数**です。kernel がその pixel に届いていても、実際に寄与した dump 数が少なすぎる場合は、その pixel を invalid とみなします。
+
+実務上は次のように理解してください。
+
+- `n_min_avg=1`
+  - 1 dump でも値を出す
+  - coverage を広く残したい確認用には便利
+  - ただし局所的に不安定になりやすい
+- `n_min_avg=2`
+  - 少なくとも 2 dump 必要
+  - 現在の既定であり、通常はこちらが自然
+- `n_min_avg` をさらに大きくする
+  - edge や sparse coverage の pixel は落ちやすくなる
+  - その代わり、採用された pixel の信頼性は上がる
+
+重要なのは、`n_min_avg` は kernel の種類そのものを変えるパラメータではなく、**平均を許可する条件**だという点です。したがって、1 点だけの synthetic 入力で全 pixel が NaN になる場合でも、まず `n_min_avg` を確認してください。現在の既定 `n_min_avg=2` では、1 dump だけの入力は kernel が正常でも invalid になります。
+
+### 10.5.2 `n_min_plane`
+
+`estimator='plane'` のときに、局所平面フィットを行うために必要な最小サンプル数です。`avg` より強い局所モデルを使うぶん、通常は `n_min_avg` より厳しい条件が必要になります。
 
 ## 10.6 beam / sampling 補助
 
@@ -1338,7 +1613,9 @@ X family / Y family の両方で共通にする必要があります。
 
 ## 11. 実用 cookbook
 
-## 11.1 まずは最も安全な設定で X/Y を別 gridding
+## 11.1 まずは推奨 kernel 設定で X/Y を別 gridding
+
+### 11.1.1 標準推奨: `sf + convsupport=3`
 
 ```python
 cfg = MapConfig(
@@ -1346,16 +1623,77 @@ cfg = MapConfig(
     y0=-3600.0,
     nx=201,
     ny=201,
-    cell_arcsec=36.0,
     beam_fwhm_arcsec=350.0,
-    kernel='gjinc',
-    kernel_preset='mangum2007',
-    kernel_sign='auto',
+    cell_arcsec=350.0 / 3.0,   # まずは beam の 1/3 を目安
+    kernel='sf',
+    convsupport=3,
     weight_mode='rms',
     reproducible_mode=True,
     verbose=True,
 )
 ```
+
+この設定は、
+
+- まず安全に全体像を見たい
+- signed kernel による ringing を避けたい
+- aliasing や local instability に比較的強い方から始めたい
+
+という場合の標準推奨です。
+
+### 11.1.2 分解能重視: `gjinc + mangum + signed`
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=350.0 / 3.0,
+    kernel='gjinc',
+    kernel_preset='mangum',
+    kernel_sign='signed',
+    weight_mode='rms',
+    reproducible_mode=True,
+    verbose=True,
+)
+```
+
+この設定は、
+
+- 細い構造をできるだけ sharp に出したい
+- final map 候補として分解能重視の再イメージングをしたい
+- その代わり noise amplification や ringing を診断 map と合わせて確認する
+
+という場合に向きます。
+
+### 11.1.3 まず何を見るべきか
+
+この段階でまず見るべきものは、
+
+- `verbose=True` の kernel summary
+- nominal effective beam
+- empirical center beam
+- `WEIGHT`, `WABS`, `CANCEL`, `WREL`
+- sparse coverage なら `n_min_avg` によって pixel が落ちていないか
+
+です。特に sparse な test や synthetic 入力では、kernel の違いより先に `n_min_avg` が効いて NaN が増えることがあります。
+
+
+どちらの設定でも、まずは `grid_otf_family(..., verbose=True)` で出る
+
+- kernel summary
+- nominal effective beam
+- empirical center beam
+
+を確認してください。また、sharpness 重視設定では、少なくとも
+
+- `WEIGHT`
+- `CANCEL`
+- family cube そのものの見た目
+
+を合わせて確認するのが安全です。
 
 このあと `grid_otf_family(...)` を X/Y それぞれに使う。
 
