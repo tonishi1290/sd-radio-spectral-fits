@@ -228,8 +228,7 @@ seed line 判定の概念は
 
 \[
 S_0(v,y,x) =
-\Bigl(D_{\rm det}(v,y,x) - B_{\rm seed}(v,y,x)
-> k_{\rm seed}\,\sigma_{\rm loc}(y,x)\Bigr)
+\Bigl(D_{\rm det}(v,y,x) - B_{\rm seed}(v,y,x)> k_{\rm seed}\,\sigma_{\rm loc}(y,x)\Bigr)
 \]
 
 である。
@@ -441,8 +440,7 @@ Stage B では、line 領域は基本的に OR で累積し、単調に増やす
 すなわち概念的には
 
 \[
-\mathrm{line\_accum}_{n+1}
-=
+\mathrm{line\_accum}_{n+1}=
 \mathrm{line\_accum}_n \,\cup\, \mathrm{new\_line}_n
 \]
 
