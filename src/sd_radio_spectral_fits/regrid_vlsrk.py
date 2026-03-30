@@ -78,6 +78,18 @@ def _get_specsys(row: pd.Series, meta: dict) -> str:
     return ""
 
 
+def _get_ssysobs(row: pd.Series, meta: dict) -> str:
+    val = _get_val(row, meta, "SSYSOBS", None)
+    if val not in (None, ""):
+        return str(val).strip().upper()
+
+    val = _get_val(row, meta, "SPECSYS", None)
+    if val not in (None, ""):
+        return str(val).strip().upper()
+
+    return ""
+
+
 def _vcorr_scale_to_kms(key: str) -> float:
     ku = str(key or "").strip().upper()
     if ku.endswith("_KMS") or ku == "V_CORR_KMS":
@@ -1119,6 +1131,15 @@ def run_velocity_regrid(
 
     rest0 = _resolve_uniform_restfreq(sc_sel.table, sc_sel.meta)
 
+    resolved_ssysobs = [
+        _get_ssysobs(out_table.iloc[i], sc_sel.meta)
+        for i in range(len(out_table))
+    ]
+    ssysobs_vals = pd.Series(resolved_ssysobs, dtype=object)
+    ssysobs_vals = ssysobs_vals.dropna().astype(str).str.strip()
+    ssysobs_vals = ssysobs_vals[ssysobs_vals != '']
+    ssysobs_unique = pd.unique(ssysobs_vals)
+
     n_tgt = int(len(v_tgt))
     out_table['CTYPE1'] = 'VRAD'
     out_table['CUNIT1'] = 'm/s'
@@ -1127,7 +1148,7 @@ def run_velocity_regrid(
     out_table['CRPIX1'] = float(target_grid.crpix1)
     out_table['NAXIS1'] = n_tgt
     out_table['SPECSYS'] = 'LSRK'
-    out_table['SSYSOBS'] = 'LSRK'
+    out_table['SSYSOBS'] = resolved_ssysobs
     out_table['RESTFRQ'] = float(rest0)
     out_table['RESTFREQ'] = float(rest0)
     out_table['VELDEF'] = 'RADIO'
@@ -1142,12 +1163,15 @@ def run_velocity_regrid(
         CRPIX1=float(target_grid.crpix1),
         NAXIS1=n_tgt,
         SPECSYS='LSRK',
-        SSYSOBS='LSRK',
         RESTFRQ=float(rest0),
         RESTFREQ=float(rest0),
         VELDEF='RADIO',
         TIMESYS=str(meta_out.get('TIMESYS', 'UTC')),
     ))
+    if len(ssysobs_unique) == 1:
+        meta_out['SSYSOBS'] = str(ssysobs_unique[0]).upper()
+    else:
+        meta_out.pop('SSYSOBS', None)
     meta_out.pop('VELOSYS', None)
     meta_out.pop('VFRAME', None)
     meta_out.pop(str(v_corr_col or '').strip().upper(), None)

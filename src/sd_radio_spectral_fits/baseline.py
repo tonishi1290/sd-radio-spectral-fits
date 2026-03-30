@@ -304,6 +304,14 @@ def _resolve_specsys(row: pd.Series, meta: dict) -> str:
     return ""
 
 
+def _resolve_ssysobs(row: pd.Series, meta: dict) -> str:
+    for key in ("SSYSOBS", "SPECSYS"):
+        val = _row_or_meta(row, meta, key, None)
+        if val not in (None, ""):
+            return str(val).strip().upper()
+    return ""
+
+
 def _vcorr_scale_to_kms(key: str) -> float:
     ku = str(key or "").strip().upper()
     if ku.endswith("_KMS") or ku == "V_CORR_KMS":
@@ -389,6 +397,11 @@ def _row_wcs_meta(row: pd.Series, meta: dict, nchan: int) -> dict:
     specsys = _resolve_specsys(row, row_meta)
     if specsys:
         row_meta["SPECSYS"] = specsys
+
+    ssysobs = _resolve_ssysobs(row, row_meta)
+    if ssysobs:
+        row_meta["SSYSOBS"] = ssysobs
+    elif specsys:
         row_meta["SSYSOBS"] = specsys
 
     return row_meta

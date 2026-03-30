@@ -315,6 +315,78 @@ def _resolve_specsys(meta: dict, table: pd.DataFrame | None = None) -> str:
     return ""
 
 
+def _resolve_ssysobs(meta: dict, table: pd.DataFrame | None = None) -> str:
+    if table is not None and "SSYSOBS" in table.columns:
+        ser = table["SSYSOBS"]
+        vals = ser.dropna().astype(str).str.strip()
+        vals = vals[vals != ""]
+        uniq = pd.unique(vals)
+        if len(uniq) == 1:
+            return str(uniq[0]).upper()
+    val = meta.get("SSYSOBS")
+    if val not in (None, ""):
+        return str(val).strip().upper()
+    if table is not None and "SPECSYS" in table.columns:
+        ser = table["SPECSYS"]
+        vals = ser.dropna().astype(str).str.strip()
+        vals = vals[vals != ""]
+        uniq = pd.unique(vals)
+        if len(uniq) == 1:
+            return str(uniq[0]).upper()
+    val = meta.get("SPECSYS")
+    if val not in (None, ""):
+        return str(val).strip().upper()
+    return ""
+
+
+def _resolve_ssysobs_series(table: pd.DataFrame, meta: dict) -> pd.Series:
+    n = len(table)
+    if "SSYSOBS" in table.columns:
+        out = table["SSYSOBS"].astype(object).copy()
+    else:
+        out = pd.Series([None] * n, index=table.index, dtype=object)
+
+    if "SPECSYS" in table.columns:
+        row_specsys = table["SPECSYS"].astype(object)
+    else:
+        row_specsys = pd.Series([None] * n, index=table.index, dtype=object)
+
+    meta_ssysobs = meta.get("SSYSOBS", None)
+    meta_specsys = meta.get("SPECSYS", None)
+
+    def _is_missing(v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, float) and not np.isfinite(v):
+            return True
+        return str(v).strip() == ""
+
+    for idx in out.index:
+        cur = out.at[idx]
+        if _is_missing(cur):
+            if meta_ssysobs not in (None, ""):
+                cur = meta_ssysobs
+            else:
+                row_val = row_specsys.at[idx]
+                if not _is_missing(row_val):
+                    cur = row_val
+                elif meta_specsys not in (None, ""):
+                    cur = meta_specsys
+                else:
+                    cur = ""
+        out.at[idx] = str(cur).strip().upper() if cur not in (None, "") else ""
+    return out
+
+
+def _unique_nonempty_upper(values) -> str:
+    ser = pd.Series(values, dtype=object).dropna().astype(str).str.strip()
+    ser = ser[ser != ""]
+    uniq = pd.unique(ser)
+    if len(uniq) == 1:
+        return str(uniq[0]).upper()
+    return ""
+
+
 def _fill_constant_column(out: pd.DataFrame, key: str, value: Any) -> pd.DataFrame:
     if value in (None, ""):
         return out
@@ -942,6 +1014,7 @@ def run_velocity_coadd(
         table_i, meta_i = _normalize_frequency_wcs_units(table_i, meta_i)
         table_i = _ensure_standard_spectral_columns(table_i, meta_i)
         specsys = _resolve_specsys(meta_i, table_i)
+        ssysobs_i = _resolve_ssysobs(meta_i, table_i)
         if not specsys:
             raise ValueError("Each coadd input must define SPECSYS or SSYSOBS.")
         rest_i = _get_rest_hz(meta_i, table_i, override_hz=rest_freq)
@@ -1019,7 +1092,7 @@ def run_velocity_coadd(
                 table_i[v_corr_col] = 0.0
 
         table_i["SPECSYS"] = specsys if specsys else table_i.get("SPECSYS", "")
-        table_i["SSYSOBS"] = specsys if specsys else table_i.get("SSYSOBS", "")
+        table_i["SSYSOBS"] = _resolve_ssysobs_series(table_i, meta_i).to_numpy(dtype=object)
         table_i["_local_idx"] = np.arange(len(table_i), dtype=int)
         
         if isinstance(data_i, list):
@@ -1201,6 +1274,13 @@ def run_velocity_coadd(
     for gid, idxs in groups.items():
         idxs = np.asarray(idxs, int)
         rep = int(idxs[0])
+        if "SSYSOBS" in table_all.columns:
+            grp_vals = pd.Series(table_all.iloc[idxs]["SSYSOBS"], dtype=object).dropna().astype(str).str.strip()
+            grp_vals = grp_vals[grp_vals != ""]
+            if len(pd.unique(grp_vals)) > 1:
+                raise ValueError(
+                    f"Group {gid} mixes multiple SSYSOBS values {list(pd.unique(grp_vals))}; cannot assign a unique observed frame to one coadded row."
+                )
         specs_arr = full_matrix[idxs]
         
         final_grp_rms = np.nan
@@ -1500,6 +1580,10 @@ def run_velocity_coadd(
     out_data = np.vstack(out_specs)
     out_table = pd.DataFrame(out_rows)
 
+    if "SSYSOBS" not in out_table.columns:
+        out_table["SSYSOBS"] = _resolve_ssysobs_series(out_table, meta_ref).to_numpy(dtype=object)
+    ssysobs_out = _unique_nonempty_upper(out_table["SSYSOBS"])
+
     sig_cols = [c for c in out_table.columns if str(c).upper().startswith("SIG_")]
     out_table = out_table.drop(columns=sig_cols + ["_local_idx", "_dummy_group", "_time_is_dummy", "_INPUT_ID", "INPUT_ID", "input_id"], errors="ignore")
 
@@ -1537,17 +1621,20 @@ def run_velocity_coadd(
         out_table["CDELT1"] = cdelt1
         out_table["CRPIX1"] = 1.0
         out_table["SPECSYS"] = "LSRK"
-        out_table["SSYSOBS"] = "LSRK"
         out_table["RESTFRQ"] = float(rest0)
         out_table["RESTFREQ"] = float(rest0)
         meta_out.update(dict(
             CTYPE1="VRAD", CUNIT1="m/s",
             CRVAL1=crval1, CDELT1=cdelt1, CRPIX1=float(1.0),
-            SPECSYS="LSRK", SSYSOBS="LSRK", VELOSYS=0.0,
+            SPECSYS="LSRK", VELOSYS=0.0,
             TIMESYS="UTC", NCHAN=int(n_tgt),
             RESTFRQ=float(rest0), RESTFREQ=float(rest0),
             VELDEF="RADIO", BUNIT="K",
         ))
+        if ssysobs_out:
+            meta_out["SSYSOBS"] = ssysobs_out
+        else:
+            meta_out.pop("SSYSOBS", None)
     else:
         c_kms = 299792.458
         freq_axis = rest0 * (1.0 - v_tgt / c_kms)
@@ -1559,7 +1646,6 @@ def run_velocity_coadd(
         out_table["CDELT1"] = cdelt1
         out_table["CRPIX1"] = 1.0
         out_table["SPECSYS"] = "LSRK"
-        out_table["SSYSOBS"] = "LSRK"
         out_table["RESTFRQ"] = float(rest0)
         out_table["RESTFREQ"] = float(rest0)
         meta_out.update(dict(
@@ -1567,11 +1653,15 @@ def run_velocity_coadd(
             CRVAL1=crval1,
             CDELT1=cdelt1,
             CRPIX1=float(1.0),
-            SPECSYS="LSRK", SSYSOBS="LSRK", VELOSYS=0.0,
+            SPECSYS="LSRK", VELOSYS=0.0,
             TIMESYS="UTC", NCHAN=int(n_tgt),
             RESTFRQ=float(rest0), RESTFREQ=float(rest0),
             VELDEF="RADIO", BUNIT="K",
         ))
+        if ssysobs_out:
+            meta_out["SSYSOBS"] = ssysobs_out
+        else:
+            meta_out.pop("SSYSOBS", None)
     if "NAXIS1" in meta_out: del meta_out["NAXIS1"]
 
     history = dict(
