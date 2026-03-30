@@ -81,6 +81,10 @@ from sd_radio_spectral_fits import (
     Site, DatasetInfo, SpectralAxisUniform, Efficiency,
 )
 
+DEFAULT_SITE_LAT_DEG = 35.940874
+DEFAULT_SITE_LON_DEG = 138.472153
+DEFAULT_SITE_ELEV_M = 1386.0
+
 # -----------------------------------------------------------------------------
 # Utilities（小さく・依存を減らす）
 # -----------------------------------------------------------------------------
@@ -557,6 +561,265 @@ def _to_rh01_guess(humid_pct_arr):
         return np.full_like(x, np.nan, dtype=float)
     rh = x / 100.0
     return np.clip(rh, 0.0, 1.0)
+
+
+def _normalize_key_token(key):
+    return re.sub(r"[^a-z0-9]+", "", str(key).strip().lower())
+
+
+def _to_float_or_none(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        x = float(value)
+        return x if np.isfinite(x) else None
+    try:
+        text = str(value).strip()
+        if text == "":
+            return None
+        x = float(text)
+        return x if np.isfinite(x) else None
+    except Exception:
+        return None
+
+
+def _copy_rawdata_impl_files_like_sunscan(rawdata_path):
+    rawdata_path = pathlib.Path(rawdata_path)
+    impl = list(rawdata_path.glob("*.toml"))
+    if not impl:
+        return
+    config_dst = rawdata_path / "config.toml"
+    for p in impl:
+        src = rawdata_path / p.name
+        if p.name.endswith("_config.toml"):
+            if not config_dst.exists():
+                try:
+                    config_dst.write_bytes(src.read_bytes())
+                except Exception:
+                    pass
+        elif p.name not in ["config.toml", "device_setting.toml", "pointing_param.toml"]:
+            obs_dst = rawdata_path / f"{p.stem}.obs"
+            if not obs_dst.exists():
+                try:
+                    obs_dst.write_bytes(src.read_bytes())
+                except Exception:
+                    pass
+
+
+def _candidate_rawdata_config_paths(rawdata_path):
+    rawdata_path = pathlib.Path(rawdata_path)
+    out = []
+    primary = rawdata_path / "config.toml"
+    if primary.exists():
+        out.append(primary)
+    for p in sorted(rawdata_path.glob("*_config.toml")):
+        if p not in out:
+            out.append(p)
+    return out
+
+
+_SITE_LAT_KEYS = {
+    "lat", "latitude", "latdeg", "latdegree", "latitudedeg", "sitelat", "sitelatdeg", "locationlat", "locationlatdeg",
+}
+_SITE_LON_KEYS = {
+    "lon", "lng", "long", "longitude", "londeg", "longdeg", "longitudedeg", "sitelon", "sitelondeg", "siteeastlon", "locationlon", "locationlongitude",
+}
+_SITE_ELEV_KEYS = {
+    "elev", "elevation", "elevm", "elevationm", "height", "heightm", "alt", "altitude", "altitudem", "siteelev", "siteelevm", "siteelevation", "locationheight", "locationelev",
+}
+
+
+def _extract_site_triplet_from_mapping(obj):
+    if not isinstance(obj, dict):
+        return None
+    lat = lon = elev = None
+    for k, v in obj.items():
+        nk = _normalize_key_token(k)
+        if lat is None and nk in _SITE_LAT_KEYS:
+            lat = _to_float_or_none(v)
+        elif lon is None and nk in _SITE_LON_KEYS:
+            lon = _to_float_or_none(v)
+        elif elev is None and nk in _SITE_ELEV_KEYS:
+            elev = _to_float_or_none(v)
+    if (lat is not None) and (lon is not None) and (elev is not None):
+        return {"lat_deg": float(lat), "lon_deg": float(lon), "elev_m": float(elev)}
+    return None
+
+
+def _search_site_triplet_in_obj(obj, *, path="root"):
+    if isinstance(obj, dict):
+        found = _extract_site_triplet_from_mapping(obj)
+        if found is not None:
+            found["path"] = path
+            return found
+        for k, v in obj.items():
+            child = _search_site_triplet_in_obj(v, path=f"{path}.{k}")
+            if child is not None:
+                return child
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            child = _search_site_triplet_in_obj(v, path=f"{path}[{i}]")
+            if child is not None:
+                return child
+    return None
+
+
+def _collect_site_fields_in_obj(obj, *, path="root", acc=None):
+    if acc is None:
+        acc = {"lat_deg": None, "lon_deg": None, "elev_m": None, "lat_path": None, "lon_path": None, "elev_path": None}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            nk = _normalize_key_token(k)
+            cur_path = f"{path}.{k}"
+            if acc["lat_deg"] is None and nk in _SITE_LAT_KEYS:
+                x = _to_float_or_none(v)
+                if x is not None:
+                    acc["lat_deg"] = float(x)
+                    acc["lat_path"] = cur_path
+                    continue
+            if acc["lon_deg"] is None and nk in _SITE_LON_KEYS:
+                x = _to_float_or_none(v)
+                if x is not None:
+                    acc["lon_deg"] = float(x)
+                    acc["lon_path"] = cur_path
+                    continue
+            if acc["elev_m"] is None and nk in _SITE_ELEV_KEYS:
+                x = _to_float_or_none(v)
+                if x is not None:
+                    acc["elev_m"] = float(x)
+                    acc["elev_path"] = cur_path
+                    continue
+            _collect_site_fields_in_obj(v, path=cur_path, acc=acc)
+    elif isinstance(obj, (list, tuple)):
+        for i, v in enumerate(obj):
+            _collect_site_fields_in_obj(v, path=f"{path}[{i}]", acc=acc)
+    return acc
+
+
+def _try_load_site_via_toml(rawdata_path):
+    if tomllib is None:
+        return None
+    for cfg_path in _candidate_rawdata_config_paths(rawdata_path):
+        try:
+            with open(cfg_path, "rb") as fh:
+                data = tomllib.load(fh)
+        except Exception:
+            continue
+        found = _search_site_triplet_in_obj(data, path="root")
+        if found is None:
+            fields = _collect_site_fields_in_obj(data, path="root")
+            if (fields["lat_deg"] is not None) and (fields["lon_deg"] is not None) and (fields["elev_m"] is not None):
+                found = {
+                    "lat_deg": float(fields["lat_deg"]),
+                    "lon_deg": float(fields["lon_deg"]),
+                    "elev_m": float(fields["elev_m"]),
+                    "path": "mixed_fields",
+                    "field_paths": {
+                        "lat": fields.get("lat_path"),
+                        "lon": fields.get("lon_path"),
+                        "elev": fields.get("elev_path"),
+                    },
+                }
+        if found is not None:
+            found["source"] = "rawdata_config_toml"
+            found["config_path"] = str(cfg_path)
+            return found
+    return None
+
+
+def _try_load_site_via_neclib(rawdata_path):
+    try:
+        from neclib import config as neclib_config
+    except Exception:
+        return None
+    rawdata_path = pathlib.Path(rawdata_path)
+    _copy_rawdata_impl_files_like_sunscan(rawdata_path)
+    prev_root = os.environ.get("NECST_ROOT")
+    try:
+        os.environ["NECST_ROOT"] = str(rawdata_path)
+        try:
+            neclib_config.reload()
+        except Exception:
+            return None
+        loc = getattr(neclib_config, "location", None)
+        if loc is None:
+            return None
+        lat_deg = _to_float_or_none(loc.lat.to_value(u.deg) if hasattr(loc, "lat") else None)
+        lon_deg = _to_float_or_none(loc.lon.to_value(u.deg) if hasattr(loc, "lon") else None)
+        if hasattr(loc, "height"):
+            try:
+                elev_m = _to_float_or_none(loc.height.to_value(u.m))
+            except Exception:
+                elev_m = _to_float_or_none(getattr(loc, "height", None))
+        else:
+            elev_m = None
+        if (lat_deg is None) or (lon_deg is None) or (elev_m is None):
+            return None
+        cfg_paths = _candidate_rawdata_config_paths(rawdata_path)
+        return {
+            "lat_deg": float(lat_deg),
+            "lon_deg": float(lon_deg),
+            "elev_m": float(elev_m),
+            "source": "rawdata_config_neclib",
+            "config_path": str(cfg_paths[0]) if cfg_paths else None,
+        }
+    finally:
+        if prev_root is None:
+            os.environ.pop("NECST_ROOT", None)
+        else:
+            os.environ["NECST_ROOT"] = prev_root
+
+
+def _try_load_site_from_rawdata(rawdata_path):
+    info = _try_load_site_via_neclib(rawdata_path)
+    if info is not None:
+        return info
+    return _try_load_site_via_toml(rawdata_path)
+
+
+def _resolve_site_from_cli_or_rawdata(args, rawdata_path):
+    auto_site = _try_load_site_from_rawdata(rawdata_path)
+    lat_src = "cli" if getattr(args, "site_lat", None) is not None else ("rawdata" if auto_site is not None else "default")
+    lon_src = "cli" if getattr(args, "site_lon", None) is not None else ("rawdata" if auto_site is not None else "default")
+    elev_src = "cli" if getattr(args, "site_elev", None) is not None else ("rawdata" if auto_site is not None else "default")
+
+    lat_deg = float(getattr(args, "site_lat", None) if getattr(args, "site_lat", None) is not None else (auto_site["lat_deg"] if auto_site is not None else DEFAULT_SITE_LAT_DEG))
+    lon_deg = float(getattr(args, "site_lon", None) if getattr(args, "site_lon", None) is not None else (auto_site["lon_deg"] if auto_site is not None else DEFAULT_SITE_LON_DEG))
+    elev_m = float(getattr(args, "site_elev", None) if getattr(args, "site_elev", None) is not None else (auto_site["elev_m"] if auto_site is not None else DEFAULT_SITE_ELEV_M))
+
+    args.site_lat = lat_deg
+    args.site_lon = lon_deg
+    args.site_elev = elev_m
+
+    if auto_site is not None and any(src == "rawdata" for src in (lat_src, lon_src, elev_src)):
+        src_path = auto_site.get("config_path")
+        src_note = f" from {src_path}" if src_path else ""
+        print(
+            "[info] site auto-loaded{}: lat={:.6f} deg, lon={:.6f} deg, elev={:.2f} m"
+            " (sources: lat={}, lon={}, elev={})".format(
+                src_note, lat_deg, lon_deg, elev_m, lat_src, lon_src, elev_src
+            )
+        )
+    elif all(src == "cli" for src in (lat_src, lon_src, elev_src)):
+        print("[info] site from CLI: lat={:.6f} deg, lon={:.6f} deg, elev={:.2f} m".format(lat_deg, lon_deg, elev_m))
+    else:
+        print(
+            "[info] site resolved: lat={:.6f} deg, lon={:.6f} deg, elev={:.2f} m"
+            " (sources: lat={}, lon={}, elev={}; use --site-lat/--site-lon/--site-elev to override)".format(
+                lat_deg, lon_deg, elev_m, lat_src, lon_src, elev_src
+            )
+        )
+
+    return {
+        "lat_deg": lat_deg,
+        "lon_deg": lon_deg,
+        "elev_m": elev_m,
+        "lat_source": lat_src,
+        "lon_source": lon_src,
+        "elev_source": elev_src,
+        "auto_site": auto_site,
+    }
+
 
 def _pressure_from_elev_hpa(elev_m):
     """高度[m]からの粗い気圧推定（標準大気の指数近似）。"""
@@ -2735,9 +2998,9 @@ def parse_args(argv):
     p.add_argument("--project", default="ProjectID", help="PROJID")
     p.add_argument("--observer", default="Unknown", help="OBSERVER")
 
-    p.add_argument("--site-lat", type=float, default=35.940874, help="Site latitude [deg]")
-    p.add_argument("--site-lon", type=float, default=138.472153, help="Site longitude [deg, east+]")
-    p.add_argument("--site-elev", type=float, default=1386.0, help="Site elevation [m]")
+    p.add_argument("--site-lat", type=float, default=None, help="Site latitude [deg]. Default: auto from RawData config, else legacy built-in default.")
+    p.add_argument("--site-lon", type=float, default=None, help="Site longitude [deg, east+]. Default: auto from RawData config, else legacy built-in default.")
+    p.add_argument("--site-elev", type=float, default=None, help="Site elevation [m]. Default: auto from RawData config, else legacy built-in default.")
 
     # legacy single-stream spectral axis defaults
     p.add_argument("--nchan", type=int, default=2**15, help="Legacy: number of channels")
@@ -3006,6 +3269,8 @@ def main(argv=None):
     rawbase = rawdata_path.name
     object_name = args.object if args.object else rawbase
 
+    site_info = _resolve_site_from_cli_or_rawdata(args, rawdata_path)
+
     if args.spectrometer_config:
         config_dict = load_spectrometer_config(args.spectrometer_config)
     else:
@@ -3169,6 +3434,9 @@ def main(argv=None):
     writer.add_history("output_layout", layout)
     writer.add_history("db_namespace", str(db_namespace))
     writer.add_history("telescope_tables", str(telescope_name))
+    writer.add_history("site_source", "lat={};lon={};elev={}".format(site_info["lat_source"], site_info["lon_source"], site_info["elev_source"]))
+    if site_info.get("auto_site") is not None and site_info["auto_site"].get("config_path"):
+        writer.add_history("site_config_path", str(site_info["auto_site"].get("config_path")))
     if getattr(args, "channel_slice", None) is not None:
         writer.add_history("channel_slice_cli", str(args.channel_slice))
     elif global_cfg.get("channel_slice", None) is not None:

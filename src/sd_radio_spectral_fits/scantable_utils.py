@@ -21,6 +21,7 @@ Dependencies:
 """
 
 from typing import Any, Dict, List, Optional, Sequence, Union, Set
+from collections.abc import Mapping
 import warnings
 import numpy as np
 import pandas as pd
@@ -757,43 +758,68 @@ def update_metadata(
             print(f"Update failed for '{target_col}': {e}")
 
 
+
 def set_beameff(
     sc: Scantable,
-    efficiency: Union[float, np.ndarray, Sequence[float]],
-    rows: Union[str, List[int], None] = None,
-    verbose: bool = True
+    efficiency: Union[float, np.ndarray, Sequence[float], Mapping[Any, float]],
+    rows: Union[str, List[int], int, slice, None] = None,
+    *,
+    key_columns: Union[str, Sequence[str]] = ("FDNUM", "IFNUM", "PLNUM"),
+    strict: bool = False,
+    verbose: bool = True,
 ) -> None:
-    """
-    BEAMEFF (ビーム効率) を設定するユーティリティ。
+    """Thin wrapper around ``tempscale.set_beameff()``."""
+    from .tempscale import set_beameff as _set_beameff_impl
+    return _set_beameff_impl(
+        sc,
+        efficiency=efficiency,
+        rows=rows,
+        key_columns=key_columns,
+        strict=strict,
+        verbose=verbose,
+    )
 
-    注意:
-    この関数はデータの実体や TEMPSCAL (温度スケールラベル) を変更しません。
-    単に BEAMEFF カラムに値をセットし、Viewer等でのオンザフライ変換 (Ta* <-> TR*) を可能にするためのメタデータを供給します。
-    """
-    df = sc.table
 
-    eff_arr = np.array(efficiency, dtype=float)
-    if np.any((eff_arr <= 0) | (eff_arr > 1.0)):
-        warnings.warn("Efficiency values out of physical range (0.0 < eta <= 1.0). Check your inputs.")
+def apply_relative_scale(
+    sc: Scantable,
+    scale: Union[float, np.ndarray, Sequence[float], Mapping[Any, float]],
+    rows: Union[str, List[int], int, slice, None] = None,
+    *,
+    key_columns: Union[str, Sequence[str]] = ("FDNUM", "IFNUM", "PLNUM"),
+    strict: bool = False,
+    invalidate_derived: bool = True,
+    verbose: bool = True,
+) -> None:
+    """Thin wrapper around ``tempscale.apply_relative_scale()``."""
+    from .tempscale import apply_relative_scale as _impl
+    return _impl(
+        sc,
+        scale=scale,
+        rows=rows,
+        key_columns=key_columns,
+        strict=strict,
+        invalidate_derived=invalidate_derived,
+        verbose=verbose,
+    )
 
-    # [FIX] このモジュール内の _parse_row_selector を常に使い、インデックス解釈を統一する
-    idxs = _parse_row_selector(rows, len(df))
-    if len(idxs) == 0:
-        return
 
-    if "BEAMEFF" not in df.columns:
-        df["BEAMEFF"] = np.nan
-
-    try:
-        df.loc[df.index[idxs], "BEAMEFF"] = eff_arr
-        if verbose:
-            print(f"Updated BEAMEFF for {len(idxs)} rows.")
-            current_scale = df["TEMPSCAL"].iloc[int(idxs[0])] if "TEMPSCAL" in df.columns else "Unknown"
-            print(f"Note: Data remains in '{current_scale}'. Use Viewer to toggle TR* display.")
-    except Exception as e:
-        print(f"Error setting BEAMEFF: {e}")
-        return
-
+def apply_global_scale(
+    sc: Scantable,
+    factor: float,
+    rows: Union[str, List[int], int, slice, None] = None,
+    *,
+    invalidate_derived: bool = True,
+    verbose: bool = True,
+) -> None:
+    """Thin wrapper around ``tempscale.apply_global_scale()``."""
+    from .tempscale import apply_global_scale as _impl
+    return _impl(
+        sc,
+        factor=factor,
+        rows=rows,
+        invalidate_derived=invalidate_derived,
+        verbose=verbose,
+    )
 
 # =========================================================
 # 5. Filter / Query (検索・抽出)

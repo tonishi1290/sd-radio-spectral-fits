@@ -5,7 +5,7 @@
 > 旧版 cookbook の情報を落とさずに、最新版アーカイブの公開 API と内部意味論に合わせて更新した版です。  
 > 例は基本的に **単発で意味が読める形** を保ち、必要なところだけ補足を増やしています。  
 > 本書の対象は主に `fitsio.py`, `rawspec.py`, `calibrate.py`, `baseline.py`, `regrid_vlsrk.py`, `coadd.py`, `restfreq.py`, `tempscale.py`, `scantable_utils.py`, `axis.py`, `doppler.py`, `atmosphere.py`, `sdfits_writer.py` です。  
-> なお、旧版 cookbook にあった `profile_view` 系の例も残していますが、**今回の zip にはそのサブモジュール自体は含まれていません**。環境側に同名モジュールが入っている前提の参考例として読んでください。
+> `profile_view` 系の詳細仕様は、最新版の `profile_view_manual_ja_v2.md` を正本として参照してください。本書では重複を避け、解析後確認に使う簡単な例だけを残します。
 
 ---
 
@@ -74,10 +74,8 @@ import sd_radio_spectral_fits.atmosphere as atm
 旧版 cookbook にあった表示系も、環境にあれば次のように読みます。
 
 ```python
-# profile_view が環境に入っている場合のみ
-import sd_radio_spectral_fits.profile_view.viewer as pv
-import sd_radio_spectral_fits.profile_view.montage as mnt
-import sd_radio_spectral_fits.profile_view.grid as grd
+# profile_view の詳細は別冊 profile_view_manual_ja_v2.md を参照
+import sd_radio_spectral_fits.profile_view as pv
 ```
 
 ---
@@ -190,11 +188,117 @@ sc_final_bsl = bsl.run_baseline_fit(
 )
 ```
 
+### 重要: マルチビームの相対スケール合わせはここで行う
+beam 間の相対スケール係数があるなら、**calibration 直後**に `apply_relative_scale()` を掛けてから baseline / coadd へ進むのが安全です。
+
+```python
+rel_map = {
+    (0, 0, 0): 1.00,
+    (0, 0, 1): 0.97,
+    (1, 0, 0): 1.03,
+    (1, 0, 1): 1.01,
+}
+
+su.apply_relative_scale(
+    sc_cal,
+    rel_map,
+    key_columns=("FDNUM", "IFNUM", "PLNUM"),
+)
+```
+
+後で全体の絶対係数が決まったら、さらに
+
+```python
+su.apply_global_scale(sc_cal, 0.91)
+```
+
+のように一律 factor を掛けます。これらは data 本体へ直接掛かり、`INTSCALE` に累積係数が記録され、既知の scale 依存派生列は既定で無効化されます。
+
 ### ポイント
 - `group_mode="scan"` により、まず scan 内の dump をまとめる
 - そのあと baseline
 - 最後に同位置の repeat をまとめる
 - `gain_mode="hybrid"` が現行の推奨値
+
+### 3.1 multi-beam で calibration 直後に相対補正を入れる完全版
+
+相対スケール係数 $g_i$ と後日の一律係数 $f$ は、どちらも **data へ掛ける係数**です。
+
+$$
+T_i^{\mathrm{aligned}}(k) = g_i\,T_i(k)
+$$
+
+$$
+T_i^{\mathrm{final}}(k) = f\,T_i^{\mathrm{aligned}}(k)
+$$
+
+一方、物理 `BEAMEFF` は
+
+$$
+T_R^* = \frac{T_A^*}{\eta}
+$$
+
+の $\eta$ なので、beam 間相対補正の係数に流用しないでください。
+
+```python
+raw_fits = "multibeam_raw.fits"
+
+rel_map = {
+    (0, 0, 0): 1.00,
+    (0, 0, 1): 0.97,
+    (1, 0, 0): 1.03,
+    (1, 0, 1): 1.01,
+}
+
+sc_raw = fitsio.read_scantable(raw_fits)
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    vlsrk_range_kms=(-200, 200),
+    t_hot_k=300.0,
+    vcorr_chunk_sec=5,
+    dtype="float32",
+)
+
+# 1. まず calibration 直後に beam 間相対補正を掛ける
+su.apply_relative_scale(
+    sc_cal,
+    rel_map,
+    key_columns=("FDNUM", "IFNUM", "PLNUM"),
+)
+
+# 2a. generic な一律係数が後で決まったなら data へ掛ける
+# su.apply_global_scale(sc_cal, 0.91)
+
+# 2b. 後で決まった係数が物理 TR* 変換の eta なら、こちらでもよい
+# su.set_beameff(sc_cal, 0.42)
+# ただし set_beameff() 自体は data を掛け直さず、後段の TR* 変換に使われる metadata を入れるだけ
+
+sc_scan = coadd.run_velocity_coadd(
+    inputs=sc_cal,
+    group_mode="scan",
+    mode="rms_weight",
+    rms_vwin="-200:0",
+    pos_tol_arcsec=1.0,
+)
+
+sc_scan_bsl = bsl.run_baseline_fit(
+    input_data=sc_scan,
+    poly_order=3,
+    vwin=["-35:-5", "30:55"],
+)
+
+sc_final = coadd.run_velocity_coadd(
+    inputs=sc_scan_bsl,
+    mode="rms_weight",
+    pos_tol_arcsec=1.0,
+)
+```
+
+### この例のポイント
+- 相対補正は **calibration 直後** に 1 回だけ掛ける
+- そうすると `BSL_RMS`, moment0, coadd が最初から揃った強度スケールで計算される
+- `apply_global_scale()` は generic な一律係数用
+- `set_beameff()` は物理 `TR*` 変換用 metadata 用
 
 ---
 
@@ -757,12 +861,17 @@ sc = coadd.run_velocity_coadd(
     baseline_vwin=["-35:-5", "30:55"],
     baseline_poly=3,
     post_baseline_mode="inherit_all",
-    post_baseline_vwin="inherit",
-    post_baseline_poly="inherit",
-    post_baseline_iter_max="inherit",
-    post_baseline_iter_sigma="inherit",
 )
 ```
+
+ここで `inherit_all` は
+
+- `post_baseline_vwin`
+- `post_baseline_poly`
+- `post_baseline_iter_max`
+- `post_baseline_iter_sigma`
+
+を一括で継承します。したがって、同時に各項目へ `"inherit"` を書く必要はありません。API の既定値として内部的には `inherit` が見えても、利用者側でそれを毎回書く必要はありません。例では省略した方が誤解がありません。
 
 ### 一部だけ上書きする
 
@@ -779,8 +888,12 @@ sc = coadd.run_velocity_coadd(
 )
 ```
 
+この例のように、`inherit_all` を有効にした上で、変えたい項目だけを明示値で上書きするのが一番誤解が少ない書き方です。`post_baseline_vwin="inherit"` などを併記する必要はありません。
+
 ### ポイント
 - `post_baseline_mode` は現状 `None` または `inherit_all`
+- `inherit_all` を使うとき、`post_baseline_vwin="inherit"` などの個別指定は冗長です
+- 個別に変えたい項目があるときだけ、その項目に明示値を与えます
 - `line_vwin` を与えると post-baseline 側にも差し引きが反映される
 - 出力 row には `BSL_STAGE="post_coadd"` などが残る
 
@@ -843,89 +956,111 @@ sc_never = coadd.run_velocity_coadd(
 
 ---
 
-## 21. BEAMEFF をあとから設定する
+## 21. `set_beameff()` と `apply_relative_scale()` / `apply_global_scale()`
 
-`set_beameff()` は data 配列を変換せず、行ごとの `BEAMEFF` を table に与える関数です。  
-したがって、まず効率を入れておき、その後 viewer や `out_scale="TR*"` で利用する、という流れになります。
+### 21.1 役割分担
 
-### 基本形: 全行へ同じ効率を付与
+- `set_beameff()` は `BEAMEFF` metadata を設定するだけ
+- `apply_relative_scale()` は beam ごとの相対係数 $g_i$ を data へ直接**掛ける**
+- `apply_global_scale()` は後で決まった一律 factor $f$ を data へ直接**掛ける**
 
-```python
-su.set_beameff(sc_tr, efficiency=0.42)
-```
+$$
+T_i^{\mathrm{aligned}}(k) = g_i\,T_i(k)
+$$
 
-### 一部行だけ
+$$
+T_i^{\mathrm{final}}(k) = f\,T_i^{\mathrm{aligned}}(k)
+$$
 
-```python
-su.set_beameff(sc_tr, efficiency=0.42, rows="0:20")
-```
+一方、物理 `BEAMEFF` は
 
-### ポイント
-- data 実体は変わらない
-- `TEMPSCAL` も変わらない
-- `BEAMEFF` 列が無ければ自動作成される
-- 0 より小さい値や 1 より大きい値には warning が出る
+$$
+T_R^* = \frac{T_A^*}{\eta}
+$$
 
-### 重要
-現アーカイブの `set_beameff()` に **`target_scale` 引数はありません。**  
-したがって
+の $\eta$ です。したがって、相対スケール合わせをしたいだけなら、`BEAMEFF` に流用せず `apply_relative_scale()` を使う方が安全です。
 
-```python
-# 現アーカイブの API ではない
-su.set_beameff(sc_tr, efficiency=0.45, target_scale="TR*")
-```
-
-のような呼び方は一致しません。
-
----
-
-## 22. FDNUM / IFNUM / PLNUM ごとに異なる BEAMEFF を設定する
-
-多ビーム・多 IF・多偏波データでは、この使い方が重要です。
-
-### 1 組だけ設定
+### 21.2 calibration 直後に適用するのが推奨
 
 ```python
-idx = su.find_scans(sc_tr, FDNUM=0, IFNUM=1, PLNUM=0)
-su.set_beameff(sc_tr, efficiency=0.45, rows=idx)
-```
+sc_cal = cal.run_tastar_calibration(...)
 
-### 複数組に別々の値を設定
-
-```python
-beam_eff_map = {
-    (0, 0, 0): 0.46,
-    (0, 0, 1): 0.44,
-    (1, 0, 0): 0.42,
-    (1, 0, 1): 0.41,
-}
-
-for (fdnum, ifnum, plnum), eta in beam_eff_map.items():
-    idx = su.find_scans(sc_tr, FDNUM=fdnum, IFNUM=ifnum, PLNUM=plnum)
-    su.set_beameff(sc_tr, efficiency=eta, rows=idx, verbose=True)
-```
-
-### query でまとめて選ぶ
-
-```python
-idx = su.find_scans(
-    sc_tr,
-    query="FDNUM == 0 and IFNUM == 1 and PLNUM in [0, 1]"
-)
-su.set_beameff(sc_tr, efficiency=0.43, rows=idx)
-```
-
-### 設定結果を確認する
-
-```python
-su.show_scantable(
-    sc_tr,
-    rows="0:20",
-    columns="FDNUM, IFNUM, PLNUM, TEMPSCAL, BEAMEFF"
+su.apply_relative_scale(
+    sc_cal,
+    {
+        (0, 0, 0): 1.00,
+        (0, 0, 1): 0.97,
+        (1, 0, 0): 1.03,
+        (1, 0, 1): 1.01,
+    },
+    key_columns=("FDNUM", "IFNUM", "PLNUM"),
 )
 ```
 
----
+この段階で掛けておくと、その後の baseline, `BSL_RMS`, moment0, coadd はすべて現在のスケールで再計算されます。
+
+### 21.3 後日、一律 factor を掛ける
+
+```python
+su.apply_global_scale(sc_cal, 0.91)
+```
+
+この係数は generic な一律補正用です。後で決まった量が物理 `TR*` 変換の $\eta$ である場合は、
+
+```python
+su.set_beameff(sc_cal, 0.42)
+```
+
+のように `BEAMEFF` として与え、viewer / coadd / write の `TR*` 変換へ渡す方が意味論として自然です。`set_beameff()` 自体は data 本体を掛け直しません。
+
+### 21.4 既に派生量があるとき
+
+`apply_relative_scale()` / `apply_global_scale()` は既定で次の列を無効化します。
+
+- `BSL_RMS`
+- `BSL_COEF`
+- `BSL_SCALE`
+- `MOMENT0`
+- `MOM0`
+- `INTEGRATED`
+
+したがって、scale を掛けた後は必要なら baseline や moment0 を再計算してください。
+
+### 21.5 `set_beameff()` を使う場面
+
+`TR*` 表示や `out_scale="TR*"` を使うために、物理 `BEAMEFF` を設定したいときです。
+
+```python
+su.set_beameff(sc_tr, 0.42)
+```
+
+### 21.6 multi-beam の mapping 指定
+
+```python
+su.set_beameff(
+    sc_tr,
+    {
+        (0, 0, 0): 0.46,
+        (0, 0, 1): 0.44,
+        (1, 0, 0): 0.42,
+        (1, 0, 1): 0.41,
+    },
+    key_columns=("FDNUM", "IFNUM", "PLNUM"),
+)
+```
+
+```python
+su.apply_relative_scale(
+    sc_tr,
+    {
+        (0, 0, 0): 1.00,
+        (0, 0, 1): 0.97,
+        (1, 0, 0): 1.03,
+        (1, 0, 1): 1.01,
+    },
+    key_columns=("FDNUM", "IFNUM", "PLNUM"),
+)
+```
 
 ## 23. row 抽出を使う
 
@@ -1521,22 +1656,24 @@ writer = SDRadioSpectralSDFITSWriter(
 ## 37. viewer 系を簡単に使う
 
 > 注記  
-> ここは旧版 cookbook の情報を落とさないために残しています。今回の zip には `profile_view` のソースは含まれていないので、実際に使うには環境側に対応版が入っている必要があります。
+> `profile_view` の詳細な API、キーボード操作、`viewer` / `montage` / `grid` の内部仕様は `profile_view_manual_ja_v2.md` を参照してください。ここでは解析後確認にすぐ使える簡単な例だけを載せます。
 
 ### 1 本ずつ見る
 
 ```python
 pv.view_spectra(
     sc_final_bsl,
+    xaxis="vel",
     xrange=(-30, 55),
 )
 ```
 
-### montage
+### montage を開く
 
 ```python
-viewer = mnt.ProfileMapMontageViewer(
+pv.plot_profile_map(
     sc_final_bsl,
+    mode="montage",
     xaxis="vel",
     nrows=5,
     ncols=4,
@@ -1544,11 +1681,12 @@ viewer = mnt.ProfileMapMontageViewer(
 )
 ```
 
-### grid
+### grid を開く
 
 ```python
-grid = grd.ProfileMapGridViewer(
+pv.plot_profile_map(
     sc_final_bsl,
+    mode="grid",
     coord="radec",
     projection="SFL",
     ref_point=(83.822, -5.391),
@@ -1559,7 +1697,11 @@ grid = grd.ProfileMapGridViewer(
 )
 ```
 
----
+### ポイント
+
+- 詳細仕様の正本は `profile_view_manual_ja_v2.md`
+- cookbook 側では最上位 API の簡単な呼び出しだけ覚えればよい
+- row ごとの WCS を尊重して表示する点が重要
 
 ## 38. よくある失敗例と回避法
 

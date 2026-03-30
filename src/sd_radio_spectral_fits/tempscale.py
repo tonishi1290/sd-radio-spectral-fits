@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import datetime
 import warnings
-from typing import Any, Iterable, Optional, Tuple, Union, List, TYPE_CHECKING
+from typing import Any, Iterable, Optional, Tuple, Union, List, TYPE_CHECKING, Sequence
+from collections.abc import Mapping
 
 import numpy as np
 import pandas as pd
@@ -269,78 +270,430 @@ def append_scale_history(history: dict | None, entry: dict) -> dict:
     if key not in hist or not isinstance(hist.get(key), list):
         hist[key] = []
     entry2 = dict(entry)
-    entry2.setdefault("created_at_utc", datetime.datetime.utcnow().isoformat(timespec="seconds") + "Z")
+    entry2.setdefault("created_at_utc", datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds").replace("+00:00", "Z"))
     hist[key].append(entry2)
     return hist
 
 
-# [MODIFIED] Added safe metadata setter based on New Spec
-def set_beameff(
-    sc: "Scantable", # Use string forward reference or TYPE_CHECKING alias
-    efficiency: Union[float, np.ndarray, Sequence[float]],
-    rows: Union[str, List[int], None] = None,
-    verbose: bool = True
-) -> None:
-    """
-    BEAMEFF (ビーム効率) を設定するユーティリティ。
-    
-    注意:
-    この関数はデータの実体や TEMPSCAL (温度スケールラベル) を変更しません。
-    単に BEAMEFF カラムに値をセットし、Viewer等でのオンザフライ変換 (Ta* <-> TR*) を可能にするためのメタデータを供給します。
 
-    Parameters
-    ----------
-    sc : Scantable
-        対象のScantable
-    efficiency : float or array
-        設定するビーム効率 (0.0 < eta <= 1.0)
-    rows : selector
-        適用する行。Noneの場合は全行。
-    verbose : bool
-        詳細表示。
-    """
-    df = sc.table
-    
-    # 1. 効率値のバリデーション
-    eff_arr = np.array(efficiency, dtype=float)
-    if np.any((eff_arr <= 0) | (eff_arr > 1.0)):
-        # 物理的にありえない値ですが、計算エラーを防ぐため警告にとどめる
-        warnings.warn("Efficiency values out of physical range (0.0 < eta <= 1.0). Check your inputs.")
-    
-    # 2. 行の特定 (簡易実装フォールバック付き)
-    try:
-        from .scantable_utils import _parse_row_selector
-        idxs = _parse_row_selector(rows, len(df))
-    except ImportError:
-        if rows is None:
-            idxs = df.index
-        elif isinstance(rows, (list, np.ndarray)):
-            idxs = rows
-        elif isinstance(rows, slice):
-            idxs = np.arange(len(df))[rows]
+# -----------------------------------------------------------------------------
+# Row-wise metadata / intensity scaling helpers
+# -----------------------------------------------------------------------------
+
+_SCALE_DERIVED_CLEAR_COLS: Tuple[str, ...] = (
+    "BSL_RMS",
+    "BSL_COEF",
+    "BSL_SCALE",
+    "MOMENT0",
+    "MOM0",
+    "INTEGRATED",
+)
+
+
+def _ensure_intscale_column(df: pd.DataFrame) -> None:
+    """Ensure an in-place cumulative intensity scale column exists."""
+    if "INTSCALE" not in df.columns:
+        df["INTSCALE"] = np.ones(len(df), dtype=np.float64)
+        return
+    vals = pd.to_numeric(df["INTSCALE"], errors="coerce").to_numpy(dtype=float)
+    bad = ~np.isfinite(vals)
+    if np.any(bad):
+        vals[bad] = 1.0
+    df["INTSCALE"] = vals.astype(np.float64, copy=False)
+
+
+def _validate_positive_factors(values: np.ndarray, *, context: str) -> np.ndarray:
+    arr = np.asarray(values, dtype=float).ravel()
+    if arr.size == 0:
+        raise ValueError(f"{context}: no factor values were provided.")
+    bad = (~np.isfinite(arr)) | (arr <= 0.0)
+    if np.any(bad):
+        examples = arr[bad][:5]
+        raise ValueError(
+            f"{context}: factors must be finite and > 0. Invalid examples: {examples.tolist()}"
+        )
+    return arr
+
+
+def _selected_index_labels(df: pd.DataFrame, idxs: np.ndarray) -> pd.Index:
+    return df.index[np.asarray(idxs, dtype=int)]
+
+
+def _normalize_key_columns(key_columns: Union[str, Sequence[str]]) -> List[str]:
+    cols = [str(key_columns)] if isinstance(key_columns, str) else [str(c) for c in key_columns]
+    if len(cols) == 0:
+        raise ValueError("key_columns must not be empty.")
+    return cols
+
+
+def _resolve_row_factors(
+    df: pd.DataFrame,
+    idxs: np.ndarray,
+    scale: Union[float, Sequence[float], np.ndarray, Mapping[Any, float]],
+    *,
+    key_columns: Union[str, Sequence[str]] = ("FDNUM", "IFNUM", "PLNUM"),
+    strict: bool = False,
+    context: str,
+) -> Tuple[np.ndarray, str, dict]:
+    idxs = np.asarray(idxs, dtype=int)
+    if idxs.size == 0:
+        return np.array([], dtype=float), "empty", {}
+
+    if isinstance(scale, Mapping):
+        cols = _normalize_key_columns(key_columns)
+        missing_cols = [c for c in cols if c not in df.columns]
+        if missing_cols:
+            raise KeyError(f"{context}: key columns not found: {missing_cols}")
+
+        normalized_map: dict[Any, float] = {}
+        for raw_key, raw_fac in scale.items():
+            fac = float(_validate_positive_factors(np.array([raw_fac], dtype=float), context=f"{context}(mapping)")[0])
+            if len(cols) == 1:
+                if isinstance(raw_key, tuple):
+                    if len(raw_key) != 1:
+                        raise ValueError(
+                            f"{context}: key {raw_key!r} does not match single key column {cols[0]!r}."
+                        )
+                    key = raw_key[0]
+                else:
+                    key = raw_key
+            else:
+                if not isinstance(raw_key, tuple) or len(raw_key) != len(cols):
+                    raise ValueError(
+                        f"{context}: key {raw_key!r} must be a tuple of length {len(cols)} for key_columns={cols}."
+                    )
+                key = tuple(raw_key)
+            normalized_map[key] = fac
+
+        subset = df.iloc[idxs]
+        used_keys: set[Any] = set()
+
+        if len(cols) == 1:
+            key_series = subset[cols[0]]
+            factors_series = key_series.map(normalized_map)
+            factors = pd.to_numeric(factors_series, errors="coerce").to_numpy(dtype=float)
+            finite = np.isfinite(factors)
+            if finite.any():
+                used_keys = set(pd.unique(key_series[finite]))
+            if not finite.all():
+                miss_pos = np.flatnonzero(~finite)
+                missing_rows = [(int(idxs[m]), key_series.iloc[m]) for m in miss_pos[:5]]
+                raise ValueError(
+                    f"{context}: {int((~finite).sum())} selected rows have no matching factor. Examples: {missing_rows}"
+                )
         else:
-            idxs = df.index 
+            map_rows = [tuple(k) + (v,) for k, v in normalized_map.items()]
+            map_df = pd.DataFrame(map_rows, columns=cols + ["__factor__"])
+            merged = subset[cols].reset_index(drop=True).merge(map_df, on=cols, how="left", sort=False)
+            factors = pd.to_numeric(merged["__factor__"], errors="coerce").to_numpy(dtype=float)
+            finite = np.isfinite(factors)
+            if finite.any():
+                used_keys = set(merged.loc[finite, cols].itertuples(index=False, name=None))
+            if not finite.all():
+                miss_pos = np.flatnonzero(~finite)
+                missing_rows = []
+                for m in miss_pos[:5]:
+                    key = tuple(subset.iloc[int(m)][c] for c in cols)
+                    missing_rows.append((int(idxs[m]), key))
+                raise ValueError(
+                    f"{context}: {int((~finite).sum())} selected rows have no matching factor. Examples: {missing_rows}"
+                )
 
-    if len(idxs) == 0:
+        unused_keys = [k for k in normalized_map.keys() if k not in used_keys]
+        if unused_keys:
+            msg = f"{context}: {len(unused_keys)} mapping keys were unused. Examples: {unused_keys[:5]}"
+            if strict:
+                raise ValueError(msg)
+            warnings.warn(msg)
+
+        return factors, "mapping", {"key_columns": cols, "n_map": len(normalized_map), "n_unused": len(unused_keys)}
+
+    arr = np.asarray(scale, dtype=float)
+    if arr.ndim == 0:
+        fac = float(_validate_positive_factors(np.array([arr.item()], dtype=float), context=f"{context}(scalar)")[0])
+        return np.full(idxs.size, fac, dtype=float), "scalar", {"factor": fac}
+
+    vals = _validate_positive_factors(arr, context=f"{context}(sequence)")
+    if vals.size != idxs.size:
+        raise ValueError(
+            f"{context}: factor length ({int(vals.size)}) must equal number of selected rows ({int(idxs.size)})."
+        )
+    return vals.astype(float, copy=False), "sequence", {"n_factors": int(vals.size)}
+
+
+def _scale_row_array_inplace_or_replace(arr: np.ndarray, factor: float) -> np.ndarray:
+    a = np.asarray(arr)
+    if np.issubdtype(a.dtype, np.floating):
+        try:
+            a *= np.asarray(factor, dtype=a.dtype)
+            return a
+        except Exception:
+            pass
+    out = np.asarray(a, dtype=np.float32) * np.float32(factor)
+    return np.asarray(out, dtype=np.float32)
+
+
+def _scale_scantable_data_inplace(sc: "Scantable", idxs: np.ndarray, row_factors: np.ndarray) -> None:
+    idxs = np.asarray(idxs, dtype=int)
+    fac = np.asarray(row_factors, dtype=float).ravel()
+    if fac.size != idxs.size:
+        raise ValueError("_scale_scantable_data_inplace: len(row_factors) must equal len(idxs).")
+
+    data = sc.data
+    scalar_like = bool(fac.size > 0 and np.allclose(fac, fac[0], rtol=0.0, atol=0.0))
+    if isinstance(data, np.ndarray):
+        if data.ndim != 2:
+            raise ValueError(f"_scale_scantable_data_inplace: expected 2D ndarray, got shape={data.shape}")
+        if not np.issubdtype(data.dtype, np.floating):
+            data = np.asarray(data, dtype=np.float32)
+            sc.data = data
+        if idxs.size == data.shape[0]:
+            if scalar_like:
+                data *= np.asarray(float(fac[0]), dtype=data.dtype)
+            else:
+                data *= fac.astype(data.dtype, copy=False)[:, None]
+            return
+        if scalar_like:
+            data[idxs, :] *= np.asarray(float(fac[0]), dtype=data.dtype)
+        else:
+            data[idxs, :] = data[idxs, :] * fac.astype(data.dtype, copy=False)[:, None]
         return
 
-    # 3. BEAMEFF の更新
-    
-    # BEAMEFFカラムがなければ作成
+    if not isinstance(data, list):
+        raise TypeError(f"_scale_scantable_data_inplace: unsupported data type {type(data)}")
+
+    if scalar_like:
+        f0 = float(fac[0])
+        for i in idxs:
+            data[int(i)] = _scale_row_array_inplace_or_replace(data[int(i)], f0)
+        return
+
+    for i, f in zip(idxs, fac):
+        data[int(i)] = _scale_row_array_inplace_or_replace(data[int(i)], float(f))
+
+
+def _invalidate_scale_dependent_columns(df: pd.DataFrame, idxs: np.ndarray) -> List[str]:
+    cleared: List[str] = []
+    labels = _selected_index_labels(df, idxs)
+    for col in _SCALE_DERIVED_CLEAR_COLS:
+        if col not in df.columns:
+            continue
+        series = df[col]
+        if getattr(series.dtype, "kind", "") in ("f", "i", "u"):
+            df.loc[labels, col] = np.nan
+        else:
+            df.loc[labels, col] = None
+        cleared.append(col)
+    return cleared
+
+
+def _apply_scale_common(
+    sc: "Scantable",
+    row_factors: np.ndarray,
+    idxs: np.ndarray,
+    *,
+    action: str,
+    factor_mode: str,
+    history_extra: Optional[dict] = None,
+    invalidate_derived: bool = True,
+    verbose: bool = True,
+) -> None:
+    df = sc.table
+    idxs = np.asarray(idxs, dtype=int)
+    row_factors = np.asarray(row_factors, dtype=float).ravel()
+    if idxs.size == 0:
+        if verbose:
+            print("No rows selected.")
+        return
+
+    _scale_scantable_data_inplace(sc, idxs, row_factors)
+    _ensure_intscale_column(df)
+    current = pd.to_numeric(df["INTSCALE"], errors="coerce").to_numpy(dtype=float)
+    bad = ~np.isfinite(current)
+    if np.any(bad):
+        current[bad] = 1.0
+    current[idxs] *= row_factors
+    df["INTSCALE"] = current.astype(np.float64, copy=False)
+
+    cleared = _invalidate_scale_dependent_columns(df, idxs) if invalidate_derived else []
+
+    entry = {
+        "stage": "tempscale",
+        "action": action,
+        "factor_mode": factor_mode,
+        "rows_selected": int(idxs.size),
+        "invalidate_derived": bool(invalidate_derived),
+        "cleared_columns": cleared,
+        "tempscal_preserved": True,
+        "record_column": "INTSCALE",
+    }
+    if row_factors.size > 0:
+        entry.update({
+            "factor_min": float(np.min(row_factors)),
+            "factor_max": float(np.max(row_factors)),
+        })
+    if history_extra:
+        entry.update(history_extra)
+    sc.history = append_scale_history(sc.history, entry)
+
+    if verbose:
+        current_scale = df["TEMPSCAL"].iloc[int(idxs[0])] if "TEMPSCAL" in df.columns else "Unknown"
+        print(f"Applied {action} to {len(idxs)} rows (mode={factor_mode}).")
+        print(f"Note: Data remain labeled as '{current_scale}'. Cumulative factor is recorded in 'INTSCALE'.")
+        if cleared:
+            print(f"Invalidated scale-dependent columns: {', '.join(cleared)}")
+
+
+def set_beameff(
+    sc: "Scantable",
+    efficiency: Union[float, Sequence[float], np.ndarray, Mapping[Any, float]],
+    rows: Union[str, List[int], int, slice, None] = None,
+    *,
+    key_columns: Union[str, Sequence[str]] = ("FDNUM", "IFNUM", "PLNUM"),
+    strict: bool = False,
+    verbose: bool = True,
+) -> None:
+    """
+    Set per-row BEAMEFF values in-place.
+
+    This function only updates the ``BEAMEFF`` column. It does **not** modify
+    the spectral data array and does **not** change ``TEMPSCAL``.
+
+    Accepted efficiency forms
+    -------------------------
+    1. scalar
+       Apply one value to all selected rows.
+    2. 1-D sequence / ndarray
+       Length must exactly match the number of selected rows.
+    3. mapping
+       Apply values by key columns such as ``(FDNUM, IFNUM, PLNUM)``.
+    """
+    from .scantable_utils import _parse_row_selector
+
+    df = sc.table
+    idxs = np.asarray(_parse_row_selector(rows, len(df)), dtype=int)
+    if idxs.size == 0:
+        if verbose:
+            print("No rows selected.")
+        return
+
     if "BEAMEFF" not in df.columns:
         df["BEAMEFF"] = np.nan
 
-    # 値の代入
-    try:
-        # Pandasのloc代入。eff_arrがスカラーならブロードキャスト、配列ならサイズ一致が必要
-        df.loc[df.index[idxs], "BEAMEFF"] = eff_arr
-        
+    values, mode, info = _resolve_row_factors(
+        df,
+        idxs,
+        efficiency,
+        key_columns=key_columns,
+        strict=strict,
+        context="set_beameff",
+    )
+    if np.any(values > 1.0):
+        bad = values[values > 1.0][:5]
+        raise ValueError(
+            "set_beameff: BEAMEFF values must satisfy 0 < eta <= 1. "
+            f"Invalid examples: {bad.tolist()}"
+        )
+    df.loc[_selected_index_labels(df, idxs), "BEAMEFF"] = values.astype(float, copy=False)
+
+    if verbose:
+        current_scale = df["TEMPSCAL"].iloc[int(idxs[0])] if "TEMPSCAL" in df.columns else "Unknown"
+        print(f"Updated BEAMEFF for {len(idxs)} rows (mode={mode}).")
+        print(f"Note: Data remain in '{current_scale}'. Use Viewer / coadd / write_sdfits to interpret TR*.")
+
+    hist = {"stage": "tempscale", "action": "set_beameff", "mode": mode, "rows_selected": int(idxs.size)}
+    hist.update(info)
+    sc.history = append_scale_history(sc.history, hist)
+
+
+def apply_relative_scale(
+    sc: "Scantable",
+    scale: Union[float, Sequence[float], np.ndarray, Mapping[Any, float]],
+    rows: Union[str, List[int], int, slice, None] = None,
+    *,
+    key_columns: Union[str, Sequence[str]] = ("FDNUM", "IFNUM", "PLNUM"),
+    strict: bool = False,
+    invalidate_derived: bool = True,
+    verbose: bool = True,
+) -> None:
+    """
+    Apply row-wise relative intensity scale factors in-place.
+
+    This function multiplies the spectral data themselves and preserves ``TEMPSCAL``.
+    It is intended for beam-to-beam relative scaling, typically immediately after
+    calibration and before baseline / RMS / moment / coadd products are computed.
+
+    The cumulative applied factor is recorded in ``INTSCALE``.
+    By default, known scale-dependent derived columns are invalidated.
+    """
+    from .scantable_utils import _parse_row_selector
+
+    df = sc.table
+    idxs = np.asarray(_parse_row_selector(rows, len(df)), dtype=int)
+    if idxs.size == 0:
         if verbose:
-            print(f"Updated BEAMEFF for {len(idxs)} rows.")
-            # ユーザーへの案内（TEMPSCALは変わっていないことを明示）
-            current_scale = df["TEMPSCAL"].iloc[idxs[0]] if "TEMPSCAL" in df.columns else "Unknown"
-            print(f"Note: Data remains in '{current_scale}'. Use Viewer to toggle TR* display.")
-            
-    except Exception as e:
-        print(f"Error setting BEAMEFF: {e}")
+            print("No rows selected.")
         return
+
+    factors, mode, info = _resolve_row_factors(
+        df,
+        idxs,
+        scale,
+        key_columns=key_columns,
+        strict=strict,
+        context="apply_relative_scale",
+    )
+    _apply_scale_common(
+        sc,
+        factors,
+        idxs,
+        action="apply_relative_scale",
+        factor_mode=mode,
+        history_extra=info,
+        invalidate_derived=invalidate_derived,
+        verbose=verbose,
+    )
+
+
+def apply_global_scale(
+    sc: "Scantable",
+    factor: float,
+    rows: Union[str, List[int], int, slice, None] = None,
+    *,
+    invalidate_derived: bool = True,
+    verbose: bool = True,
+) -> None:
+    """
+    Apply one multiplicative global intensity factor in-place.
+
+    Typical use: after beam-to-beam relative alignment has already been done,
+    multiply all selected rows by one final absolute scale factor.
+    ``TEMPSCAL`` is preserved and the cumulative factor is recorded in ``INTSCALE``.
+    """
+    from .scantable_utils import _parse_row_selector
+
+    df = sc.table
+    idxs = np.asarray(_parse_row_selector(rows, len(df)), dtype=int)
+    if idxs.size == 0:
+        if verbose:
+            print("No rows selected.")
+        return
+
+    factors, mode, info = _resolve_row_factors(
+        df,
+        idxs,
+        float(factor),
+        key_columns=("FDNUM", "IFNUM", "PLNUM"),
+        strict=False,
+        context="apply_global_scale",
+    )
+    _apply_scale_common(
+        sc,
+        factors,
+        idxs,
+        action="apply_global_scale",
+        factor_mode=mode,
+        history_extra=info,
+        invalidate_derived=invalidate_derived,
+        verbose=verbose,
+    )
