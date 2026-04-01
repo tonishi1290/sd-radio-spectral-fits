@@ -399,6 +399,17 @@ def _resolve_row_factors(
                     f"{context}: {int((~finite).sum())} selected rows have no matching factor. Examples: {missing_rows}"
                 )
 
+        used_key_counts: dict[Any, int] = {}
+        if len(cols) == 1:
+            if finite.any():
+                used_vals, counts = np.unique(key_series[finite].to_numpy(), return_counts=True)
+                used_key_counts = {used_vals[i]: int(counts[i]) for i in range(len(used_vals))}
+        else:
+            if finite.any():
+                finite_keys = list(merged.loc[finite, cols].itertuples(index=False, name=None))
+                for key in finite_keys:
+                    used_key_counts[key] = used_key_counts.get(key, 0) + 1
+
         unused_keys = [k for k in normalized_map.keys() if k not in used_keys]
         if unused_keys:
             msg = f"{context}: {len(unused_keys)} mapping keys were unused. Examples: {unused_keys[:5]}"
@@ -406,7 +417,23 @@ def _resolve_row_factors(
                 raise ValueError(msg)
             warnings.warn(msg)
 
-        return factors, "mapping", {"key_columns": cols, "n_map": len(normalized_map), "n_unused": len(unused_keys)}
+        applied_summary = []
+        for key in normalized_map.keys():
+            n_rows = int(used_key_counts.get(key, 0))
+            if n_rows <= 0:
+                continue
+            applied_summary.append({
+                "key": key,
+                "factor": float(normalized_map[key]),
+                "n_rows": n_rows,
+            })
+
+        return factors, "mapping", {
+            "key_columns": cols,
+            "n_map": len(normalized_map),
+            "n_unused": len(unused_keys),
+            "applied_summary": applied_summary,
+        }
 
     arr = np.asarray(scale, dtype=float)
     if arr.ndim == 0:
@@ -541,6 +568,17 @@ def _apply_scale_common(
         current_scale = df["TEMPSCAL"].iloc[int(idxs[0])] if "TEMPSCAL" in df.columns else "Unknown"
         print(f"Applied {action} to {len(idxs)} rows (mode={factor_mode}).")
         print(f"Note: Data remain labeled as '{current_scale}'. Cumulative factor is recorded in 'INTSCALE'.")
+        if factor_mode == "mapping" and history_extra:
+            key_columns = history_extra.get("key_columns")
+            applied_summary = history_extra.get("applied_summary") or []
+            if key_columns and applied_summary:
+                key_label = ", ".join(str(c) for c in key_columns)
+                print(f"Mapping summary by ({key_label}):")
+                for item in applied_summary:
+                    key = item.get("key")
+                    factor = float(item.get("factor"))
+                    n_rows = int(item.get("n_rows", 0))
+                    print(f"  key={key!r} -> factor={factor:.15g}, rows={n_rows}")
         if cleared:
             print(f"Invalidated scale-dependent columns: {', '.join(cleared)}")
 

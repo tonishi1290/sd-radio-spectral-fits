@@ -79,7 +79,8 @@ def fit_polynomial_baseline(
     order: Optional[int] = None,
     # Iterative parameters
     iter_max: int = 0,
-    iter_sigma: float = 3.0
+    iter_sigma: float = 3.0,
+    window_mask: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     """
     Fit a polynomial baseline to the spectrum, optionally with iterative sigma-clipping.
@@ -92,28 +93,35 @@ def fit_polynomial_baseline(
     # Resolve Windows
     # base_windows takes precedence, then windows
     wins = base_windows if base_windows is not None else windows
-    
-    # If absolutely no window is provided, usually implies "use everything" 
-    # OR "cannot fit". Here we default to "cannot fit" to be safe, 
-    # unless user explicitly passed empty list? 
-    # Let's assume None = "No Fit", [] = "Use All" (Legacy behavior varies)
-    # -> Safe bet: If None, return zero baseline.
-    if wins is None:
-        return np.zeros(deg + 1), np.zeros_like(y), {"mask": np.zeros_like(y, dtype=bool), "rms": np.nan, "std": np.nan}
 
-    # Subtract line windows if any
-    line_wins = list(line_windows or [])
-    use_windows = subtract_windows(wins, line_wins) if line_wins else list(wins)
-    
     # 2. Build Initial Mask
-    if not use_windows:
-        # If explicit empty list or subtraction resulted in empty, 
-        # usually means "use full range" in some contexts, but here we treat strictly.
-        # Fallback: if no windows defined, use valid data points? 
-        # Better: use everything (continuum mode)
-        mask_window = np.ones_like(y, dtype=bool)
+    if window_mask is not None:
+        mask_window = np.asarray(window_mask, dtype=bool)
+        if mask_window.shape != y.shape:
+            raise ValueError(
+                f"window_mask shape mismatch: {mask_window.shape} != {y.shape}"
+            )
     else:
-        mask_window = in_any_windows(v, use_windows)
+        # If absolutely no window is provided, usually implies "use everything"
+        # OR "cannot fit". Here we default to "cannot fit" to be safe,
+        # unless user explicitly passed empty list?
+        # Let's assume None = "No Fit", [] = "Use All" (Legacy behavior varies)
+        # -> Safe bet: If None, return zero baseline.
+        if wins is None:
+            return np.zeros(deg + 1), np.zeros_like(y), {"mask": np.zeros_like(y, dtype=bool), "rms": np.nan, "std": np.nan}
+
+        # Subtract line windows if any
+        line_wins = list(line_windows or [])
+        use_windows = subtract_windows(wins, line_wins) if line_wins else list(wins)
+
+        if not use_windows:
+            # If explicit empty list or subtraction resulted in empty,
+            # usually means "use full range" in some contexts, but here we treat strictly.
+            # Fallback: if no windows defined, use valid data points?
+            # Better: use everything (continuum mode)
+            mask_window = np.ones_like(y, dtype=bool)
+        else:
+            mask_window = in_any_windows(v, use_windows)
         
     mask_valid = np.isfinite(y) & mask_window
     
@@ -138,16 +146,13 @@ def fit_polynomial_baseline(
             break
             
         try:
-            # [変更] np.polyfit から np.polynomial.Polynomial.fit へ移行
-            p = np.polynomial.Polynomial.fit(v[current_mask], y[current_mask], deg)
-            
-            # [変更] np.polyval から p() へ移行
-            baseline = p(v)
-            
-            # FITS保存用に、従来の np.polyfit と同じ形式（高次->低次）に変換
-            coeffs = p.convert().coef[::-1]
-            
-        except np.linalg.LinAlgError:
+            # Fast path: np.polynomial.polynomial.polyfit/polyval is materially faster
+            # than Polynomial.fit(...).convert() here, while keeping the same power-basis
+            # coefficients (after reversing to high->low order for FITS/legacy storage).
+            coeffs_low = np.polynomial.polynomial.polyfit(v[current_mask], y[current_mask], deg)
+            baseline = np.polynomial.polynomial.polyval(v, coeffs_low)
+            coeffs = coeffs_low[::-1]
+        except (np.linalg.LinAlgError, ValueError):
             break
             
         if i == iter_max:
@@ -415,22 +420,190 @@ def _row_wcs_meta(row: pd.Series, meta: dict, nchan: int) -> dict:
     return row_meta
 
 
-def _physical_axis_for_row(row: pd.Series, meta: dict, nchan_full: int, *, v_corr_kms: float, ch_slice: slice | None = None) -> np.ndarray:
+def _is_missing_scalar(val: Any) -> bool:
+    if val is None:
+        return True
+    try:
+        return bool(pd.isna(val))
+    except Exception:
+        return False
+
+
+def _get_column_arrays(table: pd.DataFrame, columns: Sequence[str]) -> dict[str, np.ndarray]:
+    out: dict[str, np.ndarray] = {}
+    for key in columns:
+        if key in table.columns:
+            out[key] = table[key].to_numpy(copy=False)
+    return out
+
+
+def _row_only_value_from_arrays(column_arrays: dict[str, np.ndarray], idx: int, key: str, default=None):
+    arr = column_arrays.get(key)
+    if arr is None:
+        return default
+    val = arr[idx]
+    if _is_missing_scalar(val):
+        return default
+    return val
+
+
+def _row_or_meta_from_arrays(column_arrays: dict[str, np.ndarray], idx: int, meta: dict, key: str, default=None):
+    val = _row_only_value_from_arrays(column_arrays, idx, key, None)
+    if val is not None:
+        return val
+    val = meta.get(key, None)
+    if _is_missing_scalar(val):
+        return default
+    return val
+
+
+def _resolve_specsys_from_arrays(column_arrays: dict[str, np.ndarray], idx: int, meta: dict) -> str:
+    for key in ("SPECSYS", "SSYSOBS"):
+        val = _row_or_meta_from_arrays(column_arrays, idx, meta, key, None)
+        if val not in (None, ""):
+            return str(val).strip().upper()
+    return ""
+
+
+def _resolve_ssysobs_from_arrays(column_arrays: dict[str, np.ndarray], idx: int, meta: dict) -> str:
+    for key in ("SSYSOBS", "SPECSYS"):
+        val = _row_or_meta_from_arrays(column_arrays, idx, meta, key, None)
+        if val not in (None, ""):
+            return str(val).strip().upper()
+    return ""
+
+
+def _extract_vcorr_kms_from_arrays(column_arrays: dict[str, np.ndarray], idx: int, preferred_key: str = "VELOSYS") -> tuple[float, str | None]:
+    found: list[tuple[str, float]] = []
+    for key in _vcorr_candidate_names(preferred_key):
+        val = _row_only_value_from_arrays(column_arrays, idx, key, None)
+        if val is None:
+            continue
+        found.append((key, float(val) * _vcorr_scale_to_kms(key)))
+
+    if not found:
+        return 0.0, None
+
+    ref_key, ref_val = found[0]
+    for key, val in found[1:]:
+        if np.isfinite(ref_val) and np.isfinite(val) and abs(val - ref_val) > 1.0e-9:
+            raise ValueError(f"Velocity columns disagree for a row: {ref_key}={ref_val} km/s, {key}={val} km/s")
+    return ref_val, ref_key
+
+
+def _row_wcs_meta_from_arrays(column_arrays: dict[str, np.ndarray], idx: int, meta: dict, nchan: int) -> dict:
+    row_meta = dict(meta)
+    for key in ("VELOSYS", "VFRAME", "V_CORR_KMS"):
+        row_meta.pop(key, None)
+
+    for key in (
+        "CRVAL1", "CDELT1", "CRPIX1", "CTYPE1", "CUNIT1",
+        "RESTFRQ", "RESTFREQ", "SPECSYS", "SSYSOBS", "VELDEF",
+        "NAXIS1"
+    ):
+        val = _row_or_meta_from_arrays(column_arrays, idx, meta, key, None)
+        if val is not None:
+            row_meta[key] = val
+
+    for key in ("VELOSYS", "VFRAME", "V_CORR_KMS"):
+        val = _row_only_value_from_arrays(column_arrays, idx, key, None)
+        if val is not None:
+            row_meta[key] = val
+
+    row_meta["NAXIS1"] = int(nchan)
+
+    rest = None
+    for key in ("RESTFRQ", "RESTFREQ"):
+        val = row_meta.get(key, None)
+        if val not in (None, ""):
+            try:
+                rest = float(val)
+                break
+            except Exception:
+                pass
+    if rest is not None:
+        row_meta["RESTFRQ"] = rest
+        row_meta["RESTFREQ"] = rest
+
+    specsys = _resolve_specsys_from_arrays(column_arrays, idx, row_meta)
+    if specsys:
+        row_meta["SPECSYS"] = specsys
+
+    ssysobs = _resolve_ssysobs_from_arrays(column_arrays, idx, row_meta)
+    if ssysobs:
+        row_meta["SSYSOBS"] = ssysobs
+    elif specsys:
+        row_meta["SSYSOBS"] = specsys
+
+    return row_meta
+
+def _physical_axis_from_row_meta(row_meta: dict, *, v_corr_kms: float, ch_slice: slice | None = None) -> np.ndarray:
     """Return the per-row auxiliary VLSR axis used for BSL_WINF interpretation.
 
-    This helper does *not* regrid or rewrite the spectrum WCS. It only computes the
-    row-specific VLSR velocity axis needed to interpret baseline windows when the
-    stored spectrum is still in native FREQ/TOPOCENT.
+    Parameters are already resolved into ``row_meta`` so callers that have just built
+    the row-wise WCS do not have to reconstruct it a second time.
     """
-    row_meta = _row_wcs_meta(row, meta, nchan_full)
-    axis = vlsrk_axis_for_spectrum(row_meta, v_corr_kms=float(v_corr_kms), nchan=int(nchan_full))
+    nchan_full = int(row_meta.get("NAXIS1", 0))
+    axis = vlsrk_axis_for_spectrum(row_meta, v_corr_kms=float(v_corr_kms), nchan=nchan_full)
     if ch_slice is not None:
         axis = axis[ch_slice]
     return np.asarray(axis, dtype=float)
 
 
+def _physical_axis_for_row(row: pd.Series, meta: dict, nchan_full: int, *, v_corr_kms: float, ch_slice: slice | None = None) -> np.ndarray:
+    """Backward-compatible wrapper around ``_physical_axis_from_row_meta``."""
+    row_meta = _row_wcs_meta(row, meta, nchan_full)
+    return _physical_axis_from_row_meta(row_meta, v_corr_kms=float(v_corr_kms), ch_slice=ch_slice)
 
 
+def _axis_cache_key_from_row_meta(
+    row_meta: dict,
+    *,
+    v_corr_kms: float,
+    ch_start: Optional[int],
+    ch_stop: Optional[int],
+) -> tuple:
+    rest_hz = row_meta.get("RESTFRQ", row_meta.get("RESTFREQ"))
+    return (
+        int(row_meta.get("NAXIS1", 0)),
+        float(row_meta["CRVAL1"]),
+        float(row_meta["CDELT1"]),
+        float(row_meta.get("CRPIX1", 1.0)),
+        float(rest_hz),
+        str(row_meta.get("CTYPE1", "")),
+        str(row_meta.get("CUNIT1", "")),
+        str(row_meta.get("SPECSYS", "")),
+        str(row_meta.get("SSYSOBS", "")),
+        str(row_meta.get("VELDEF", "")),
+        float(v_corr_kms),
+        None if ch_start is None else int(ch_start),
+        None if ch_stop is None else int(ch_stop),
+    )
+
+
+def _window_mask_for_axis(
+    x_axis: np.ndarray,
+    windows: Optional[List[Tuple[float, float]]],
+    *,
+    empty_means_all: bool = False,
+) -> np.ndarray:
+    """Return an axis-only window mask.
+
+    The returned mask depends only on the coordinate axis, not on the spectrum values.
+    Row-dependent finite checks must be applied by the caller.
+
+    Parameters
+    ----------
+    empty_means_all
+        Keep the legacy fit semantics of ``fit_polynomial_baseline`` where an empty
+        effective fit window falls back to "use all finite channels". QC logic should
+        keep ``False`` so an empty QC window remains empty.
+    """
+    if windows is None:
+        return np.ones(len(x_axis), dtype=bool)
+    if len(windows) == 0:
+        return np.ones(len(x_axis), dtype=bool) if empty_means_all else np.zeros(len(x_axis), dtype=bool)
+    return np.asarray(in_any_windows(x_axis, windows), dtype=bool)
 
 
 
@@ -665,6 +838,23 @@ def run_baseline_fit(
     # 2. Parse Windows
     base_windows_req = parse_windows(vwin)
     line_windows_req = parse_windows(line_vwin) if line_vwin else []
+    fit_windows_req = subtract_windows(base_windows_req, line_windows_req) if line_windows_req else list(base_windows_req)
+    qc_windows_req = fit_windows_req if line_windows_req else list(base_windows_req)
+    qc_window_source_default = "baseline_minus_line" if line_windows_req else "baseline"
+    vcorr_candidate_text = ", ".join(_vcorr_candidate_names(v_corr_col))
+    row_column_arrays = _get_column_arrays(
+        table,
+        (
+            "CRVAL1", "CDELT1", "CRPIX1", "CTYPE1", "CUNIT1",
+            "RESTFRQ", "RESTFREQ", "SPECSYS", "SSYSOBS", "VELDEF",
+            "NAXIS1", "VELOSYS", "VFRAME", "V_CORR_KMS",
+        ),
+    )
+    axis_cache: Dict[tuple, np.ndarray] = {}
+    fit_window_mask_cache: Dict[tuple, np.ndarray] = {}
+    qc_window_mask_cache: Dict[tuple, np.ndarray] = {}
+    axis_finite_cache: Dict[tuple, bool] = {}
+    ch_slice = slice(ch_start, ch_stop) if (ch_start is not None or ch_stop is not None) else None
     
     # 3. Fit Loop
     new_data_list = []
@@ -683,24 +873,22 @@ def run_baseline_fit(
         
         did_apply_channel_slice = False
         try:
-            row_i = table.iloc[i]
             full_spec = np.asarray(spec, dtype=float)
             n_chan_full = len(full_spec)
 
-            row_meta = _row_wcs_meta(row_i, meta, n_chan_full)
-            specsys = _resolve_specsys(row_i, row_meta)
+            row_meta = _row_wcs_meta_from_arrays(row_column_arrays, i, meta, n_chan_full)
+            specsys = str(row_meta.get("SPECSYS", "")).strip().upper()
             if not specsys:
                 raise ValueError("Missing SPECSYS/SSYSOBS; baseline fitting requires an explicit spectral reference frame.")
             rest_hz = row_meta.get("RESTFRQ", row_meta.get("RESTFREQ", None))
             if rest_hz in (None, ""):
                 raise ValueError("Missing RESTFRQ/RESTFREQ; baseline fitting in velocity windows requires a rest frequency.")
-            v_corr_kms, v_corr_source = _extract_vcorr_kms(row_i, preferred_key=v_corr_col)
+            v_corr_kms, v_corr_source = _extract_vcorr_kms_from_arrays(row_column_arrays, i, preferred_key=v_corr_col)
 
             if "TOPO" in specsys and v_corr_source is None:
-                cand_txt = ", ".join(_vcorr_candidate_names(v_corr_col))
                 raise ValueError(
                     f"Row {i} has SPECSYS={specsys} but no usable row-wise velocity correction column "
-                    f"({cand_txt})."
+                    f"({vcorr_candidate_text})."
                 )
             if "LSR" in specsys and abs(v_corr_kms) > 1.0e-9:
                 raise ValueError(
@@ -711,14 +899,20 @@ def run_baseline_fit(
             if n_chan_full <= 0:
                 raise ValueError("Encountered an empty spectrum.")
 
-            ch_slice = slice(ch_start, ch_stop) if (ch_start is not None or ch_stop is not None) else None
-            x_axis = _physical_axis_for_row(
-                row_i,
-                meta,
-                n_chan_full,
+            axis_key = _axis_cache_key_from_row_meta(
+                row_meta,
                 v_corr_kms=float(v_corr_kms),
-                ch_slice=ch_slice,
+                ch_start=ch_start,
+                ch_stop=ch_stop,
             )
+            x_axis = axis_cache.get(axis_key)
+            if x_axis is None:
+                x_axis = _physical_axis_from_row_meta(
+                    row_meta,
+                    v_corr_kms=float(v_corr_kms),
+                    ch_slice=ch_slice,
+                )
+                axis_cache[axis_key] = x_axis
 
             if ch_slice is not None:
                 spec = full_spec[ch_slice]
@@ -730,28 +924,40 @@ def run_baseline_fit(
                 raise ValueError(
                     f"Axis/data length mismatch after channel selection: len(spec)={len(spec)}, len(axis)={len(x_axis)}"
                 )
-            if not np.all(np.isfinite(x_axis)):
+            axis_is_finite = axis_finite_cache.get(axis_key)
+            if axis_is_finite is None:
+                axis_is_finite = bool(np.all(np.isfinite(x_axis)))
+                axis_finite_cache[axis_key] = axis_is_finite
+            if not axis_is_finite:
                 raise ValueError("Generated spectral axis contains non-finite values.")
 
-            qc_score_i = np.nan
-            qc_window_source_i = "none"
-            if line_windows_req:
-                qc_windows = subtract_windows(base_windows_req, line_windows_req)
-                qc_window_source_i = "baseline_minus_line"
-            else:
-                qc_windows = list(base_windows_req)
-                qc_window_source_i = "baseline"
+            fit_axis_window_mask = fit_window_mask_cache.get(axis_key)
+            if fit_axis_window_mask is None:
+                fit_axis_window_mask = _window_mask_for_axis(
+                    x_axis,
+                    fit_windows_req,
+                    empty_means_all=True,
+                )
+                fit_window_mask_cache[axis_key] = fit_axis_window_mask
 
-            if qc_windows is None:
-                qc_window_mask = np.isfinite(spec)
+            qc_axis_window_mask = qc_window_mask_cache.get(axis_key)
+            if qc_axis_window_mask is None:
+                qc_axis_window_mask = _window_mask_for_axis(
+                    x_axis,
+                    qc_windows_req,
+                    empty_means_all=False,
+                )
+                qc_window_mask_cache[axis_key] = qc_axis_window_mask
+
+            if qc_windows_req is None:
                 qc_window_source_i = "all_finite"
-            elif len(qc_windows) == 0:
-                # Safe behavior: if the requested QC windows become empty after subtraction,
-                # do not silently fall back to the whole band.
-                qc_window_mask = np.zeros_like(spec, dtype=bool)
+            elif len(qc_windows_req) == 0:
                 qc_window_source_i = "empty"
             else:
-                qc_window_mask = np.isfinite(spec) & in_any_windows(x_axis, qc_windows)
+                qc_window_source_i = qc_window_source_default
+
+            finite_spec_mask = np.isfinite(spec)
+            qc_window_mask = finite_spec_mask & qc_axis_window_mask
             qc_score_i = diffmad_score(spec, window_mask=qc_window_mask)
             if np.any(qc_window_mask):
                 _vals = np.asarray(spec[qc_window_mask], dtype=float)
@@ -762,12 +968,13 @@ def run_baseline_fit(
 
             # Fit
             coeffs, baseline, info = fit_polynomial_baseline(
-                x_axis, spec, 
-                base_windows=base_windows_req,
-                line_windows=line_windows_req,
+                x_axis, spec,
+                base_windows=fit_windows_req,
+                line_windows=None,
                 poly_order=int(poly_order),
                 iter_max=int(iter_max),
                 iter_sigma=float(iter_sigma),
+                window_mask=fit_axis_window_mask,
             )
             
             # Result

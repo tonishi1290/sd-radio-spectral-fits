@@ -357,7 +357,7 @@ def _average_mode_by_scan(
         
     t_out = []
     d_out = []
-    for scan_id, group_idxs in mapping_subset.groupby(scan_col).groups.items():
+    for scan_id, group_idxs in mapping_subset.groupby(scan_col, sort=False, dropna=False).groups.items():
         idx_array = np.array(list(group_idxs), dtype=int)
         if len(idx_array) == 0: continue
         
@@ -381,6 +381,71 @@ def _average_mode_by_scan(
     d_out_sorted = np.stack([d_out[i] for i in sort_idx])
     
     return t_out_sorted, d_out_sorted
+
+
+def _resolve_existing_columns_ci(table: pd.DataFrame, preferred: Sequence[str]) -> list[str]:
+    actual_by_upper: dict[str, str] = {}
+    for col in table.columns:
+        key = str(col).strip().upper()
+        if key not in actual_by_upper:
+            actual_by_upper[key] = str(col)
+    out: list[str] = []
+    for want in preferred:
+        key = str(want).strip().upper()
+        if key in actual_by_upper:
+            out.append(actual_by_upper[key])
+    return out
+
+
+_CAL_KEY_MISSING = object()
+
+
+def _group_index_map_by_key(table: pd.DataFrame, key_cols: Sequence[str]) -> dict[tuple[Any, ...], np.ndarray]:
+    if len(table) == 0:
+        return {}
+    if not key_cols:
+        return {tuple(): np.arange(len(table), dtype=int)}
+
+    grouped = table.groupby(list(key_cols), sort=False, dropna=False).indices
+    out: dict[tuple[Any, ...], np.ndarray] = {}
+    for key, idxs in grouped.items():
+        key_tuple_raw = key if isinstance(key, tuple) else (key,)
+        norm_vals = []
+        for value in key_tuple_raw:
+            if value is None:
+                norm_vals.append(_CAL_KEY_MISSING)
+                continue
+            if isinstance(value, str):
+                if value.strip() == '':
+                    norm_vals.append(_CAL_KEY_MISSING)
+                else:
+                    norm_vals.append(value)
+                continue
+            try:
+                if bool(pd.isna(value)):
+                    norm_vals.append(_CAL_KEY_MISSING)
+                    continue
+            except Exception:
+                pass
+            if isinstance(value, np.generic):
+                norm_vals.append(value.item())
+            else:
+                norm_vals.append(value)
+        out[tuple(norm_vals)] = np.asarray(idxs, dtype=int)
+    return out
+
+
+def _format_calibration_key(key_cols: Sequence[str], key: tuple[Any, ...]) -> str:
+    if not key_cols:
+        return '<global>'
+    parts = []
+    for col, value in zip(key_cols, key):
+        if value is _CAL_KEY_MISSING:
+            value_repr = '<NA>'
+        else:
+            value_repr = repr(value)
+        parts.append(f'{col}={value_repr}')
+    return ', '.join(parts)
 
 
 def make_tastar_dumps(
@@ -492,6 +557,13 @@ def make_tastar_dumps(
 
     mapping_on = ensure_flagrow_column(mapping_all.loc[obsmode == "ON"].iloc[: len(t_on)].copy())
     mapping_on.index = t_on
+
+    cal_key_cols = _resolve_existing_columns_ci(mapping_all, ["FDNUM", "IFNUM", "PLNUM"])
+    if verbose:
+        if cal_key_cols:
+            print(f"[CALIBRATE] Calibration is fully separated by key columns: {cal_key_cols}")
+        else:
+            print("[CALIBRATE] Calibration key columns FDNUM/IFNUM/PLNUM not found; using a single global group.")
 
     # Canonicalize coordinate columns when available.
     # TOPOCENT inputs require coordinates to compute VELOSYS unless a valid row-wise
@@ -727,7 +799,7 @@ def make_tastar_dumps(
     mapping_hot = ensure_flagrow_column(mapping_all.loc[obsmode == "HOT"].iloc[: len(t_hot)].reset_index(drop=True))
     mapping_off = ensure_flagrow_column(mapping_all.loc[obsmode == "OFF"].iloc[: len(t_off)].reset_index(drop=True))
 
-    ref_group_cols = choose_existing_group_cols(mapping_all, ["FDNUM", "IFNUM", "PLNUM", "BACKEND", "MOLECULE"])
+    ref_group_cols = _resolve_existing_columns_ci(mapping_all, ["FDNUM", "IFNUM", "PLNUM", "BACKEND", "MOLECULE"])
 
     hot_input_bad = flagrow_mask(mapping_hot)
     off_input_bad = flagrow_mask(mapping_off)
@@ -784,31 +856,69 @@ def make_tastar_dumps(
     mapping_hot_use = mapping_hot.loc[hot_keep].reset_index(drop=True)
     mapping_off_use = mapping_off.loc[off_keep].reset_index(drop=True)
 
-    # [NEW] HOTとOFFをスキャンごとに時間平均(積分)してS/Nを向上させる
-    t_hot_avg, hot2_avg = _average_mode_by_scan(t_hot_use, hot2_use, mapping_hot_use)
-    t_off_avg, off2_avg = _average_mode_by_scan(t_off_use, off2_use, mapping_off_use)
+    on_group_map = _group_index_map_by_key(mapping_on, cal_key_cols)
+    hot_group_map = _group_index_map_by_key(mapping_hot_use, cal_key_cols)
+    off_group_map = _group_index_map_by_key(mapping_off_use, cal_key_cols)
 
-    # 分子（空の引き算）用: ON点時刻におけるOFFスペクトルの内挿
-    off_on_interp = _interp_spectra_in_time(t_on, t_off_avg, off2_avg)
+    if verbose:
+        print(
+            f"[CALIBRATE] Group counts: ON={len(on_group_map)}, HOT={len(hot_group_map)}, OFF={len(off_group_map)}"
+        )
+        if gain_mode_norm == "independent":
+            print("[CALIBRATE] Using 'independent' gain mode.")
+        else:
+            print("[CALIBRATE] Using 'hybrid' gain mode.")
 
-    if gain_mode_norm == "independent":
-        if verbose: print("[CALIBRATE] Using 'independent' gain mode.")
-        # 従来方式: HOTとOFFをON時刻で別々に内挿してから引き算
-        hot_on_interp = _interp_spectra_in_time(t_on, t_hot_avg, hot2_avg)
-        denom = hot_on_interp.astype(calc_dt) - off_on_interp.astype(calc_dt)
-    else:
-        if verbose: print("[CALIBRATE] Using 'hybrid' gain mode.")
-        # ハイブリッド方式: HOT取得時刻におけるOFFを内挿し、定在波を相殺した純粋な分母(ゲインアレイ)を作成
-        off_at_hot = _interp_spectra_in_time(t_hot_avg, t_off_avg, off2_avg)
-        denom_at_hot = hot2_avg.astype(calc_dt) - off_at_hot.astype(calc_dt)
-        # そのクリーンな分母アレイをON点の時刻に内挿して適用
-        denom = _interp_spectra_in_time(t_on, t_hot_avg, denom_at_hot)
+    ta_calc = np.full((len(t_on), on2_arr.shape[1]), np.nan, dtype=calc_dt)
+    t_cal_arr = np.asarray(t_cal, dtype=calc_dt)
 
-    # ゲインと Ta* の計算 (T_cal 配列を 2D にブロードキャストして適用)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        t_cal_2d = t_cal[:, None].astype(calc_dt)
-        gain = t_cal_2d / denom
-        ta_calc = (on2_arr.astype(calc_dt) - off_on_interp.astype(calc_dt)) * gain
+    missing_hot_keys = [key for key in on_group_map.keys() if key not in hot_group_map]
+    missing_off_keys = [key for key in on_group_map.keys() if key not in off_group_map]
+    if missing_hot_keys:
+        missing_str = '; '.join(_format_calibration_key(cal_key_cols, key) for key in missing_hot_keys[:8])
+        raise ValueError(
+            'Missing HOT reference rows for calibration group(s): ' + missing_str + '.'
+        )
+    if missing_off_keys:
+        missing_str = '; '.join(_format_calibration_key(cal_key_cols, key) for key in missing_off_keys[:8])
+        raise ValueError(
+            'Missing OFF reference rows for calibration group(s): ' + missing_str + '.'
+        )
+
+    for key, on_idx in on_group_map.items():
+        hot_idx = hot_group_map[key]
+        off_idx = off_group_map[key]
+
+        t_on_grp = t_on[on_idx]
+        on2_grp = on2_arr[on_idx]
+        t_cal_grp = t_cal_arr[on_idx]
+
+        t_hot_grp = t_hot_use[hot_idx]
+        hot2_grp = hot2_use[hot_idx]
+        mapping_hot_grp = mapping_hot_use.iloc[hot_idx].reset_index(drop=True)
+
+        t_off_grp = t_off_use[off_idx]
+        off2_grp = off2_use[off_idx]
+        mapping_off_grp = mapping_off_use.iloc[off_idx].reset_index(drop=True)
+
+        t_hot_avg, hot2_avg = _average_mode_by_scan(t_hot_grp, hot2_grp, mapping_hot_grp)
+        t_off_avg, off2_avg = _average_mode_by_scan(t_off_grp, off2_grp, mapping_off_grp)
+
+        off_on_interp = _interp_spectra_in_time(t_on_grp, t_off_avg, off2_avg)
+
+        if gain_mode_norm == "independent":
+            hot_on_interp = _interp_spectra_in_time(t_on_grp, t_hot_avg, hot2_avg)
+            denom = hot_on_interp.astype(calc_dt) - off_on_interp.astype(calc_dt)
+        else:
+            off_at_hot = _interp_spectra_in_time(t_hot_avg, t_off_avg, off2_avg)
+            denom_at_hot = hot2_avg.astype(calc_dt) - off_at_hot.astype(calc_dt)
+            denom = _interp_spectra_in_time(t_on_grp, t_hot_avg, denom_at_hot)
+
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gain = t_cal_grp[:, None].astype(calc_dt) / denom
+            ta_grp = (on2_grp.astype(calc_dt) - off_on_interp.astype(calc_dt)) * gain
+
+        ta_calc[on_idx] = ta_grp
         
     ta_calc[~np.isfinite(ta_calc)] = np.nan
     ta = ta_calc.astype(store_dt)
@@ -1027,6 +1137,7 @@ def run_tastar_calibration(
         't_surface_k': str(t_surface_k), 't_atm_model': t_atm_model,
         't_atm_delta_k': float(t_atm_delta_k), 't_atm_eta': float(t_atm_eta),
         'gain_mode': gain_mode, 'qc_sigma': str(qc_sigma), 'qc_apply_flagrow': bool(qc_apply_flagrow),
+        'calibration_group_cols': list(_resolve_existing_columns_ci(res.table, ['FDNUM', 'IFNUM', 'PLNUM'])),
         'qc_summary': qc_summary,
         'notes': 'Ta* calibration.',
         'ch_range': str(ch_range) if ch_range else "all",
