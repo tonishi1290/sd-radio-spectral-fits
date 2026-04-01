@@ -508,7 +508,8 @@ def _apply_scale_common(
 
     _scale_scantable_data_inplace(sc, idxs, row_factors)
     _ensure_intscale_column(df)
-    current = pd.to_numeric(df["INTSCALE"], errors="coerce").to_numpy(dtype=float)
+    # pandas may return a read-only NumPy view here; take an explicit writable copy.
+    current = pd.to_numeric(df["INTSCALE"], errors="coerce").to_numpy(dtype=float, copy=True)
     bad = ~np.isfinite(current)
     if np.any(bad):
         current[bad] = 1.0

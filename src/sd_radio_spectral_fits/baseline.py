@@ -21,6 +21,14 @@ from .scantable_utils import _parse_row_selector, _df_to_native_endian
 
 from .restfreq import apply_restfreq_override
 from .axis import wcs_slice_channels
+from .qc_flagrow import (
+    ensure_flagrow_column,
+    flagrow_mask,
+    apply_flagrow,
+    robust_mad_scale,
+    choose_existing_group_cols,
+    diffmad_score,
+)
 
 # =========================================================
 # 0. Data Structures
@@ -523,6 +531,9 @@ def run_baseline_fit(
     # Standard policy: VELOSYS is the canonical unapplied velocity column [m/s].
     v_corr_col: str = "VELOSYS",
     rest_freq: Optional[float] = None,
+    qc_sigma: Optional[float] = None,
+    qc_abs_peak_k: Optional[float] = None,
+    qc_apply_flagrow: bool = False,
     apply: bool = True,
     bsl_overwrite: str = "replace",
     on_fail: str = "exit",
@@ -557,6 +568,7 @@ def run_baseline_fit(
     
     # [ADDED] Ensure table is native endian immediately to prevent iloc issues
     table = _df_to_native_endian(table)
+    table = ensure_flagrow_column(table)
 
     # [ADDED] REST frequency override (rest1->rest2) for velocity interpretation
     if rest_freq is not None:
@@ -606,6 +618,17 @@ def run_baseline_fit(
         else:
             data_source = data_source[:n_rows]
 
+    input_flag_bad = flagrow_mask(table)
+    dropped_input_flagrow = int(np.count_nonzero(input_flag_bad))
+    if dropped_input_flagrow > 0:
+        keep0 = ~input_flag_bad
+        table = table.iloc[keep0].reset_index(drop=True)
+        if isinstance(data_source, list):
+            data_source = [d for d, k in zip(data_source, keep0) if k]
+        else:
+            data_source = data_source[keep0]
+    n_rows = len(table)
+
     # ---------------------------------------------------------------------
     # Temperature scale policy (New 2026: Non-destructive)
     # - Just ensure TEMPSCAL/BEAMEFF columns exist for downstream consistency.
@@ -651,6 +674,9 @@ def run_baseline_fit(
     done_list = []
     sliced_flags = []
     keep_mask = [] # For skipping rows if policy=skip
+    qc_gross_scores = []
+    qc_abs_peaks_k = []
+    qc_window_sources = []
 
     for i in range(n_rows):
         spec = get_spec(i)
@@ -707,6 +733,33 @@ def run_baseline_fit(
             if not np.all(np.isfinite(x_axis)):
                 raise ValueError("Generated spectral axis contains non-finite values.")
 
+            qc_score_i = np.nan
+            qc_window_source_i = "none"
+            if line_windows_req:
+                qc_windows = subtract_windows(base_windows_req, line_windows_req)
+                qc_window_source_i = "baseline_minus_line"
+            else:
+                qc_windows = list(base_windows_req)
+                qc_window_source_i = "baseline"
+
+            if qc_windows is None:
+                qc_window_mask = np.isfinite(spec)
+                qc_window_source_i = "all_finite"
+            elif len(qc_windows) == 0:
+                # Safe behavior: if the requested QC windows become empty after subtraction,
+                # do not silently fall back to the whole band.
+                qc_window_mask = np.zeros_like(spec, dtype=bool)
+                qc_window_source_i = "empty"
+            else:
+                qc_window_mask = np.isfinite(spec) & in_any_windows(x_axis, qc_windows)
+            qc_score_i = diffmad_score(spec, window_mask=qc_window_mask)
+            if np.any(qc_window_mask):
+                _vals = np.asarray(spec[qc_window_mask], dtype=float)
+                _med = float(np.median(_vals))
+                qc_abs_peak_i = float(np.max(np.abs(_vals - _med)))
+            else:
+                qc_abs_peak_i = np.nan
+
             # Fit
             coeffs, baseline, info = fit_polynomial_baseline(
                 x_axis, spec, 
@@ -729,6 +782,9 @@ def run_baseline_fit(
             done_list.append(True)
             sliced_flags.append(did_apply_channel_slice)
             keep_mask.append(True)
+            qc_gross_scores.append(qc_score_i)
+            qc_abs_peaks_k.append(qc_abs_peak_i)
+            qc_window_sources.append(qc_window_source_i)
 
         except Exception as e:
             if policy.mode == "exit":
@@ -745,6 +801,9 @@ def run_baseline_fit(
                 nused_list.append(0)
                 done_list.append(False)
                 sliced_flags.append(did_apply_channel_slice)
+                qc_gross_scores.append(np.nan)
+                qc_abs_peaks_k.append(np.nan)
+                qc_window_sources.append("error")
                 if policy.mode == "warn":
                     print(f"Warning: Baseline fit failed row {i}, kept original.")
 
@@ -759,6 +818,9 @@ def run_baseline_fit(
             nused_list = [u for u, k in zip(nused_list, keep_bool) if k]
             done_list = [d for d, k in zip(done_list, keep_bool) if k]
             sliced_flags = [f for f, k in zip(sliced_flags, keep_bool) if k]
+            qc_gross_scores = [q for q, k in zip(qc_gross_scores, keep_bool) if k]
+            qc_abs_peaks_k = [q for q, k in zip(qc_abs_peaks_k, keep_bool) if k]
+            qc_window_sources = [q for q, k in zip(qc_window_sources, keep_bool) if k]
             n_rows = len(table)
 
     # 5. Reconstruct Scantable Data
@@ -780,6 +842,78 @@ def run_baseline_fit(
 
     # 6. Update WCS for channel-sliced output (if any)
     table, meta = _update_wcs_after_channel_slice(table, meta, new_data_list, ch_start, ch_stop, sliced_flags)
+
+    # 7. OTF-style gross QC screening (lightweight; no second baseline fit)
+    existing_bad = flagrow_mask(table)
+    auto_bad = np.zeros(len(table), dtype=bool)
+    auto_bad_diff = np.zeros(len(table), dtype=bool)
+    auto_bad_abs = np.zeros(len(table), dtype=bool)
+    qc_gross_scores_arr = np.asarray(qc_gross_scores, dtype=float)
+    qc_abs_peaks_arr = np.asarray(qc_abs_peaks_k, dtype=float)
+    qc_auto_bad_count = 0
+    qc_auto_bad_diff_count = 0
+    qc_auto_bad_abs_count = 0
+    qc_applied_bad_count = 0
+    qc_enabled = (qc_sigma is not None) or (qc_abs_peak_k is not None)
+    if qc_enabled and len(table) > 0:
+        group_cols = choose_existing_group_cols(table, ["FDNUM", "IFNUM", "PLNUM", "BACKEND", "MOLECULE"])
+        if group_cols:
+            work = table.loc[:, group_cols].copy()
+            for col in work.columns:
+                if pd.api.types.is_numeric_dtype(work[col]):
+                    work[col] = pd.to_numeric(work[col], errors="coerce").fillna(-999999)
+                else:
+                    work[col] = work[col].astype(str).fillna("")
+            grouped = work.groupby(list(work.columns), sort=False, dropna=False).indices
+            groups = [np.asarray(idxs, dtype=int) for idxs in grouped.values()]
+        else:
+            groups = [np.arange(len(table), dtype=int)]
+        if qc_sigma is not None:
+            for idxs in groups:
+                cand = idxs[~existing_bad[idxs]]
+                vals = qc_gross_scores_arr[cand]
+                finite = np.isfinite(vals)
+                if np.count_nonzero(finite) < 4:
+                    continue
+                med = float(np.median(vals[finite]))
+                scl = robust_mad_scale(vals[finite])
+                if not np.isfinite(scl) or scl <= 0:
+                    continue
+                auto_bad_diff[cand] = np.isfinite(vals) & (vals > med + float(qc_sigma) * scl)
+        if qc_abs_peak_k is not None:
+            thresh = float(qc_abs_peak_k)
+            if thresh < 0:
+                raise ValueError("qc_abs_peak_k must be >= 0.")
+            auto_bad_abs = np.isfinite(qc_abs_peaks_arr) & (qc_abs_peaks_arr > thresh) & (~existing_bad)
+        auto_bad = auto_bad_diff | auto_bad_abs
+    qc_auto_bad_count = int(np.count_nonzero(auto_bad))
+    qc_auto_bad_diff_count = int(np.count_nonzero(auto_bad_diff))
+    qc_auto_bad_abs_count = int(np.count_nonzero(auto_bad_abs))
+    if qc_enabled:
+        table["OTF_GROSS_QC_SCORE"] = qc_gross_scores_arr
+        table["OTF_GROSS_QC_ABSPEAK_K"] = qc_abs_peaks_arr
+        if len(qc_window_sources) == len(table):
+            table["OTF_QC_WINDOW_SOURCE"] = np.asarray(qc_window_sources, dtype=object)
+    if qc_apply_flagrow and np.any(auto_bad):
+        table = apply_flagrow(table, auto_bad, code=1)
+        qc_applied_bad_count = int(np.count_nonzero(auto_bad))
+
+    final_bad = flagrow_mask(table)
+    dropped_flagrow = int(np.count_nonzero(final_bad))
+    if dropped_flagrow > 0:
+        keep_bool = ~final_bad
+        table = table.iloc[keep_bool].reset_index(drop=True)
+        if isinstance(final_data, list):
+            final_data = [d for d, k in zip(final_data, keep_bool) if k]
+        else:
+            final_data = final_data[keep_bool]
+        coeffs_list = [c for c, k in zip(coeffs_list, keep_bool) if k]
+        rms_list = [r for r, k in zip(rms_list, keep_bool) if k]
+        nused_list = [u for u, k in zip(nused_list, keep_bool) if k]
+        done_list = [d for d, k in zip(done_list, keep_bool) if k]
+        qc_gross_scores_arr = qc_gross_scores_arr[keep_bool]
+        qc_abs_peaks_arr = qc_abs_peaks_arr[keep_bool]
+        qc_window_sources = [q for q, k in zip(qc_window_sources, keep_bool) if k]
 
     # 7. Update Table & History
     table = _drop_bsl_metadata_columns(table)
@@ -814,11 +948,25 @@ def run_baseline_fit(
             "ch_stop": None if ch_stop is None else int(ch_stop),
             "v_corr_col": str(v_corr_col),
             "rest_freq": None if rest_freq is None else float(rest_freq),
+            "qc_sigma": None if qc_sigma is None else float(qc_sigma),
+            "qc_abs_peak_k": None if qc_abs_peak_k is None else float(qc_abs_peak_k),
+            "qc_apply_flagrow": bool(qc_apply_flagrow),
             "apply": bool(apply),
             "bsl_overwrite": str(bsl_overwrite),
             "window_frame": "VLSR",
             "vcorr_source_policy": "row_only",
-        }
+        },
+        "qc_summary": {
+            "mode": "otf_gross_screening",
+            "intended_use": "Enable qc_sigma for OTF baseline runs; leave unset for non-OTF unless explicitly desired.",
+            "input_flagrow_bad": int(dropped_input_flagrow),
+            "auto_bad_would_flag": int(qc_auto_bad_count),
+            "auto_bad_diffmad_would_flag": int(qc_auto_bad_diff_count),
+            "auto_bad_abspeak_would_flag": int(qc_auto_bad_abs_count),
+            "auto_bad_applied": int(qc_applied_bad_count),
+            "dropped_flagrow": int(dropped_flagrow),
+            "qc_window_source_unique": sorted({str(x) for x in qc_window_sources}),
+        },
     }
     
     new_history = hist.copy()
@@ -827,6 +975,21 @@ def run_baseline_fit(
     
     if isinstance(new_history["baseline_history"], list):
         new_history["baseline_history"].append(history_entry)
+
+    if qc_enabled:
+        qc_window_unique = sorted({str(x) for x in qc_window_sources})
+        print(
+            "[BASELINE] OTF gross QC: "
+            f"auto_bad={int(qc_auto_bad_count)}, "
+            f"diffmad_bad={int(qc_auto_bad_diff_count)}, "
+            f"abspeak_bad={int(qc_auto_bad_abs_count)}, "
+            f"applied={int(qc_applied_bad_count)}, "
+            f"dropped_input_flagrow={int(dropped_input_flagrow)}, "
+            f"dropped_flagrow={int(dropped_flagrow)}, "
+            f"window_sources={qc_window_unique}, "
+            f"qc_abs_peak_k={None if qc_abs_peak_k is None else float(qc_abs_peak_k)}, "
+            f"apply_flagrow={bool(qc_apply_flagrow)}"
+        )
     
     res = Scantable(meta=meta, data=final_data, table=table, history=new_history)
 

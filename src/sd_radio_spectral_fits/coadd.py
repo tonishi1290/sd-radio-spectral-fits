@@ -16,11 +16,18 @@ from .baseline import fit_polynomial_baseline
 from .regrid_vlsrk import Standardizer, VGrid, make_vgrid
 from .doppler import compute_vcorr_series
 from .ranges import parse_windows
-from .utils import FailPolicy, subtract_windows
+from .utils import FailPolicy, subtract_windows, in_any_windows
 # [ADDED] Row selector and Endian utilities
 from .scantable_utils import _parse_row_selector, _df_to_native_endian, _resolve_table_timestamps
 
 from .restfreq import apply_restfreq_override
+from .qc_flagrow import (
+    ensure_flagrow_column,
+    flagrow_mask,
+    grouped_affine_shape_qc,
+    apply_flagrow,
+    abspeak_score,
+)
 
 from .tempscale import (
     normalize_tempscal,
@@ -915,6 +922,9 @@ def run_velocity_coadd(
     rms_bin: int = 1,
     weight_zero_policy: str = "error",
     coadd_qc: Optional[str] = None,
+    qc_sigma: Optional[float] = None,
+    qc_abs_peak_k: Optional[float] = None,
+    qc_apply_flagrow: bool = False,
     line_vwin: Union[str, List[str], None] = None,      # [MODIFIED]
     block_size: int = 0,
     max_dumps: int = 0,
@@ -1123,6 +1133,7 @@ def run_velocity_coadd(
     meta_ref = metas[0]
     table_all = ensure_tempscal_column(table_all, default=str(meta_ref.get('TEMPSCAL', 'TA*')))
     table_all = ensure_beameff_column(table_all, default=meta_ref.get('BEAMEFF', float('nan')))
+    table_all = ensure_flagrow_column(table_all)
     beameff_vec = beameff_array(table_all, meta_ref, len(table_all), default=float('nan'))
     tempscal_vec = tempscal_array(table_all, meta_ref, len(table_all), default=str(meta_ref.get('TEMPSCAL', 'TA*')))
     
@@ -1147,6 +1158,15 @@ def run_velocity_coadd(
         data_list = [data_list[i] for i in final_idxs]
         beameff_vec = beameff_vec[final_idxs]
         tempscal_vec = tempscal_vec[final_idxs]
+
+    input_flag_bad = flagrow_mask(table_all)
+    dropped_input_flagrow = int(np.count_nonzero(input_flag_bad))
+    if dropped_input_flagrow > 0:
+        keep = ~input_flag_bad
+        table_all = table_all.iloc[keep].reset_index(drop=True)
+        data_list = [d for d, k in zip(data_list, keep) if k]
+        beameff_vec = beameff_vec[keep]
+        tempscal_vec = tempscal_vec[keep]
 
     sc_all = Scantable(meta=meta_ref, data=data_list, table=table_all)
     
@@ -1242,6 +1262,19 @@ def run_velocity_coadd(
             pos_col = "_dummy_group"
 
     groups = _group_indices(table_all, group_mode, pos_col, pos_tol_arcsec)
+    scan_qc_qc_windows = list(baseline_windows_parsed) if baseline_windows_parsed else list(rms_windows_parsed)
+    scan_qc_window_source = "baseline" if baseline_windows_parsed else ("rms" if rms_windows_parsed else "none")
+    if line_windows_parsed and scan_qc_qc_windows:
+        scan_qc_qc_windows = subtract_windows(scan_qc_qc_windows, line_windows_parsed)
+        scan_qc_window_source = f"{scan_qc_window_source}_minus_line"
+    scan_qc_window_mask = None
+    if scan_qc_qc_windows:
+        scan_qc_window_mask = in_any_windows(np.asarray(v_tgt, dtype=float), scan_qc_qc_windows)
+    scan_qc_abspeak_total = 0
+    scan_qc_would_flag_total = 0
+    scan_qc_flagged_total = 0
+    scan_qc_group_used = 0
+
     
     # [ADDED] 重み付け方針の判定と標準出力
     weight_strategy = "Uniform (weight=1.0)"
@@ -1282,7 +1315,52 @@ def run_velocity_coadd(
                     f"Group {gid} mixes multiple SSYSOBS values {list(pd.unique(grp_vals))}; cannot assign a unique observed frame to one coadded row."
                 )
         specs_arr = full_matrix[idxs]
-        
+
+        group_flag_mask = np.zeros(len(idxs), dtype=bool)
+        obs_mode_group = ""
+        if "OBSMODE" in table_all.columns:
+            obs_vals = pd.Series(table_all.iloc[idxs]["OBSMODE"], dtype=object).dropna().astype(str).str.strip().str.upper()
+            uniq_obs = pd.unique(obs_vals[obs_vals != ""])
+            if len(uniq_obs) == 1:
+                obs_mode_group = str(uniq_obs[0])
+        if (group_mode == "scan") and ((qc_sigma is not None) or (qc_abs_peak_k is not None)) and (obs_mode_group in ("", "ON")):
+            auto_bad_shape = np.zeros(len(idxs), dtype=bool)
+            auto_scores_local = np.full(len(idxs), np.nan, dtype=float)
+            qc_group_used_local = False
+            if qc_sigma is not None:
+                auto_bad_shape, auto_scores_local = grouped_affine_shape_qc(
+                    table_all.iloc[idxs].reset_index(drop=True),
+                    np.asarray(specs_arr, dtype=float),
+                    qc_sigma=float(qc_sigma),
+                    candidate_mask=np.ones(len(idxs), dtype=bool),
+                    group_cols=None,
+                    min_group_size=3,
+                )
+                if np.any(np.isfinite(auto_scores_local)):
+                    qc_group_used_local = True
+            auto_bad_abs = np.zeros(len(idxs), dtype=bool)
+            if qc_abs_peak_k is not None and scan_qc_window_mask is not None and np.any(scan_qc_window_mask):
+                abs_scores = np.asarray([abspeak_score(row, window_mask=scan_qc_window_mask) for row in np.asarray(specs_arr, dtype=float)], dtype=float)
+                auto_bad_abs = np.isfinite(abs_scores) & (abs_scores > float(qc_abs_peak_k))
+                scan_qc_abspeak_total += int(np.count_nonzero(auto_bad_abs))
+                if np.any(np.isfinite(abs_scores)):
+                    qc_group_used_local = True
+            if qc_group_used_local:
+                scan_qc_group_used += 1
+            auto_bad_local = np.asarray(auto_bad_shape, dtype=bool) | np.asarray(auto_bad_abs, dtype=bool)
+            would_flag_local = int(np.count_nonzero(auto_bad_local))
+            scan_qc_would_flag_total += would_flag_local
+            if qc_apply_flagrow and would_flag_local > 0:
+                group_flag_mask = np.asarray(auto_bad_local, dtype=bool)
+                table_all.iloc[idxs[group_flag_mask], table_all.columns.get_loc("FLAGROW")] = 1
+                scan_qc_flagged_total += int(np.count_nonzero(group_flag_mask))
+                keep_local = ~group_flag_mask
+                idxs = idxs[keep_local]
+                specs_arr = specs_arr[keep_local]
+                if len(idxs) == 0:
+                    continue
+                rep = int(idxs[0])
+
         final_grp_rms = np.nan
         
         if use_qc:
@@ -1677,6 +1755,15 @@ def run_velocity_coadd(
         exclude_rows=str(exclude_rows),
         vcorr_chunk_sec=str(vcorr_chunk_sec),
         qc_config=qc_config if use_qc else None,
+        qc_sigma=None if qc_sigma is None else float(qc_sigma),
+        qc_abs_peak_k=None if qc_abs_peak_k is None else float(qc_abs_peak_k),
+        qc_apply_flagrow=bool(qc_apply_flagrow),
+        dropped_input_flagrow=int(dropped_input_flagrow),
+        scan_qc_would_flag_total=int(scan_qc_would_flag_total),
+        scan_qc_flagged_total=int(scan_qc_flagged_total),
+        scan_qc_group_used=int(scan_qc_group_used),
+        scan_qc_abspeak_total=int(scan_qc_abspeak_total),
+        scan_qc_window_source=str(scan_qc_window_source),
         # [MODIFIED] rmsの評価に使った次数とビニング幅も追加
         rms=dict(windows=rms_windows_parsed, poly=int(rms_poly), bin=int(rms_bin)),
         baseline=dict(windows=baseline_windows_parsed, poly=int(baseline_poly)),
@@ -1690,6 +1777,19 @@ def run_velocity_coadd(
         weight_zero_policy=str(weight_zero_policy),
     )
     
+    if ((qc_sigma is not None) or (qc_abs_peak_k is not None)) and verbose:
+        print(
+            f"[COADD] scan QC: would_flag={int(scan_qc_would_flag_total)}, "
+            f"applied={int(scan_qc_flagged_total)}, "
+            f"dropped_input_flagrow={int(dropped_input_flagrow)}, "
+            f"group_mode={group_mode}, "
+            f"scan_groups_used={int(scan_qc_group_used)}, "
+            f"abspeak_bad={int(scan_qc_abspeak_total)}, "
+            f"window_source={str(scan_qc_window_source)}, "
+            f"qc_abs_peak_k={None if qc_abs_peak_k is None else float(qc_abs_peak_k)}, "
+            f"apply_flagrow={bool(qc_apply_flagrow)}"
+        )
+
     if mixed_groups_auto:
         history = append_scale_history(history, {
             "stage": "coadd",

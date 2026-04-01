@@ -13,6 +13,13 @@ from .rawspec import load_rawspec_auto
 
 from .fitsio import Scantable, write_scantable
 from .scantable_utils import _parse_row_selector, _df_to_native_endian, _resolve_table_timestamps
+from .qc_flagrow import (
+    ensure_flagrow_column,
+    flagrow_mask,
+    apply_flagrow,
+    grouped_affine_shape_qc,
+    choose_existing_group_cols,
+)
 from .restfreq import apply_restfreq_override
 
 from .utils import validate_mapping_frame
@@ -390,6 +397,8 @@ def make_tastar_dumps(
     t_atm_delta_k: float = 15.0,                  # offsetモデル使用時の差し引き温度差 [K]
     t_atm_eta: float = 0.95,                      # ratioモデル使用時の係数
     gain_mode: str = "hybrid",                    # "hybrid" (推奨) または "independent"
+    qc_sigma: Optional[float] = None,            # HOT/OFF shape QC threshold (report/apply)
+    qc_apply_flagrow: bool = False,              # Whether to reflect auto QC into FLAGROW
     verbose: bool = True,                         # ログ出力フラグ
     # -----------------------------------------------------
     
@@ -409,6 +418,7 @@ def make_tastar_dumps(
     off_arr = raw["off"]
     hot_arr = raw["hot"]
     mapping_all: pd.DataFrame = _df_to_native_endian(raw.get("mapping", pd.DataFrame()).copy())
+    mapping_all = ensure_flagrow_column(mapping_all)
 
     # gain_mode の正規化と厳格チェック（typoで黙って hybrid に落ちる事故を防ぐ）
     gain_mode_norm = str(gain_mode).strip().lower()
@@ -480,7 +490,7 @@ def make_tastar_dumps(
     if len(t_hot) == 0: raise ValueError("No HOT scans remaining.")
     if len(t_off) == 0: raise ValueError("No OFF scans remaining.")
 
-    mapping_on = mapping_all.loc[obsmode == "ON"].iloc[: len(t_on)].copy()
+    mapping_on = ensure_flagrow_column(mapping_all.loc[obsmode == "ON"].iloc[: len(t_on)].copy())
     mapping_on.index = t_on
 
     # Canonicalize coordinate columns when available.
@@ -713,12 +723,70 @@ def make_tastar_dumps(
     off2_arr = np.asarray(off_arr, dtype=store_dt)[:, ch_start:ch_stop]
     hot2_arr = np.asarray(hot_arr, dtype=store_dt)[:, ch_start:ch_stop]
 
+    # HOT/OFF FLAGROW + optional shape QC
+    mapping_hot = ensure_flagrow_column(mapping_all.loc[obsmode == "HOT"].iloc[: len(t_hot)].reset_index(drop=True))
+    mapping_off = ensure_flagrow_column(mapping_all.loc[obsmode == "OFF"].iloc[: len(t_off)].reset_index(drop=True))
+
+    ref_group_cols = choose_existing_group_cols(mapping_all, ["FDNUM", "IFNUM", "PLNUM", "BACKEND", "MOLECULE"])
+
+    hot_input_bad = flagrow_mask(mapping_hot)
+    off_input_bad = flagrow_mask(mapping_off)
+    hot_auto_bad = np.zeros(len(mapping_hot), dtype=bool)
+    off_auto_bad = np.zeros(len(mapping_off), dtype=bool)
+    hot_scores = np.full(len(mapping_hot), np.nan, dtype=float)
+    off_scores = np.full(len(mapping_off), np.nan, dtype=float)
+
+    if qc_sigma is not None and len(mapping_hot) > 0:
+        hot_auto_bad, hot_scores = grouped_affine_shape_qc(
+            mapping_hot,
+            hot2_arr.astype(float, copy=False),
+            qc_sigma=float(qc_sigma),
+            candidate_mask=(~hot_input_bad),
+            group_cols=ref_group_cols,
+            min_group_size=3,
+        )
+    if qc_sigma is not None and len(mapping_off) > 0:
+        off_auto_bad, off_scores = grouped_affine_shape_qc(
+            mapping_off,
+            off2_arr.astype(float, copy=False),
+            qc_sigma=float(qc_sigma),
+            candidate_mask=(~off_input_bad),
+            group_cols=ref_group_cols,
+            min_group_size=3,
+        )
+
+    if qc_sigma is not None:
+        mapping_hot["REF_QC_SCORE"] = hot_scores
+        mapping_off["REF_QC_SCORE"] = off_scores
+
+    if qc_apply_flagrow:
+        mapping_hot = apply_flagrow(mapping_hot, hot_auto_bad, code=1)
+        mapping_off = apply_flagrow(mapping_off, off_auto_bad, code=1)
+
+    hot_keep = ~flagrow_mask(mapping_hot)
+    off_keep = ~flagrow_mask(mapping_off)
+
+    if verbose and qc_sigma is not None:
+        print(
+            f"[CALIBRATE] HOT/OFF QC: hot_auto_bad={int(np.count_nonzero(hot_auto_bad))}, "
+            f"off_auto_bad={int(np.count_nonzero(off_auto_bad))}, apply_flagrow={bool(qc_apply_flagrow)}"
+        )
+
+    if not np.any(hot_keep):
+        raise ValueError("No HOT rows remain after applying existing FLAGROW / HOT QC.")
+    if not np.any(off_keep):
+        raise ValueError("No OFF rows remain after applying existing FLAGROW / OFF QC.")
+
+    t_hot_use = t_hot[hot_keep]
+    t_off_use = t_off[off_keep]
+    hot2_use = hot2_arr[hot_keep]
+    off2_use = off2_arr[off_keep]
+    mapping_hot_use = mapping_hot.loc[hot_keep].reset_index(drop=True)
+    mapping_off_use = mapping_off.loc[off_keep].reset_index(drop=True)
+
     # [NEW] HOTとOFFをスキャンごとに時間平均(積分)してS/Nを向上させる
-    mapping_hot = mapping_all.loc[obsmode == "HOT"].iloc[: len(t_hot)].reset_index(drop=True)
-    mapping_off = mapping_all.loc[obsmode == "OFF"].iloc[: len(t_off)].reset_index(drop=True)
-    
-    t_hot_avg, hot2_avg = _average_mode_by_scan(t_hot, hot2_arr, mapping_hot)
-    t_off_avg, off2_avg = _average_mode_by_scan(t_off, off2_arr, mapping_off)
+    t_hot_avg, hot2_avg = _average_mode_by_scan(t_hot_use, hot2_use, mapping_hot_use)
+    t_off_avg, off2_avg = _average_mode_by_scan(t_off_use, off2_use, mapping_off_use)
 
     # 分子（空の引き算）用: ON点時刻におけるOFFスペクトルの内挿
     off_on_interp = _interp_spectra_in_time(t_on, t_off_avg, off2_avg)
@@ -770,6 +838,19 @@ def make_tastar_dumps(
 
     meta2["TEMPSCAL"] = "TA*"
     table["TEMPSCAL"] = "TA*"
+    if qc_sigma is not None:
+        table["QC_REF_HOT_AUTO_BAD"] = int(np.count_nonzero(hot_auto_bad))
+        table["QC_REF_OFF_AUTO_BAD"] = int(np.count_nonzero(off_auto_bad))
+        table["QC_SIGMA"] = float(qc_sigma)
+        table["QC_APPLY_FLAGROW"] = bool(qc_apply_flagrow)
+        table.attrs["qc_summary"] = {
+            "hot_input_flagrow_bad": int(np.count_nonzero(hot_input_bad)),
+            "off_input_flagrow_bad": int(np.count_nonzero(off_input_bad)),
+            "hot_auto_bad_would_flag": int(np.count_nonzero(hot_auto_bad)),
+            "off_auto_bad_would_flag": int(np.count_nonzero(off_auto_bad)),
+            "hot_used_rows": int(np.count_nonzero(hot_keep)),
+            "off_used_rows": int(np.count_nonzero(off_keep)),
+        }
 
     if rest_freq is not None:
         apply_restfreq_override(meta2, table, float(rest_freq), require_wcs_for_vrad=True)
@@ -828,6 +909,8 @@ def tastar_from_rawspec(
     t_atm_delta_k: float = 15.0,
     t_atm_eta: float = 0.95,
     gain_mode: str = "hybrid",
+    qc_sigma: Optional[float] = None,
+    qc_apply_flagrow: bool = False,
     verbose: bool = True,
 ) -> Scantable:
     """Public helper used by CLI scripts."""
@@ -849,6 +932,8 @@ def tastar_from_rawspec(
         t_atm_delta_k=t_atm_delta_k,
         t_atm_eta=t_atm_eta,
         gain_mode=gain_mode,
+        qc_sigma=qc_sigma,
+        qc_apply_flagrow=qc_apply_flagrow,
         verbose=verbose,
     )
 
@@ -877,6 +962,8 @@ def run_tastar_calibration(
     t_atm_delta_k: float = 15.0,
     t_atm_eta: float = 0.95,
     gain_mode: str = "hybrid",
+    qc_sigma: Optional[float] = None,
+    qc_apply_flagrow: bool = False,
     verbose: bool = True,
 ) -> Scantable:
     """
@@ -920,6 +1007,8 @@ def run_tastar_calibration(
         t_atm_delta_k=t_atm_delta_k,
         t_atm_eta=t_atm_eta,
         gain_mode=gain_mode,
+        qc_sigma=qc_sigma,
+        qc_apply_flagrow=qc_apply_flagrow,
         verbose=verbose,
     )
 
@@ -927,12 +1016,18 @@ def run_tastar_calibration(
     # [FIX] 実際に適用された THOT を結果テーブルから取得して記録する
     actual_thot = float(res.table["THOT"].iloc[0])
     
+    qc_summary = dict(res.table.attrs.get("qc_summary", {}))
+    if qc_sigma is not None:
+        qc_summary.setdefault("hot_auto_bad_would_flag", int(res.table["QC_REF_HOT_AUTO_BAD"].iloc[0]) if "QC_REF_HOT_AUTO_BAD" in res.table.columns else 0)
+        qc_summary.setdefault("off_auto_bad_would_flag", int(res.table["QC_REF_OFF_AUTO_BAD"].iloc[0]) if "QC_REF_OFF_AUTO_BAD" in res.table.columns else 0)
+
     history = {
         'task': 'sdrsf-make-tastar', 'input': input_name,
         't_hot_k': actual_thot, 't_hot_k_input': str(t_hot_k), 'tau_zenith': str(tau_zenith),
         't_surface_k': str(t_surface_k), 't_atm_model': t_atm_model,
         't_atm_delta_k': float(t_atm_delta_k), 't_atm_eta': float(t_atm_eta),
-        'gain_mode': gain_mode,
+        'gain_mode': gain_mode, 'qc_sigma': str(qc_sigma), 'qc_apply_flagrow': bool(qc_apply_flagrow),
+        'qc_summary': qc_summary,
         'notes': 'Ta* calibration.',
         'ch_range': str(ch_range) if ch_range else "all",
         'vlsrk_range': str(vlsrk_range_kms) if vlsrk_range_kms else "none",

@@ -46,6 +46,7 @@ import heapq
 import os
 import pickle
 import tempfile
+import importlib.util
 from datetime import datetime
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -63,18 +64,100 @@ import necstdb
 
 from astropy.time import Time
 from astropy.coordinates import AltAz, SkyCoord
+import astropy.coordinates as coord
 from astropy import units as u
 
-try:
-    from .multibeam_beam_measurement.pure_rotation_model import (
-        rotate_el0_offset,
-        offset_xy_to_beam_azel,
+def _load_pure_rotation_helpers():
+    """
+    Load pure_rotation_model helpers without relying on parent package __init__.py.
+
+    The user hit a case where ``multibeam_beam_measurement/__init__.py`` imported a
+    missing module, which broke converter startup before pure_rotation_model.py could
+    even be reached. We therefore try three stages:
+      1) normal relative / absolute imports,
+      2) direct file loading by path (bypassing package __init__),
+      3) a converter-local fallback implementing the same geometry.
+    """
+    errors = []
+
+    for mode in ("relative", "absolute"):
+        try:
+            if mode == "relative":
+                from .multibeam_beam_measurement.pure_rotation_model import (  # type: ignore
+                    rotate_el0_offset,
+                    offset_xy_to_beam_azel,
+                )
+            else:
+                from tools.necst.multibeam_beam_measurement.pure_rotation_model import (  # type: ignore
+                    rotate_el0_offset,
+                    offset_xy_to_beam_azel,
+                )
+            return rotate_el0_offset, offset_xy_to_beam_azel
+        except Exception as e:
+            errors.append(f"{mode}_import: {e}")
+
+    here = pathlib.Path(__file__).resolve()
+    candidate_paths = [
+        here.parent / "multibeam_beam_measurement" / "pure_rotation_model.py",
+        here.parent / "tools" / "necst" / "multibeam_beam_measurement" / "pure_rotation_model.py",
+    ]
+    if len(here.parents) >= 3:
+        candidate_paths.append(here.parents[2] / "tools" / "necst" / "multibeam_beam_measurement" / "pure_rotation_model.py")
+
+    for path in candidate_paths:
+        try:
+            if not path.exists():
+                continue
+            spec = importlib.util.spec_from_file_location("_necst_pure_rotation_model", str(path))
+            if spec is None or spec.loader is None:
+                raise RuntimeError(f"cannot create module spec for {path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            rotate_el0_offset = getattr(mod, "rotate_el0_offset")
+            offset_xy_to_beam_azel = getattr(mod, "offset_xy_to_beam_azel")
+            return rotate_el0_offset, offset_xy_to_beam_azel
+        except Exception as e:
+            errors.append(f"direct_load({path}): {e}")
+
+    def rotate_el0_offset(dx_el0_arcsec, dy_el0_arcsec, el_deg, sign=1.0):
+        el = np.asarray(el_deg, dtype=float)
+        theta_deg = float(sign) * el
+        theta = np.deg2rad(theta_deg)
+        dx0 = float(dx_el0_arcsec)
+        dy0 = float(dy_el0_arcsec)
+        dx_rot = np.asarray(dx0 * np.cos(theta) - dy0 * np.sin(theta), dtype=float)
+        dy_rot = np.asarray(dx0 * np.sin(theta) + dy0 * np.cos(theta), dtype=float)
+        return dx_rot, dy_rot, np.asarray(theta_deg, dtype=float)
+
+    def offset_xy_to_beam_azel(boresight_az_deg, boresight_el_deg, dx_arcsec, dy_arcsec):
+        az = np.asarray(boresight_az_deg, dtype=float)
+        el = np.asarray(boresight_el_deg, dtype=float)
+        dx = np.asarray(dx_arcsec, dtype=float)
+        dy = np.asarray(dy_arcsec, dtype=float)
+        if az.shape != el.shape:
+            raise ValueError(f"Az/El shape mismatch: {az.shape} vs {el.shape}")
+        if dx.shape == ():
+            dx = np.full_like(el, float(dx), dtype=float)
+        if dy.shape == ():
+            dy = np.full_like(el, float(dy), dtype=float)
+        cos_el = np.cos(np.deg2rad(el))
+        tiny = np.cos(np.deg2rad(89.9))
+        safe = np.abs(cos_el) >= tiny
+        d_az_deg = np.full_like(el, np.nan, dtype=float)
+        d_az_deg[safe] = dx[safe] / (3600.0 * cos_el[safe])
+        d_el_deg = dy / 3600.0
+        beam_az = (az + d_az_deg) % 360.0
+        beam_el = el + d_el_deg
+        return beam_az, beam_el
+
+    sys.stderr.write(
+        "[warn] pure_rotation_model import failed; using converter-local fallback.\n"
+        + "[warn] details: " + " | ".join(errors) + "\n"
     )
-except ImportError:
-    from tools.necst.multibeam_beam_measurement.pure_rotation_model import (
-        rotate_el0_offset,
-        offset_xy_to_beam_azel,
-    )
+    return rotate_el0_offset, offset_xy_to_beam_azel
+
+
+rotate_el0_offset, offset_xy_to_beam_azel = _load_pure_rotation_helpers()
 
 from sd_radio_spectral_fits import (
     SDRadioSpectralSDFITSWriter,
@@ -166,17 +249,8 @@ def _timestamp_texts_to_unix(values, suffix):
 
 def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("time", "t", "unix_time", "unixtime")):
     names = list(arr.dtype.names or [])
-    timestamp_field = None
-    for k in ("timestamp", "time_spectrometer"):
-        if k in names:
-            timestamp_field = k
-            break
-
-    fallback_field = None
-    for k in numeric_fallback_candidates:
-        if k in names:
-            fallback_field = k
-            break
+    timestamp_field = _pick_field_name(names, None, ["timestamp", "time_spectrometer"])
+    fallback_field = _pick_field_name(names, None, list(numeric_fallback_candidates))
 
     time_meta = {
         "applied": None,
@@ -405,11 +479,7 @@ def _extract_spectral_from_structured(arr, nchan, channel_slice_bounds=None):
       full-NCHAN の 2D 配列を作らないようにする
     """
     names = list(arr.dtype.names or [])
-    s_field = None
-    for k in ("data", "spectrum", "spec"):
-        if k in names:
-            s_field = k
-            break
+    s_field = _pick_field_name(names, None, ["data", "spectrum", "spec"])
     if s_field is None:
         raise RuntimeError("no spectrum-like field in spectral table. available={}".format(names))
 
@@ -1466,7 +1536,8 @@ def _parse_channel_slice_spec(value, nchan_full):
     label = None
     if isinstance(value, str):
         s = value.strip()
-        m = re.fullmatch(r'([\[(])\s*([-+]?\d+)\s*,\s*([-+]?\d+)\s*([\])])', s)
+        _float_re = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?'
+        m = re.fullmatch(rf'([\[(])\s*({_float_re})\s*,\s*({_float_re})\s*([\])])', s)
         if not m:
             raise ValueError(
                 "channel_slice string must look like '[chmin,chmax]', '[chmin,chmax)', '(chmin,chmax]' or '(chmin,chmax)'"
@@ -1500,6 +1571,151 @@ def _parse_channel_slice_spec(value, nchan_full):
     return (int(start), int(stop)), label
 
 
+def _parse_vlsrk_kms_slice_spec(value):
+    if value is None:
+        return None
+
+    def _to_endpoint(x, name):
+        if isinstance(x, bool):
+            raise ValueError(f"vlsrk_kms_slice {name} must be a finite float, got boolean {x!r}")
+        try:
+            out = float(x)
+        except Exception as e:
+            raise ValueError(f"vlsrk_kms_slice {name} must be a finite float, got {x!r}") from e
+        if not np.isfinite(out):
+            raise ValueError(f"vlsrk_kms_slice {name} must be finite, got {x!r}")
+        return out
+
+    if isinstance(value, str):
+        s = value.strip()
+        _float_re = r'[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?'
+        m = re.fullmatch(rf'([\[(])\s*({_float_re})\s*,\s*({_float_re})\s*([\])])', s)
+        if not m:
+            raise ValueError(
+                "vlsrk_kms_slice string must look like '[vmin,vmax]', '[vmin,vmax)', '(vmin,vmax]' or '(vmin,vmax)'"
+            )
+        left, a_s, b_s, right = m.groups()
+        a = _to_endpoint(a_s, 'start')
+        b = _to_endpoint(b_s, 'end')
+        label = f"{left}{a_s},{b_s}{right}"
+        if a <= b:
+            low = a
+            high = b
+            low_inclusive = (left == '[')
+            high_inclusive = (right == ']')
+        else:
+            low = b
+            high = a
+            low_inclusive = (right == ']')
+            high_inclusive = (left == '[')
+    elif isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise ValueError(f"vlsrk_kms_slice sequence must have length 2, got {value!r}")
+        a = _to_endpoint(value[0], 'start')
+        b = _to_endpoint(value[1], 'end')
+        low = min(a, b)
+        high = max(a, b)
+        low_inclusive = True
+        high_inclusive = True
+        label = f"[{value[0]},{value[1]}]"
+    else:
+        raise ValueError(f"unsupported vlsrk_kms_slice value type: {type(value).__name__}")
+
+    if (low == high) and (not (low_inclusive and high_inclusive)):
+        raise ValueError("vlsrk_kms_slice selects no velocity range after normalization")
+
+    return {
+        'label': label,
+        'low_kms': float(low),
+        'high_kms': float(high),
+        'low_inclusive': bool(low_inclusive),
+        'high_inclusive': bool(high_inclusive),
+    }
+
+
+def _mask_from_vlsrk_bounds(v_lsrk_kms, spec):
+    v = np.asarray(v_lsrk_kms, dtype=float)
+    lo = float(spec['low_kms'])
+    hi = float(spec['high_kms'])
+    if spec['low_inclusive']:
+        m_lo = (v >= lo)
+    else:
+        m_lo = (v > lo)
+    if spec['high_inclusive']:
+        m_hi = (v <= hi)
+    else:
+        m_hi = (v < hi)
+    return np.isfinite(v) & m_lo & m_hi
+
+
+def _relativistic_doppler_factor(v_kms):
+    c_kms = 299792.458
+    beta = np.asarray(v_kms, dtype=float) / c_kms
+    if np.any(np.abs(beta) >= 1.0):
+        raise ValueError(f"velocity exceeds speed of light: {v_kms!r}")
+    return np.sqrt((1.0 + beta) / (1.0 - beta))
+
+
+def _calc_vlsrk_correction_kms_for_site(site, ra_deg, dec_deg, unixtime):
+    loc = site.to_earthlocation()
+    tobs = Time(float(unixtime), format='unix', scale='utc')
+    target = SkyCoord(float(ra_deg) * u.deg, float(dec_deg) * u.deg, frame='icrs', obstime=tobs, location=loc)
+    vobs = SkyCoord(loc.get_gcrs(tobs)).transform_to(coord.LSRK()).velocity
+    ra_rad = target.icrs.ra.to_value(u.rad)
+    dec_rad = target.icrs.dec.to_value(u.rad)
+    v_proj = (
+        vobs.d_x.to_value(u.km / u.s) * np.cos(dec_rad) * np.cos(ra_rad)
+        + vobs.d_y.to_value(u.km / u.s) * np.cos(dec_rad) * np.sin(ra_rad)
+        + vobs.d_z.to_value(u.km / u.s) * np.sin(dec_rad)
+    )
+    return float(v_proj)
+
+
+def _channel_slice_bounds_from_vlsrk_kms_slice(sw, vlsrk_kms_slice_spec, v_corr_kms):
+    if vlsrk_kms_slice_spec is None:
+        return None, None
+    rest_hz = float(getattr(sw, 'restfreq_hz', np.nan))
+    if (not np.isfinite(rest_hz)) or (rest_hz <= 0.0):
+        raise ValueError(
+            "vlsrk_kms_slice requires a positive restfreq_hz in the selected stream WCS"
+        )
+    if str(getattr(sw, 'ctype1', 'FREQ')).strip().upper() != 'FREQ':
+        raise ValueError("vlsrk_kms_slice currently supports only CTYPE1='FREQ'")
+
+    freq_axis_hz = np.asarray(_channel_centers_from_wcs(sw), dtype=np.float64)
+    specsys = str(getattr(sw, 'specsys', 'TOPOCENT')).strip().upper()
+    if specsys == 'TOPOCENT':
+        k_corr = _relativistic_doppler_factor(float(v_corr_kms))
+        freq_lsrk_hz = freq_axis_hz / k_corr
+    elif specsys == 'LSRK':
+        freq_lsrk_hz = freq_axis_hz
+    else:
+        raise ValueError(f"vlsrk_kms_slice currently supports only TOPOCENT/LSRK, got {specsys!r}")
+
+    c_kms = 299792.458
+    v_lsrk_radio_kms = c_kms * (1.0 - (freq_lsrk_hz / rest_hz))
+    mask = _mask_from_vlsrk_bounds(v_lsrk_radio_kms, vlsrk_kms_slice_spec)
+    idx = np.flatnonzero(mask)
+    if idx.size == 0:
+        finite = np.isfinite(v_lsrk_radio_kms)
+        if np.any(finite):
+            vmin_axis = float(np.nanmin(v_lsrk_radio_kms[finite]))
+            vmax_axis = float(np.nanmax(v_lsrk_radio_kms[finite]))
+            raise ValueError(
+                "vlsrk_kms_slice {} selects no channels; stream velocity coverage is [{:.6f}, {:.6f}] km/s".format(
+                    vlsrk_kms_slice_spec['label'], vmin_axis, vmax_axis
+                )
+            )
+        raise ValueError(
+            "vlsrk_kms_slice {} selects no channels because the computed velocity axis is not finite".format(
+                vlsrk_kms_slice_spec['label']
+            )
+        )
+    start = int(idx[0])
+    stop = int(idx[-1]) + 1
+    return (start, stop), vlsrk_kms_slice_spec['label']
+
+
 def _slice_stream_wcs(sw, channel_slice_bounds):
     if channel_slice_bounds is None:
         return sw
@@ -1523,6 +1739,16 @@ def _slice_stream_wcs(sw, channel_slice_bounds):
         cdelt1_hz=float(sw.cdelt1_hz),
         crpix1=1.0,
     )
+
+
+def _config_channel_slice_sources(streams, global_cfg):
+    sources = []
+    if (global_cfg is not None) and (global_cfg.get("channel_slice", None) is not None):
+        sources.append("global.channel_slice")
+    for stream in streams:
+        if getattr(stream, "channel_slice_spec", None) is not None:
+            sources.append(f"stream '{stream.name}'.channel_slice")
+    return sources
 
 
 def apply_channel_slice_config(streams, global_cfg, cli_channel_slice=None):
@@ -1633,8 +1859,61 @@ def _apply_lo_chain_to_sky(baseband_centers_hz, lo_cfg):
     return out
 
 
+def _extract_restfreq_hz_from_frequency_axis(freq_cfg, *, context="frequency_axis"):
+    if freq_cfg is None:
+        return np.nan
+
+    hz_raw = freq_cfg.get("restfreq_hz", None)
+    ghz_raw = freq_cfg.get("restfreq_ghz", None)
+
+    if hz_raw is None:
+        hz = np.nan
+    else:
+        try:
+            hz = float(hz_raw)
+        except Exception as e:
+            raise ValueError(f"{context}.restfreq_hz must be a positive finite scalar, got {hz_raw!r}") from e
+    if ghz_raw is None:
+        ghz = np.nan
+    else:
+        try:
+            ghz = float(ghz_raw)
+        except Exception as e:
+            raise ValueError(f"{context}.restfreq_ghz must be a positive finite scalar, got {ghz_raw!r}") from e
+    hz_from_ghz = ghz * 1.0e9 if np.isfinite(ghz) else np.nan
+
+    if hz_raw is not None and ((not np.isfinite(hz)) or (hz <= 0.0)):
+        raise ValueError(f"{context}.restfreq_hz must be positive and finite, got {hz_raw!r}")
+    if ghz_raw is not None and ((not np.isfinite(ghz)) or (ghz <= 0.0)):
+        raise ValueError(f"{context}.restfreq_ghz must be positive and finite, got {ghz_raw!r}")
+
+    if (hz_raw is not None) and (ghz_raw is not None):
+        if not np.isclose(hz, hz_from_ghz, rtol=1.0e-12, atol=max(1.0e-6, abs(hz) * 1.0e-12)):
+            raise ValueError(
+                f"{context} has inconsistent restfreq_hz={hz_raw!r} and restfreq_ghz={ghz_raw!r}"
+            )
+        return float(hz)
+
+    if hz_raw is not None:
+        return float(hz)
+    if ghz_raw is not None:
+        return float(hz_from_ghz)
+    return np.nan
+
+
+def _canonicalize_frequency_axis_restfreq(freq_cfg, *, context="frequency_axis"):
+    out = dict(freq_cfg or {})
+    restfreq_hz = _extract_restfreq_hz_from_frequency_axis(out, context=context)
+    out.pop("restfreq_ghz", None)
+    if np.isfinite(restfreq_hz):
+        out["restfreq_hz"] = float(restfreq_hz)
+    else:
+        out.pop("restfreq_hz", None)
+    return out
+
+
 def derive_stream_wcs(stream):
-    freq_cfg = dict(stream.frequency_axis or {})
+    freq_cfg = _canonicalize_frequency_axis_restfreq(stream.frequency_axis or {}, context=f"stream '{stream.name}' frequency_axis")
     lo_cfg = dict(stream.local_oscillators or {})
     nchan = int(freq_cfg.get("nchan", 0))
     if nchan <= 0:
@@ -1807,7 +2086,10 @@ def _normalize_stream_block(block, stream_index):
             beam_model_version=beam_model_version,
         )
 
-    frequency_axis = dict(block.get("frequency_axis", {}) or {})
+    frequency_axis = _canonicalize_frequency_axis_restfreq(
+        dict(block.get("frequency_axis", {}) or {}),
+        context="spectrometers[{}].frequency_axis".format(stream_index),
+    )
     local_oscillators = dict(block.get("local_oscillators", {}) or {})
     override = dict(block.get("override", {}) or {})
     channel_slice_spec = block.get("channel_slice", None)
@@ -1875,6 +2157,20 @@ def load_spectrometer_config(config_path):
     }
 
 
+def apply_restfreq_ghz_override(streams, restfreq_ghz):
+    if restfreq_ghz is None:
+        return
+    restfreq_hz = float(restfreq_ghz) * 1.0e9
+    if (not np.isfinite(restfreq_hz)) or (restfreq_hz <= 0.0):
+        raise ValueError(f"--restfreq-ghz must be positive and finite, got {restfreq_ghz!r}")
+    for stream in streams:
+        stream.frequency_axis = dict(stream.frequency_axis or {})
+        stream.frequency_axis.pop('restfreq_ghz', None)
+        stream.frequency_axis['restfreq_hz'] = float(restfreq_hz)
+        stream.wcs_full = derive_stream_wcs(stream)
+        stream.wcs = stream.wcs_full
+
+
 def build_legacy_single_stream_config(args):
     beam = BeamConfig(
         beam_id="B{:02d}".format(0),
@@ -1898,7 +2194,7 @@ def build_legacy_single_stream_config(args):
             "first_channel_center_hz": float(args.if0_ghz) * 1e9,
             "channel_spacing_hz": ((float(args.if1_ghz) - float(args.if0_ghz)) * 1e9) / max(int(args.nchan) - 1, 1),
             "crpix1": 1.0,
-            "restfreq_hz": float(args.restfreq_hz),
+            "restfreq_hz": float(115.271 if args.restfreq_ghz is None else args.restfreq_ghz) * 1.0e9,
             "ctype1": "FREQ",
             "cunit1": "Hz",
             "specsys": "TOPOCENT",
@@ -1951,13 +2247,113 @@ def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
     )
 
 
-def extract_spectral_stream(common, db_namespace, telescope, stream):
+
+def _resolve_spec_table_name(db_namespace, telescope, stream):
     if _is_meaningful_str(stream.db_table_name):
-        spec_table_name = str(stream.db_table_name)
+        return str(stream.db_table_name)
+    spec_stream_name = _nonempty_str(stream.db_stream_name, default=stream.name)
+    return _table_name(db_namespace, telescope, "data", "spectral", spec_stream_name)
+
+
+def _extract_pos_labels_from_structured(arr_spec, nrow):
+    names = list(arr_spec.dtype.names or [])
+    pos_field = _pick_field_name(names, None, ["position", "obsmode", "obs_mode", "obsMode", "mode", "state", "status", "label"])
+    if pos_field is not None:
+        pos_str = np.array([_decode_label(v) for v in np.asarray(arr_spec[pos_field], dtype=object)], dtype=object)
     else:
-        spec_stream_name = _nonempty_str(stream.db_stream_name, default=stream.name)
-        spec_table_name = _table_name(db_namespace, telescope, "data", "spectral", spec_stream_name)
+        pos_str = np.array(["UNKNOWN"] * int(nrow), dtype=object)
+    if np.all([str(x).strip() == "" for x in pos_str]):
+        pos_str = np.array(["UNKNOWN"] * int(nrow), dtype=object)
+    else:
+        pos_str = np.array([("UNKNOWN" if str(x).strip() == "" else str(x).strip().upper()) for x in pos_str], dtype=object)
+    return pos_str, pos_field
+
+
+def _compute_stream_vlsrk_channel_slice(common, site, db_namespace, telescope, stream, vlsrk_kms_slice_spec, interp_extrap, encoder_time_col, altaz_time_col, encoder_shift_sec, azel_correction_apply):
+    spec_table_name = _resolve_spec_table_name(db_namespace, telescope, stream)
     arr_spec = _read_structured_array_tolerant(common.db, spec_table_name)
+    t_spec_unsorted, time_meta = _select_spectral_time_from_structured(arr_spec)
+    pos_str_unsorted, _ = _extract_pos_labels_from_structured(arr_spec, len(t_spec_unsorted))
+    order = np.argsort(t_spec_unsorted)
+    t_spec = np.asarray(t_spec_unsorted[order], dtype=float)
+    pos_str = np.asarray(pos_str_unsorted[order], dtype=object)
+
+    on_idx = np.flatnonzero((pos_str == "ON") & np.isfinite(t_spec))
+    if on_idx.size > 0:
+        iref = int(on_idx[0])
+        ref_mode = "ON"
+    else:
+        finite_idx = np.flatnonzero(np.isfinite(t_spec))
+        if finite_idx.size == 0:
+            raise RuntimeError(
+                "cannot determine a reference spectral row for vlsrk_kms_slice in stream '{}': spectral time is not finite".format(stream.name)
+            )
+        iref = int(finite_idx[0])
+        ref_mode = "FIRST_FINITE"
+        print(
+            "[warn] stream='{}' has no ON sample in spectral labels; using first finite sample for vlsrk_kms_slice (basis={})".format(
+                stream.name, time_meta.get("applied")
+            )
+        )
+
+    tref = float(t_spec[iref])
+    pointing = normalize_pointing(
+        np.asarray([tref], dtype=float),
+        common.arr_enc,
+        common.arr_alt,
+        str(encoder_time_col),
+        str(altaz_time_col),
+        str(interp_extrap),
+        float(encoder_shift_sec),
+        str(azel_correction_apply),
+    )
+    beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
+    beam_az_deg = float(np.asarray(beam_applied["beam_az_deg"], dtype=float)[0])
+    beam_el_deg = float(np.asarray(beam_applied["beam_el_deg"], dtype=float)[0])
+    if (not np.isfinite(beam_az_deg)) or (not np.isfinite(beam_el_deg)):
+        raise RuntimeError(
+            "cannot determine a finite beam Az/El for vlsrk_kms_slice in stream '{}': beam_az_deg={!r}, beam_el_deg={!r}".format(
+                stream.name, beam_az_deg, beam_el_deg
+            )
+        )
+    ra_deg, dec_deg = _radec_from_azel(
+        site,
+        np.asarray([tref], dtype=float),
+        np.asarray([beam_az_deg], dtype=float),
+        np.asarray([beam_el_deg], dtype=float),
+        apply_refraction=False,
+    )
+    ra_ref_deg = float(np.asarray(ra_deg, dtype=float)[0])
+    dec_ref_deg = float(np.asarray(dec_deg, dtype=float)[0])
+    if (not np.isfinite(ra_ref_deg)) or (not np.isfinite(dec_ref_deg)):
+        raise RuntimeError(
+            "cannot determine a finite reference RA/DEC for vlsrk_kms_slice in stream '{}': ra_deg={!r}, dec_deg={!r}".format(
+                stream.name, ra_ref_deg, dec_ref_deg
+            )
+        )
+    v_corr_kms = _calc_vlsrk_correction_kms_for_site(site, ra_ref_deg, dec_ref_deg, tref)
+    bounds, label = _channel_slice_bounds_from_vlsrk_kms_slice(stream.wcs_full, vlsrk_kms_slice_spec, v_corr_kms)
+    info = {
+        "stream": str(stream.name),
+        "spec_table_name": str(spec_table_name),
+        "reference_mode": str(ref_mode),
+        "reference_time_unix": float(tref),
+        "reference_ra_deg": float(ra_ref_deg),
+        "reference_dec_deg": float(dec_ref_deg),
+        "reference_beam_az_deg": float(beam_az_deg),
+        "reference_beam_el_deg": float(beam_el_deg),
+        "v_corr_kms": float(v_corr_kms),
+        "label": str(label),
+        "bounds": tuple(bounds),
+        "time_basis": str(time_meta.get("applied")),
+    }
+    return arr_spec, bounds, label, info
+
+
+def extract_spectral_stream(common, db_namespace, telescope, stream, arr_spec=None):
+    spec_table_name = _resolve_spec_table_name(db_namespace, telescope, stream)
+    if arr_spec is None:
+        arr_spec = _read_structured_array_tolerant(common.db, spec_table_name)
     raw_nchan = int(stream.wcs_full.nchan if stream.wcs_full is not None else stream.wcs.nchan)
     t_spec, spec2d, time_meta, s_field = _extract_spectral_from_structured(
         arr_spec, nchan=raw_nchan, channel_slice_bounds=stream.channel_slice_bounds
@@ -1970,25 +2366,13 @@ def extract_spectral_stream(common, db_namespace, telescope, stream):
         )
 
     names = list(arr_spec.dtype.names or [])
-    pos_field = None
-    for cand in ("position", "obsmode", "obs_mode", "obsMode", "mode", "state", "status", "label"):
-        if cand in names:
-            pos_field = cand
-            break
 
     if "id" in names:
         id_str = np.array([_decode_label(v) for v in np.asarray(arr_spec["id"], dtype=object)], dtype=object)
     else:
         id_str = np.array([""] * len(t_spec), dtype=object)
 
-    if pos_field is not None:
-        pos_str = np.array([_decode_label(v) for v in np.asarray(arr_spec[pos_field], dtype=object)], dtype=object)
-    else:
-        pos_str = np.array(["UNKNOWN"] * len(t_spec), dtype=object)
-    if np.all([str(x).strip() == "" for x in pos_str]):
-        pos_str = np.array(["UNKNOWN"] * len(t_spec), dtype=object)
-    else:
-        pos_str = np.array([("UNKNOWN" if str(x).strip() == "" else str(x).strip().upper()) for x in pos_str], dtype=object)
+    pos_str, _ = _extract_pos_labels_from_structured(arr_spec, len(t_spec))
 
     temp_c = None
     press_hpa = None
@@ -3008,8 +3392,9 @@ def parse_args(argv):
     p.add_argument("--if1-ghz", type=float, default=2.5, help="Legacy: IF end [GHz]")
     p.add_argument("--lo1-ghz", type=float, default=109.8, help="Legacy: LO1 [GHz]")
     p.add_argument("--lo2-ghz", type=float, default=4.0, help="Legacy: LO2 [GHz]")
-    p.add_argument("--restfreq-hz", type=float, default=115.271e9, help="Legacy: RESTFREQ [Hz]")
+    p.add_argument("--restfreq-ghz", type=float, default=None, help="RESTFREQ [GHz]. When specified, the CLI value overrides config restfreq_hz/restfreq_ghz for all selected streams.")
     p.add_argument("--channel-slice", default=None, help="Optional channel slice applied at conversion time, e.g. '[1024,8192)' or '[1024,8191]'")
+    p.add_argument("--vlsrk-kms-slice", default=None, help="Optional VLSRK radio-velocity slice [km/s]. The converter determines one channel slice per stream from the first ON row, e.g. '[-20,80]'.")
 
     p.add_argument("--encoder-time-col", default="time", help="encoder time column (recommended: time)")
     p.add_argument("--encoder-shift-sec", type=float, default=0.0, help="Shift applied to encoder timestamps before interpolation to spectral time: t_enc <- t_enc + shift [s]. Use the same sign convention as sunscan --encoder-shift-sec.")
@@ -3330,7 +3715,8 @@ def main(argv=None):
         print("[info] using azel_correction_apply={} when forming corrected boresight".format(args.azel_correction_apply))
     if float(args.encoder_shift_sec) != 0.0:
         print("[info] encoder_shift_sec = {} s (applied as t_enc <- t_enc + shift before interpolation to spectral time)".format(float(args.encoder_shift_sec)))
-    apply_channel_slice_config(config_dict["streams"], global_cfg, cli_channel_slice=getattr(args, "channel_slice", None))
+    if (getattr(args, "channel_slice", None) is not None) and (getattr(args, "vlsrk_kms_slice", None) is not None):
+        raise ValueError("--channel-slice and --vlsrk-kms-slice are mutually exclusive")
     layout = str(global_cfg.get("output_layout", "merged")).strip().lower()
     if layout not in ("merged", "merged_time"):
         raise RuntimeError("Only merged/merged_time output_layout is supported in v1_40")
@@ -3338,10 +3724,19 @@ def main(argv=None):
         raise RuntimeError("merged/merged_time output_layout requires global.time_sort=true in v1_40")
     all_streams = list(config_dict["streams"])
     streams = _select_streams_for_convert(all_streams, explicit_stream_names=getattr(args, "stream_names", None))
+    config_channel_slice_sources = _config_channel_slice_sources(streams, global_cfg)
     if not streams:
         if getattr(args, "stream_names", None):
             raise ValueError("no streams selected for conversion after applying --stream-name")
         raise ValueError("no streams selected for conversion; check enabled/use_for_convert flags or --stream-name")
+    if (getattr(args, "vlsrk_kms_slice", None) is not None) and config_channel_slice_sources:
+        raise ValueError(
+            "--vlsrk-kms-slice is mutually exclusive with config channel_slice sources: {}".format(
+                ", ".join(config_channel_slice_sources)
+            )
+        )
+    apply_restfreq_ghz_override(streams, getattr(args, "restfreq_ghz", None))
+    apply_channel_slice_config(streams, global_cfg, cli_channel_slice=getattr(args, "channel_slice", None))
     skipped_stream_names = [str(stream.name) for stream in all_streams if str(stream.name) not in {str(s.name) for s in streams}]
     if getattr(args, "stream_names", None):
         print("[info] selected {} stream(s) by --stream-name: {}".format(len(streams), [str(s.name) for s in streams]))
@@ -3412,6 +3807,40 @@ def main(argv=None):
 
     site = Site(lat_deg=float(args.site_lat), lon_deg=float(args.site_lon), elev_m=float(args.site_elev))
 
+    preloaded_stream_arrays = {}
+    vlsrk_slice_infos = []
+    if getattr(args, "vlsrk_kms_slice", None) is not None:
+        vlsrk_kms_slice_spec = _parse_vlsrk_kms_slice_spec(getattr(args, "vlsrk_kms_slice"))
+        for stream in streams:
+            arr_spec_pre, bounds_pre, label_pre, info_pre = _compute_stream_vlsrk_channel_slice(
+                common=common,
+                site=site,
+                db_namespace=str(db_namespace),
+                telescope=str(telescope_name),
+                stream=stream,
+                vlsrk_kms_slice_spec=vlsrk_kms_slice_spec,
+                interp_extrap=str(args.interp_extrap),
+                encoder_time_col=str(args.encoder_time_col),
+                altaz_time_col=str(args.altaz_time_col),
+                encoder_shift_sec=float(args.encoder_shift_sec),
+                azel_correction_apply=str(args.azel_correction_apply),
+            )
+            stream.channel_slice_bounds = tuple(bounds_pre)
+            stream.channel_slice_label = str(label_pre)
+            stream.wcs = _slice_stream_wcs(stream.wcs_full, bounds_pre)
+            preloaded_stream_arrays[str(stream.name)] = arr_spec_pre
+            vlsrk_slice_infos.append(dict(info_pre))
+            print(
+                "[info] stream='{}' vlsrk_kms_slice={} -> channel_slice={} using {} row at t={:.6f} unix, vcorr={:.6f} km/s".format(
+                    stream.name,
+                    label_pre,
+                    tuple(bounds_pre),
+                    info_pre['reference_mode'],
+                    float(info_pre['reference_time_unix']),
+                    float(info_pre['v_corr_kms']),
+                )
+            )
+
     writer = make_writer(
         site=site,
         telescope=str(telescope_name),
@@ -3437,10 +3866,19 @@ def main(argv=None):
     writer.add_history("site_source", "lat={};lon={};elev={}".format(site_info["lat_source"], site_info["lon_source"], site_info["elev_source"]))
     if site_info.get("auto_site") is not None and site_info["auto_site"].get("config_path"):
         writer.add_history("site_config_path", str(site_info["auto_site"].get("config_path")))
+    if getattr(args, "restfreq_ghz", None) is not None:
+        writer.add_history("restfreq_ghz_cli", float(getattr(args, "restfreq_ghz")))
     if getattr(args, "channel_slice", None) is not None:
         writer.add_history("channel_slice_cli", str(args.channel_slice))
-    elif global_cfg.get("channel_slice", None) is not None:
+    elif (getattr(args, "vlsrk_kms_slice", None) is None) and (global_cfg.get("channel_slice", None) is not None):
         writer.add_history("channel_slice_global", str(global_cfg.get("channel_slice")))
+    if getattr(args, "vlsrk_kms_slice", None) is not None:
+        writer.add_history("vlsrk_kms_slice_cli", str(args.vlsrk_kms_slice))
+        for idx, info in enumerate(vlsrk_slice_infos):
+            writer.add_history(
+                f"vlsrk_slice_{idx}",
+                "stream={stream};label={label};bounds={bounds};ref_mode={reference_mode};t_unix={reference_time_unix:.6f};vcorr_kms={v_corr_kms:.6f}".format(**info)
+            )
     writer.add_history("azimuth_meaning", "AZIMUTH/ELEVATIO=beam-center Az/El")
     writer.add_history("az_enc_meaning", "AZ_ENC/EL_ENC=measured encoder Az/El interpolated to t_spec")
     writer.add_history("encoder_shift_sec", float(getattr(args, "encoder_shift_sec", 0.0)))
@@ -3475,7 +3913,13 @@ def main(argv=None):
 
         for stream in streams:
             print("[info] processing stream '{}'".format(stream.name))
-            stream_data = extract_spectral_stream(common, str(db_namespace), str(telescope_name), stream)
+            stream_data = extract_spectral_stream(
+                common,
+                str(db_namespace),
+                str(telescope_name),
+                stream,
+                arr_spec=preloaded_stream_arrays.get(str(stream.name)),
+            )
             spectral_time_summaries.append({
                 "stream": stream.name,
                 "applied": stream_data.spec_time_basis,
