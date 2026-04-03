@@ -1,0 +1,32 @@
+# NANTEN2 実機式準拠の器差パラメータ例
+# 小角オフセットや振幅は arcsec、位相は deg、重力項は native unit の arcsec/deg^n です。
+
+[metadata]
+model = "nanten2_actual_v1"
+comment = "Template for NANTEN2 actual pointing model"
+
+[pointing_params]
+"dAz[arcsec]" = 0.0
+"de[arcsec]" = 0.0
+"chi_Az[arcsec]" = 0.0
+"omega_Az[deg]" = 0.0
+"eps[arcsec]" = 0.0
+"chi2_Az[arcsec]" = 0.0
+"omega2_Az[deg]" = 0.0
+"chi_El[arcsec]" = 0.0
+"omega_El[deg]" = 0.0
+"chi2_El[arcsec]" = 0.0
+"omega2_El[deg]" = 0.0
+"g[arcsec/deg]" = 0.0
+"gg[arcsec/deg^2]" = 0.0
+"ggg[arcsec/deg^3]" = 0.0
+"gggg[arcsec/deg^4]" = 0.0
+"dEl[arcsec]" = 0.0
+"de_radio[arcsec]" = 0.0
+"del_radio[arcsec]" = 0.0
+"cor_v[arcsec]" = 0.0
+"cor_p[deg]" = 0.0
+"g_radio[arcsec/deg]" = 0.0
+"gg_radio[arcsec/deg^2]" = 0.0
+"ggg_radio[arcsec/deg^3]" = 0.0
+"gggg_radio[arcsec/deg^4]" = 0.0

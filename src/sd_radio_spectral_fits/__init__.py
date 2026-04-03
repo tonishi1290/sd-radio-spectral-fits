@@ -13,7 +13,7 @@ from importlib.metadata import version, PackageNotFoundError
 try:
     __version__ = version("sd-radio-spectral-fits") 
 except PackageNotFoundError:
-    __version__ = "1.2.5" # インストール前は手動の値をフォールバックにする
+    __version__ = "1.2.6" # インストール前は手動の値をフォールバックにする
 
 SWNAME = "sd_radio_spectral_fits" # これを定義しておかないと __all__ で怒られます
 

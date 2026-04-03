@@ -1,0 +1,10 @@
+# OMU1P85M を光学ポインティングとして使うときの固定パラメータ例
+# e1, e2 は電波軸ずれ項なので、光学だけなら通常 0 に固定します。
+
+[metadata]
+model = "omu1p85m_actual_v1"
+comment = "Fix radio-axis terms for optical pointing fit"
+
+[fixed_params]
+"e1[arcsec]" = 0.0
+"e2[arcsec]" = 0.0

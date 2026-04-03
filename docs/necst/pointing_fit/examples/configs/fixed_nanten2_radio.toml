@@ -1,0 +1,22 @@
+[metadata]
+model = "nanten2_actual_v1"
+
+[fixed_params]
+"dAz[arcsec]" = 4893.357013294455
+"de[arcsec]" = 390.13823885141915
+"chi_Az[arcsec]" = -23.93979871158179
+"omega_Az[deg]" = -18.894628145674588
+"eps[arcsec]" = -2.339235701486047
+"chi2_Az[arcsec]" = -2.5263358979542465
+"omega2_Az[deg]" = 21.81502265394603
+"chi_El[arcsec]" = -33.45674477853083
+"omega_El[deg]" = -16.649854114125468
+"chi2_El[arcsec]" = -2.253294476439806
+"omega2_El[deg]" = -1.1196322357634891
+g = 0.0
+gg = 0.0
+ggg = 0.0
+gggg = 0.0
+"dEl[arcsec]" = -207.18601546697477
+ggg_radio = 0.000000
+gggg_radio = 0.000000

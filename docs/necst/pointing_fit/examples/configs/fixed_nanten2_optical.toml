@@ -1,0 +1,14 @@
+[metadata]
+model = "nanten2_actual_v1"
+
+[fixed_params]
+#ggg = 0.0
+gggg = 0.0
+"de_radio[arcsec]" = 0.0
+"del_radio[arcsec]" = 0.0
+"cor_v[arcsec]" = 0.0
+"cor_p[deg]" = 0.0
+g_radio = 0.0
+gg_radio = 0.0
+ggg_radio = 0.000000
+gggg_radio = 0.000000

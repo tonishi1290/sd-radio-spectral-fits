@@ -1,0 +1,13 @@
+[defaults]
+angle_unit = "deg"
+offset_unit = "arcsec"
+measurement_space = "star_offset"
+positive_az_moves_star = "left"
+positive_el_moves_star = "down"
+command_err_mode = "subtract"
+model = "nanten2_actual_v1"
+
+[[datasets]]
+dataset_id = "nanten2_star_offset_example"
+input = "../data/nanten2_star_offset_example/d_param.csv"
+used_param = "../data/nanten2_star_offset_example/pointing_param.toml"

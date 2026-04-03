@@ -1,0 +1,28 @@
+[metadata]
+model = "nanten2_actual_v1"
+
+[pointing_params]
+"dAz[deg]" = 0.0
+"de[deg]" = 0.0
+"chi_Az[deg]" = 0.0
+"omega_Az[deg]" = 0.0
+"eps[deg]" = 0.0
+"chi2_Az[deg]" = 0.0
+"omega2_Az[deg]" = 0.0
+"chi_El[deg]" = 0.0
+"omega_El[deg]" = 0.0
+"chi2_El[deg]" = 0.0
+"omega2_El[deg]" = 0.0
+"g[arcsec/deg]" = 0.0
+"gg[arcsec/deg^2]" = 0.0
+"ggg[arcsec/deg^3]" = 0.0
+"gggg[arcsec/deg^4]" = 0.0
+"dEl[deg]" = 0.0
+"de_radio[deg]" = 0.0
+"del_radio[deg]" = 0.0
+"cor_v[deg]" = 0.0
+"cor_p[deg]" = 0.0
+"g_radio[arcsec/deg]" = 0.0
+"gg_radio[arcsec/deg^2]" = 0.0
+"ggg_radio[arcsec/deg^3]" = 0.0
+"gggg_radio[arcsec/deg^4]" = 0.0
