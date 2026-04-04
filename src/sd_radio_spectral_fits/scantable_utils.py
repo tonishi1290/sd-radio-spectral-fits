@@ -241,7 +241,7 @@ def show_scantable(
     # --- 拡張データ用 ---
     extra_data: Optional[pd.DataFrame] = None,
     # --- その場で座標計算するためのショートカット ---
-    ref_coord: Optional[Union[str, SkyCoord]] = None,
+    ref_coord: Optional[Union[str, SkyCoord, Sequence[Any], np.ndarray]] = None,
     frame: str = "ICRS",
     projection: str = "GLS",
     unit: str = "arcsec",
@@ -250,6 +250,12 @@ def show_scantable(
     Scantableの中身を表形式で確認する。
     ref_coordを指定すると、その場でオフセットを計算して表示する（データは変更しない）。
     calc_mapping_offsetsで計算済みの外部データ(extra_data)を一時的に結合して表示することも可能。
+
+    ref_coord は以下を受け付ける。
+    - SkyCoord
+    - Astropy SkyCoord が解釈できる文字列
+    - 2要素の list / tuple / ndarray などの非文字列シーケンス
+      (lon, lat) と解釈し、数値は deg、Quantity はその単位を使う
 
     テーブルに含まれないカラム（例: RESTFREQ）が指定された場合、以下の順序で検索し、
     最初に見つかった値を全行に結合して表示する。
@@ -426,7 +432,7 @@ def show_scantable(
 
 def calc_mapping_offsets(
     sc: Scantable,
-    ref_coord: Optional[Union[str, SkyCoord]] = None,
+    ref_coord: Optional[Union[str, SkyCoord, Sequence[Any], np.ndarray]] = None,
     frame: str = "ICRS",
     projection: str = "GLS",
     unit: str = "arcsec",
@@ -442,15 +448,25 @@ def calc_mapping_offsets(
     ----------
     sc : Scantable
         入力データ。RA/DEC, GLON/GLAT, または AZ/EL 列が必要。
-    ref_coord : str, SkyCoord, optional
-        参照点（中心座標）。Noneの場合はOBSRA/DECまたはデータの平均値を使用。
+    ref_coord : str, SkyCoord, or 2-element non-string sequence, optional
+        参照点（中心座標）。None の場合は OBSRA/DEC またはデータの平均値を使用。
+        以下を受け付ける。
+        - SkyCoord
+        - Astropy SkyCoord が解釈できる文字列
+        - 2要素の list / tuple / ndarray などの非文字列シーケンス
+          (lon, lat) と解釈し、数値は deg、Quantity はその単位を使う
+
+        文字列は Astropy SkyCoord に委ねる。明示単位つきの文字列を推奨。
+        例:
+        - "05h35m14.5s -05d22m30s"
+        - "83.809deg -5.372639deg"
+        単位なしの "83.809 -5.372639" のような曖昧な文字列は避けること。
     frame : str
         計算に使用する座標系 ("ICRS", "FK5", "Galactic", "AltAz" 等)。
     projection : str
         投影法。
-        - "GLS" (Global Sinusoidal): dlon*cos(lat) を使用
-        - "TAN" (Gnomonic): tangent plane（SkyCoord.spherical_offsets_to を使用）
-        - "SIN": simple difference (dlon, dlat)
+        - "GLS" または "SFL" (Global Sinusoidal): dlon*cos(lat) を使用
+        - "CAR" または "NONE": simple difference (dlon, dlat)
     unit : str
         出力単位 ("arcsec", "arcmin", "deg")。
     cos_mode : str
@@ -532,9 +548,27 @@ def calc_mapping_offsets(
     else:
         if isinstance(ref_coord, SkyCoord):
             ref_sky = ref_coord
-        else:
-            # 文字列はSkyCoordに委ねる（例: "05h35m14.5s -05d22m30s" 等）
+        elif isinstance(ref_coord, str):
+            # 文字列は Astropy SkyCoord に委ねる。
+            # 受理例:
+            #   "05h35m14.5s -05d22m30s"
+            #   "83.809deg -5.372639deg"
+            # 明示単位のない "83.809 -5.372639" のような曖昧な文字列は避ける。
             ref_sky = SkyCoord(ref_coord)
+        elif isinstance(ref_coord, np.ndarray) or (isinstance(ref_coord, Sequence) and not isinstance(ref_coord, (str, bytes))):
+            if len(ref_coord) != 2:
+                raise TypeError(
+                    "ref_coord sequence must have exactly 2 elements: (lon, lat)."
+                )
+            lon_ref, lat_ref = ref_coord
+            lon_arg = lon_ref if hasattr(lon_ref, "unit") else float(lon_ref) * u.deg
+            lat_arg = lat_ref if hasattr(lat_ref, "unit") else float(lat_ref) * u.deg
+            ref_sky = SkyCoord(lon_arg, lat_arg, frame=tgt_frame)
+        else:
+            raise TypeError(
+                "ref_coord must be None, SkyCoord, a parseable string, "
+                "or a 2-element non-string sequence (lon, lat)."
+            )
 
         try:
             ref_sky = ref_sky.transform_to(tgt_frame)
@@ -564,7 +598,7 @@ def calc_mapping_offsets(
         ofs_x = dlon
         ofs_y = dlat
     else:
-        raise ValueError(f"Unknown projection '{proj}'. Supported: GLS, SFL, CAR, SIN.")
+        raise ValueError(f"Unknown projection '{proj}'. Supported: GLS, SFL, CAR, NONE.")
         
 
     # 5. 単位変換

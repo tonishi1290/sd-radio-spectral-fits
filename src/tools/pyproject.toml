@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sd-radio-spectral-fits-tools"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
     "sd-radio-spectral-fits",
     "numpy>=2.00",
@@ -26,6 +26,8 @@ sunscan_multibeam = "necst.sunscan_multibeam:main"
 pointing-fit = "necst.pointing_fit.cli:main"
 
 optical-pointing-image-process = "necst.optical_pointing_image_process:main"
+
+necst_v4_plot_trajectory = "necst.necst_v4_plot_trajectory:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
