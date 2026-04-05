@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import csv
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import importlib.util
 import inspect
 import pathlib
@@ -404,6 +405,61 @@ def _unwrap_if_needed(x: np.ndarray, frame_name: str, axis_name: str, unwrap_az:
     if str(axis_name).lower() != "az":
         return arr
     return np.rad2deg(np.unwrap(np.deg2rad(arr)))
+
+
+def _wrap_delta_deg(delta_deg: np.ndarray) -> np.ndarray:
+    d = np.asarray(delta_deg, dtype=float)
+    return ((d + 180.0) % 360.0) - 180.0
+
+
+def _frame_default_reverse_x(frame_name: str) -> bool:
+    return str(frame_name).strip().lower() in ("radec", "galactic")
+
+
+def _prepare_display_xy(x: np.ndarray, y: np.ndarray, frame_name: str, *, equal_aspect: bool) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    frame = str(frame_name).strip().lower()
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    meta: Dict[str, Any] = {
+        "reverse_x": _frame_default_reverse_x(frame),
+        "equal_aspect": bool(equal_aspect),
+        "lat0_deg": None,
+        "lon0_deg": None,
+        "cos_lat0": None,
+        "aspect_ratio": 1.0,
+    }
+
+    sign = -1.0 if meta["reverse_x"] else 1.0
+    x_disp = x.copy()
+    y_disp = y.copy()
+
+    finite = np.isfinite(x) & np.isfinite(y)
+    if not np.any(finite):
+        return x_disp, y_disp, meta
+
+    lon0 = float(np.nanmedian(x[finite]))
+    lat0 = float(np.nanmedian(y[finite]))
+    cos_lat0 = float(np.cos(np.deg2rad(lat0)))
+    if (not np.isfinite(cos_lat0)) or (abs(cos_lat0) < 1e-12):
+        cos_lat0 = 1.0
+
+    meta["lat0_deg"] = lat0
+    meta["lon0_deg"] = lon0
+    meta["cos_lat0"] = cos_lat0
+    meta["aspect_ratio"] = 1.0 / cos_lat0 if bool(equal_aspect) else 1.0
+    return x_disp, y_disp, meta
+
+
+def _format_utc_range_from_unix(t_spec: np.ndarray) -> str:
+    t = np.asarray(t_spec, dtype=float)
+    finite = np.isfinite(t)
+    if not np.any(finite):
+        return "UTC unknown"
+    t0 = float(np.nanmin(t[finite]))
+    t1 = float(np.nanmax(t[finite]))
+    dt0 = datetime.fromtimestamp(t0, tz=timezone.utc)
+    dt1 = datetime.fromtimestamp(t1, tz=timezone.utc)
+    return f"UTC {dt0.strftime('%Y-%m-%d %H:%M:%S')} .. {dt1.strftime('%Y-%m-%d %H:%M:%S')}"
 
 
 # -----------------------------------------------------------------------------
@@ -1039,7 +1095,7 @@ def _draw_quiver_arrows(ax: plt.Axes, x0: np.ndarray, y0: np.ndarray, dx: np.nda
         headwidth=4.0,
         headlength=5.0,
         headaxislength=4.5,
-        pivot='tail',
+        pivot='mid',
         zorder=4,
     )
     return True
@@ -1082,58 +1138,91 @@ def _draw_direction_arrows_samples(ax: plt.Axes, x: np.ndarray, y: np.ndarray, *
     )
 
 
-def _draw_direction_arrows_segment(ax: plt.Axes, x: np.ndarray, y: np.ndarray, mode: Sequence[Any], *,
-                                   arrow_alpha: float, arrow_color: str, arrow_width: float,
-                                   arrow_length_frac: float) -> bool:
-    if x.size < 2:
+def _draw_direction_arrows_segment(
+    ax: plt.Axes,
+    x: np.ndarray,
+    y: np.ndarray,
+    mode: Sequence[Any],
+    *,
+    arrow_alpha: float,
+    arrow_color: str,
+    arrow_width: float,
+    arrow_length_frac: float,
+) -> bool:
+    """
+    Draw one arrow per contiguous run of *drawn line segments* with the same mode.
+
+    Notes
+    -----
+    - The colored trajectory uses segment-mode = mode[:-1].
+    - Therefore segment arrows must also be built from segment runs, not point runs.
+    - No extra arrows are drawn at mode boundaries.
+    """
+
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mode_arr = np.asarray(mode, dtype=object)
+
+    npts = int(x.size)
+    if npts < 2 or mode_arr.size < 2:
         return False
-    span_x = float(np.nanmax(x) - np.nanmin(x)) if x.size else 0.0
-    span_y = float(np.nanmax(y) - np.nanmin(y)) if y.size else 0.0
+
+    # Segment i is the visible line from point i -> i+1,
+    # and its mode/color is determined by mode[i].
+    seg_mode = np.asarray([_normalize_segment_mode(m) for m in mode_arr[:-1]], dtype=object)
+    nseg = int(seg_mode.size)
+    if nseg <= 0:
+        return False
+
+    span_x = float(np.nanmax(x) - np.nanmin(x)) if npts else 0.0
+    span_y = float(np.nanmax(y) - np.nanmin(y)) if npts else 0.0
     span = max(span_x, span_y)
     if (not np.isfinite(span)) or (span <= 0.0):
-        return False
-    draw_len = max(float(arrow_length_frac), 0.0) * span
-    if not np.isfinite(draw_len) or draw_len <= 0.0:
-        draw_len = 0.015 * span
-    move_min = 0.01 * span
+        span = 1.0
 
-    runs = _find_mode_runs(mode)
+    draw_len = max(float(arrow_length_frac), 0.0) * span
+    if (not np.isfinite(draw_len)) or (draw_len <= 0.0):
+        draw_len = 0.015 * span
+
+    # Reject only truly degenerate local motion.
+    move_min = max(1.0e-12 * span, 1.0e-15)
+
+    # Build contiguous runs in segment-index space: [s, e)
+    runs = []
+    i = 0
+    while i < nseg:
+        key = str(seg_mode[i])
+        j = i + 1
+        while j < nseg and str(seg_mode[j]) == key:
+            j += 1
+        runs.append((i, j, key))
+        i = j
+
     starts_x = []
     starts_y = []
     vec_x = []
     vec_y = []
 
+    # One arrow per run, aligned with a local drawn segment near the middle.
     for s, e, _key in runs:
-        if e - s < 2:
+        mid_seg = int((s + e - 1) // 2)
+        if mid_seg < 0 or mid_seg >= nseg:
             continue
-        dx = float(x[e - 1] - x[s])
-        dy = float(y[e - 1] - y[s])
-        dist = float(np.hypot(dx, dy))
-        if (not np.isfinite(dist)) or (dist < move_min):
-            continue
-        mid = int((s + e - 1) // 2)
-        starts_x.append(float(x[mid]))
-        starts_y.append(float(y[mid]))
-        vec_x.append(draw_len * dx / dist)
-        vec_y.append(draw_len * dy / dist)
 
-    for (s0, e0, _k0), (s1, e1, _k1) in zip(runs[:-1], runs[1:]):
-        if s1 <= 0 or e0 <= 0:
-            continue
-        dx = float(x[s1] - x[e0 - 1])
-        dy = float(y[s1] - y[e0 - 1])
+        dx = float(x[mid_seg + 1] - x[mid_seg])
+        dy = float(y[mid_seg + 1] - y[mid_seg])
         dist = float(np.hypot(dx, dy))
-        if (not np.isfinite(dist)) or (dist < move_min):
+        if (not np.isfinite(dist)) or (dist <= move_min):
             continue
-        x0 = 0.5 * float(x[e0 - 1] + x[s1])
-        y0 = 0.5 * float(y[e0 - 1] + y[s1])
-        starts_x.append(x0)
-        starts_y.append(y0)
+
+        starts_x.append(0.5 * float(x[mid_seg] + x[mid_seg + 1]))
+        starts_y.append(0.5 * float(y[mid_seg] + y[mid_seg + 1]))
         vec_x.append(draw_len * dx / dist)
         vec_y.append(draw_len * dy / dist)
 
     if len(starts_x) <= 0:
         return False
+
     return _draw_quiver_arrows(
         ax,
         np.asarray(starts_x, dtype=float),
@@ -1145,7 +1234,6 @@ def _draw_direction_arrows_segment(ax: plt.Axes, x: np.ndarray, y: np.ndarray, m
         width=arrow_width,
     )
 
-
 def plot_trajectory(samples: TrajectorySamples,
                     title: Optional[str] = None,
                     ax: Optional[plt.Axes] = None,
@@ -1155,6 +1243,7 @@ def plot_trajectory(samples: TrajectorySamples,
                     cmd_linewidth: Optional[float] = None,
                     thin_every: int = 1,
                     unwrap_az: bool = False,
+                    equal_aspect: bool = False,
                     legend: bool = True,
                     show_points: bool = False,
                     point_size: float = 4.0,
@@ -1176,14 +1265,16 @@ def plot_trajectory(samples: TrajectorySamples,
     step = max(int(thin_every), 1)
     idx = slice(None, None, step)
 
-    x = _unwrap_if_needed(np.asarray(samples.x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
-    y = np.asarray(samples.y)[idx]
+    x_raw = _unwrap_if_needed(np.asarray(samples.x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
+    y_raw = np.asarray(samples.y)[idx]
     mode = np.asarray(samples.mode_str, dtype=object)[idx]
 
-    finite = np.isfinite(x) & np.isfinite(y)
-    x = x[finite]
-    y = y[finite]
+    finite = np.isfinite(x_raw) & np.isfinite(y_raw)
+    x_raw = x_raw[finite]
+    y_raw = y_raw[finite]
     mode = mode[finite]
+
+    x, y, display_meta = _prepare_display_xy(x_raw, y_raw, samples.frame_name, equal_aspect=bool(equal_aspect))
 
     segments = _make_segments(x, y)
     masks = _make_mode_masks(mode)
@@ -1203,12 +1294,14 @@ def plot_trajectory(samples: TrajectorySamples,
 
     do_overlay_cmd = bool(samples.cmd_x is not None and samples.cmd_y is not None) if overlay_cmd is None else bool(overlay_cmd)
     if do_overlay_cmd:
-        cmd_x = _unwrap_if_needed(np.asarray(samples.cmd_x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
-        cmd_y = np.asarray(samples.cmd_y)[idx]
-        cmd_finite = np.isfinite(cmd_x) & np.isfinite(cmd_y)
-        cmd_x = cmd_x[cmd_finite]
-        cmd_y = cmd_y[cmd_finite]
+        cmd_x_raw = _unwrap_if_needed(np.asarray(samples.cmd_x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
+        cmd_y_raw = np.asarray(samples.cmd_y)[idx]
+        cmd_finite = np.isfinite(cmd_x_raw) & np.isfinite(cmd_y_raw)
+        cmd_x_raw = cmd_x_raw[cmd_finite]
+        cmd_y_raw = cmd_y_raw[cmd_finite]
         cmd_mode = np.asarray(samples.mode_str, dtype=object)[idx][cmd_finite]
+        cmd_x = cmd_x_raw
+        cmd_y = cmd_y_raw
         cmd_segments = _make_segments(cmd_x, cmd_y)
         cmd_masks = _make_mode_masks(cmd_mode)
         for key in ("ON", "OFF", "HOT", "OTHER"):
@@ -1254,17 +1347,23 @@ def plot_trajectory(samples: TrajectorySamples,
             )
 
     ax.autoscale()
+    if bool(display_meta.get("reverse_x")):
+        ax.invert_xaxis()
+        
+    if bool(equal_aspect):
+        aspect_ratio = float(display_meta.get("aspect_ratio", 1.0) or 1.0)
+        if (not np.isfinite(aspect_ratio)) or (aspect_ratio <= 0.0):
+            aspect_ratio = 1.0
+        ax.set_aspect(aspect_ratio, adjustable="box")
     ax.set_xlabel(samples.x_label)
     ax.set_ylabel(samples.y_label)
     ax.grid(True, alpha=0.3)
 
     if title is None:
         if samples.t_spec.size > 0:
-            t0 = float(np.nanmin(samples.t_spec))
-            t1 = float(np.nanmax(samples.t_spec))
             title = (
                 f"Trajectory ({samples.frame_name}, source={samples.coord_source}, stream={samples.stream_name})\n"
-                f"unix={t0:.3f} .. {t1:.3f}"
+                f"{_format_utc_range_from_unix(samples.t_spec)}"
             )
         else:
             title = f"Trajectory ({samples.frame_name}, source={samples.coord_source}, stream={samples.stream_name})"
@@ -1300,6 +1399,11 @@ def plot_trajectory(samples: TrajectorySamples,
         "arrow_mode": arrow_mode_norm,
         "arrow_every": max(int(arrow_every), 1),
         "arrow_length_frac": float(arrow_length_frac),
+        "reverse_x": bool(display_meta.get("reverse_x")),
+        "equal_aspect": bool(equal_aspect),
+        "display_lat0_deg": display_meta.get("lat0_deg"),
+        "display_lon0_deg": display_meta.get("lon0_deg"),
+        "display_cos_lat0": display_meta.get("cos_lat0"),
     }
     return fig, ax, meta
 
@@ -1343,6 +1447,7 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--off-block-start", type=int, default=None, help="1-based OFF block index used with selection=off-block-range")
     p.add_argument("--off-block-end", type=int, default=None, help="1-based OFF block end index used with selection=off-block-range")
     p.add_argument("--unwrap-az", action="store_true", help="Unwrap Az when coord-frame=azel")
+    p.add_argument("--equal-aspect", action="store_true", help="Keep the original coordinate values on the axes, but match the local angular scales by applying a cos(lat0) correction to the x/y display scale. RA/Dec and Galactic are also shown with the conventional left-right reversal.")
     p.add_argument("--thin-every", type=int, default=1, help="Plot every Nth sample")
     p.add_argument("--linewidth", type=float, default=1.0, help="Main trajectory linewidth")
     p.add_argument("--show-points", action="store_true", help="Overlay sample points")
@@ -1474,6 +1579,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         linewidth=float(args.linewidth),
         thin_every=max(int(args.thin_every), 1),
         unwrap_az=bool(args.unwrap_az),
+        equal_aspect=bool(args.equal_aspect),
         legend=not bool(args.hide_legend),
         show_points=bool(args.show_points),
         point_size=float(args.point_size),
