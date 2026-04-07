@@ -15,13 +15,7 @@ __all__ = ["BeamIntensityEstimateResult", "estimate_relative_beam_intensities"]
 
 
 class BeamIntensityEstimateResult:
-    """Container for relative beam intensity results.
-
-    The object prints the compact summary table by default so that
-    ``print(result)`` highlights the most important columns.
-    Detailed diagnostic columns are available in ``result.detail`` and
-    run-level settings are stored in ``result.config``.
-    """
+    """Container for relative beam intensity results."""
 
     def __init__(self, summary: Table, detail: Table, config: dict[str, Any]):
         self.summary = summary
@@ -35,7 +29,7 @@ class BeamIntensityEstimateResult:
     def __str__(self) -> str:
         lines = self.summary.pformat(max_width=-1, max_lines=-1)
         if self.detail.colnames:
-            lines.append('')
+            lines.append("")
             lines.append("詳細は result.detail、設定は result.config を参照してください。")
         return "\n".join(lines)
 
@@ -67,6 +61,7 @@ class BeamIntensityEstimateResult:
 # Low-level helpers
 # =========================
 
+
 def _header_get_case_insensitive(header: Any, key: str, default: Any = None) -> Any:
     if header is None:
         return default
@@ -85,6 +80,7 @@ def _header_get_case_insensitive(header: Any, key: str, default: Any = None) -> 
     return default
 
 
+
 def _meta_get_case_insensitive(meta: Any, key: str, default: Any = None) -> Any:
     if not isinstance(meta, Mapping):
         return default
@@ -97,6 +93,7 @@ def _meta_get_case_insensitive(meta: Any, key: str, default: Any = None) -> Any:
         if ks.upper() == ukey or ks.lower() == lkey:
             return v
     return default
+
 
 
 def _canonical_axis_unit(unit: Any) -> str:
@@ -116,6 +113,7 @@ def _canonical_axis_unit(unit: Any) -> str:
     return u
 
 
+
 def _unit_to_arcsec_scale(unit: Any) -> float:
     u = _canonical_axis_unit(unit or "deg")
     if u == "deg":
@@ -129,6 +127,7 @@ def _unit_to_arcsec_scale(unit: Any) -> float:
     raise ValueError(f"Unsupported spatial unit for CUNIT1/2: {unit!r}")
 
 
+
 def _unit_to_kms_scale(unit: Any) -> float:
     u = _canonical_axis_unit(unit or "km/s")
     if u == "km/s":
@@ -136,6 +135,7 @@ def _unit_to_kms_scale(unit: Any) -> float:
     if u == "m/s":
         return 1.0e-3
     raise ValueError(f"Unsupported spectral unit for CUNIT3: {unit!r}")
+
 
 
 def _world_value(value: Any, unit: Any, *, target: str) -> float:
@@ -147,6 +147,7 @@ def _world_value(value: Any, unit: Any, *, target: str) -> float:
     raise ValueError(target)
 
 
+
 def _float_close(a: Any, b: Any, *, rtol: float = 1.0e-8, atol: float = 1.0e-10) -> bool:
     try:
         af = float(a)
@@ -154,6 +155,7 @@ def _float_close(a: Any, b: Any, *, rtol: float = 1.0e-8, atol: float = 1.0e-10)
     except Exception:
         return False
     return bool(np.isclose(af, bf, rtol=rtol, atol=atol, equal_nan=True))
+
 
 
 def _normalize_support_mask(bundle: OTFBundle, *, relative_weight_threshold: float = 0.10) -> np.ndarray:
@@ -180,24 +182,27 @@ def _normalize_support_mask(bundle: OTFBundle, *, relative_weight_threshold: flo
     return support
 
 
-def _normalize_valid_mask(bundle: OTFBundle) -> np.ndarray:
+
+def _normalize_valid_mask(bundle: OTFBundle, *, relative_weight_threshold: float = 0.10) -> np.ndarray:
     nchan, ny, nx = bundle.data.shape
+    support = _normalize_support_mask(bundle, relative_weight_threshold=relative_weight_threshold)
     if bundle.valid_mask is None:
-        support = _normalize_support_mask(bundle)
         return np.isfinite(bundle.data) & support[None, :, :]
     vm = np.asarray(bundle.valid_mask, dtype=bool)
     if vm.shape == (ny, nx):
-        return np.broadcast_to(vm[None, :, :], (nchan, ny, nx)).copy()
+        return np.broadcast_to(vm[None, :, :], (nchan, ny, nx)).copy() & support[None, :, :]
     if vm.shape == (nchan, ny, nx):
-        return vm.copy()
+        return vm.copy() & support[None, :, :]
     raise ValueError(f"Unsupported valid_mask shape={vm.shape}")
+
 
 
 def _finite_spatial_footprint(bundle: OTFBundle, *, relative_weight_threshold: float) -> np.ndarray:
     support = _normalize_support_mask(bundle, relative_weight_threshold=relative_weight_threshold)
-    valid3 = _normalize_valid_mask(bundle)
+    valid3 = _normalize_valid_mask(bundle, relative_weight_threshold=relative_weight_threshold)
     valid_any = np.any(valid3 & np.isfinite(bundle.data), axis=0)
     return support & valid_any
+
 
 
 def _spatial_cell_arcsec(header: Any) -> tuple[float, float]:
@@ -208,6 +213,7 @@ def _spatial_cell_arcsec(header: Any) -> tuple[float, float]:
     if not np.isfinite(sx) or not np.isfinite(sy) or sx <= 0.0 or sy <= 0.0:
         raise ValueError("Header is missing valid spatial cell size information.")
     return float(sx), float(sy)
+
 
 
 def _beam_fwhm_arcsec(bundle: OTFBundle) -> float | None:
@@ -247,17 +253,27 @@ def _beam_fwhm_arcsec(bundle: OTFBundle) -> float | None:
     return float(np.nanmax(np.asarray(candidates, dtype=float)))
 
 
+
 def _binary_erode_disk(mask: np.ndarray, radius_pix: int) -> np.ndarray:
     src = np.asarray(mask, dtype=bool)
     if radius_pix <= 0:
         return src.copy()
     ny, nx = src.shape
+    if ny <= 0 or nx <= 0:
+        return np.zeros_like(src, dtype=bool)
+    if radius_pix >= builtins.max(ny, nx):
+        return np.zeros_like(src, dtype=bool)
+
     out = np.ones_like(src, dtype=bool)
     r2 = float(radius_pix * radius_pix)
     for dy in range(-radius_pix, radius_pix + 1):
         for dx in range(-radius_pix, radius_pix + 1):
             if float(dy * dy + dx * dx) > r2:
                 continue
+
+            if abs(dy) >= ny or abs(dx) >= nx:
+                return np.zeros_like(src, dtype=bool)
+
             shifted = np.zeros_like(src, dtype=bool)
             if dy >= 0:
                 ys_src = slice(0, ny - dy)
@@ -271,9 +287,16 @@ def _binary_erode_disk(mask: np.ndarray, radius_pix: int) -> np.ndarray:
             else:
                 xs_src = slice(-dx, nx)
                 xs_dst = slice(0, nx + dx)
+
+            if (ys_src.stop - ys_src.start) <= 0 or (xs_src.stop - xs_src.start) <= 0:
+                return np.zeros_like(src, dtype=bool)
+
             shifted[ys_dst, xs_dst] = src[ys_src, xs_src]
             out &= shifted
+            if not np.any(out):
+                return out
     return out
+
 
 
 def _edge_trim_mask(bundle: OTFBundle, *, edge_margin_beam: float, relative_weight_threshold: float) -> tuple[np.ndarray, list[str]]:
@@ -291,6 +314,7 @@ def _edge_trim_mask(bundle: OTFBundle, *, edge_margin_beam: float, relative_weig
     return _binary_erode_disk(footprint, radius_pix), qf
 
 
+
 def _spectral_axis_kms(bundle: OTFBundle) -> np.ndarray:
     header = bundle.header
     nchan = int(bundle.data.shape[0])
@@ -301,6 +325,7 @@ def _spectral_axis_kms(bundle: OTFBundle) -> np.ndarray:
     scale = _unit_to_kms_scale(cunit)
     idx = np.arange(nchan, dtype=float) + 1.0
     return (crval + (idx - crpix) * cdelt) * scale
+
 
 
 def _same_spatial_grid(a: OTFBundle, b: OTFBundle) -> bool:
@@ -322,6 +347,7 @@ def _same_spatial_grid(a: OTFBundle, b: OTFBundle) -> bool:
     return True
 
 
+
 def _same_spectral_grid(a: OTFBundle, b: OTFBundle) -> bool:
     ha = a.header
     hb = b.header
@@ -338,73 +364,6 @@ def _same_spectral_grid(a: OTFBundle, b: OTFBundle) -> bool:
             return False
     return True
 
-
-def _integrate_masked_moment0(data_cube: np.ndarray, mask: np.ndarray, velocity_axis_kms: np.ndarray) -> np.ndarray:
-    data = np.asarray(data_cube, dtype=float)
-    m = np.asarray(mask, dtype=bool)
-    if data.ndim != 3:
-        raise ValueError(f"data_cube must be 3D, got shape={data.shape}")
-    if m.ndim == 1:
-        if m.shape[0] != data.shape[0]:
-            raise ValueError("1D mask length does not match nchan")
-        m3 = np.broadcast_to(m[:, None, None], data.shape)
-    elif m.ndim == 3:
-        if m.shape != data.shape:
-            raise ValueError(f"3D mask shape mismatch: {m.shape} vs {data.shape}")
-        m3 = m
-    else:
-        raise ValueError(f"mask must be 1D or 3D, got shape={m.shape}")
-
-    v = np.asarray(velocity_axis_kms, dtype=float)
-    if v.shape != (data.shape[0],):
-        raise ValueError("velocity_axis_kms shape mismatch")
-    if v.size > 1:
-        dv = float(np.abs(np.nanmedian(np.diff(v))))
-    else:
-        dv = 1.0
-    if not np.isfinite(dv) or dv <= 0.0:
-        raise ValueError("Could not determine positive channel width in km/s")
-
-    valid_sel = m3 & np.isfinite(data)
-    cube_sel = np.where(valid_sel, data, 0.0)
-    with np.errstate(invalid="ignore"):
-        mom0 = np.sum(cube_sel, axis=0, dtype=np.float64) * dv
-    mom0 = np.asarray(mom0, dtype=float)
-    nuse = np.count_nonzero(valid_sel, axis=0)
-    mom0[nuse <= 0] = np.nan
-    return mom0
-
-
-def _integrated_sigma_map(bundle: OTFBundle, mask: np.ndarray, velocity_axis_kms: np.ndarray) -> np.ndarray | None:
-    rms_map = bundle.image_ext.get("BASE_RMS")
-    if rms_map is None:
-        return None
-    rms = np.asarray(rms_map, dtype=float)
-    if rms.shape != bundle.data.shape[1:]:
-        return None
-    v = np.asarray(velocity_axis_kms, dtype=float)
-    if v.size > 1:
-        dv = float(np.abs(np.nanmedian(np.diff(v))))
-    else:
-        dv = 1.0
-    if not np.isfinite(dv) or dv <= 0.0:
-        return None
-    m = np.asarray(mask, dtype=bool)
-    data = np.asarray(bundle.data, dtype=float)
-    if m.ndim == 1:
-        if m.shape[0] != data.shape[0]:
-            return None
-        m3 = np.broadcast_to(m[:, None, None], data.shape)
-    elif m.ndim == 3:
-        if m.shape != data.shape:
-            return None
-        m3 = m
-    else:
-        return None
-    nuse = np.count_nonzero(m3 & np.isfinite(data), axis=0).astype(float)
-    sigma = np.asarray(rms, dtype=float) * dv * np.sqrt(np.maximum(nuse, 0.0))
-    sigma[(nuse <= 0) | ~np.isfinite(rms)] = np.nan
-    return sigma
 
 
 def _resolve_identifiers(bundle: OTFBundle, index: int) -> dict[str, Any]:
@@ -433,6 +392,7 @@ def _resolve_identifiers(bundle: OTFBundle, index: int) -> dict[str, Any]:
     return out
 
 
+
 def _common_signal_mask_if_available(bundles: Sequence[OTFBundle]) -> np.ndarray | None:
     masks = []
     for bundle in bundles:
@@ -454,445 +414,353 @@ def _common_signal_mask_if_available(bundles: Sequence[OTFBundle]) -> np.ndarray
     return common
 
 
-def _moment_maps_from_bundles(
+
+def _base_rms_cube_if_available(bundle: OTFBundle) -> np.ndarray | None:
+    rms_map = bundle.image_ext.get("BASE_RMS")
+    if rms_map is None:
+        return None
+    rms = np.asarray(rms_map, dtype=float)
+    if rms.shape != bundle.data.shape[1:]:
+        return None
+    return np.broadcast_to(rms[None, :, :], bundle.data.shape).astype(float, copy=False)
+
+
+
+def _resolve_method(method: str) -> tuple[str, list[str]]:
+    qf: list[str] = []
+    if method == "sum":
+        warnings.warn(
+            "method='sum' is deprecated; it now maps to 'common_voxel_sum'.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        qf.append("deprecated_method_alias:sum->common_voxel_sum")
+        return "common_voxel_sum", qf
+    if method == "common_voxel_sum":
+        return method, qf
+    if method == "fit":
+        raise ValueError(
+            "method='fit' has been removed. Use method='common_voxel_sum'."
+        )
+    raise ValueError("method must be 'common_voxel_sum' (or deprecated alias 'sum')")
+
+
+
+def _resolve_template_fraction(
+    *,
+    template_fraction: float | None,
+    min_template_fraction: float,
+) -> float:
+    if template_fraction is not None:
+        return float(template_fraction)
+    return float(min_template_fraction)
+
+
+
+def _resolve_min_voxels(*, min_voxels: int | None, min_pixels: int | None) -> int:
+    if min_voxels is not None:
+        return int(min_voxels)
+    if min_pixels is not None:
+        warnings.warn(
+            "min_pixels is deprecated; use min_voxels instead.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+        return int(min_pixels)
+    return 16
+
+
+
+def _velocity_channel_mask(bundle: OTFBundle, velocity_range_kms: tuple[float, float] | None) -> np.ndarray:
+    nchan = int(bundle.data.shape[0])
+    if velocity_range_kms is None:
+        return np.ones(nchan, dtype=bool)
+    v0 = float(velocity_range_kms[0])
+    v1 = float(velocity_range_kms[1])
+    vmin = builtins.min(v0, v1)
+    vmax = builtins.max(v0, v1)
+    vaxis = _spectral_axis_kms(bundle)
+    mask = np.isfinite(vaxis) & (vaxis >= vmin) & (vaxis <= vmax)
+    if not np.any(mask):
+        raise ValueError(
+            f"velocity_range_kms={velocity_range_kms} selects no channels for stream={bundle.meta.get('stream_name', 'unknown') if isinstance(bundle.meta, Mapping) else 'unknown'}"
+        )
+    return mask
+
+
+
+def _common_voxel_candidates(
     bundles: Sequence[OTFBundle],
     *,
+    common_support: np.ndarray,
     velocity_range_kms: tuple[float, float] | None,
-) -> tuple[list[np.ndarray], list[np.ndarray | None], str, list[str]]:
-    quality_flags: list[str] = []
+    relative_weight_threshold: float,
+) -> tuple[np.ndarray, str, list[np.ndarray], list[np.ndarray | None], list[str]]:
+    qf: list[str] = []
+    valids: list[np.ndarray] = []
+    rms_cubes: list[np.ndarray | None] = []
+    channel_masks: list[np.ndarray] = []
 
     common_signal = _common_signal_mask_if_available(bundles)
     if common_signal is not None:
-        ref = bundles[0]
-        for other in bundles[1:]:
-            if not _same_spectral_grid(ref, other):
-                raise ValueError("All bundles must share the same spectral grid when using common SIGNAL_MASK products.")
-        maps: list[np.ndarray] = []
-        sigmas: list[np.ndarray | None] = []
-        for bundle in bundles:
-            v = _spectral_axis_kms(bundle)
-            maps.append(_integrate_masked_moment0(bundle.data, common_signal, v))
-            sigmas.append(_integrated_sigma_map(bundle, common_signal, v))
-        quality_flags.append("moment_source:common_signal_mask")
-        return maps, sigmas, "common_signal_mask", quality_flags
+        qf.append("candidate_mask:common_signal")
+        candidate_source = "common_signal"
+    elif velocity_range_kms is not None:
+        qf.append("candidate_mask:velocity_range")
+        candidate_source = "velocity_range"
+    else:
+        qf.append("candidate_mask:all_channels")
+        candidate_source = "all_channels"
 
-    if velocity_range_kms is not None:
-        v0 = float(velocity_range_kms[0])
-        v1 = float(velocity_range_kms[1])
-        vmin = builtins.min(v0, v1)
-        vmax = builtins.max(v0, v1)
-        maps = []
-        sigmas = []
-        for i, bundle in enumerate(bundles):
-            v = _spectral_axis_kms(bundle)
-            mask1 = np.isfinite(v) & (v >= vmin) & (v <= vmax)
-            if not np.any(mask1):
-                raise ValueError(
-                    f"velocity_range_kms={velocity_range_kms} selects no channels for stream={_resolve_identifiers(bundle, i)['stream_name']}"
-                )
-            maps.append(_integrate_masked_moment0(bundle.data, mask1, v))
-            sigmas.append(_integrated_sigma_map(bundle, mask1, v))
-        quality_flags.append("moment_source:velocity_range")
-        return maps, sigmas, "velocity_range", quality_flags
+    for i, bundle in enumerate(bundles):
+        valid = _normalize_valid_mask(bundle, relative_weight_threshold=relative_weight_threshold)
+        valid &= np.isfinite(np.asarray(bundle.data, dtype=float))
+        valid &= common_support[None, :, :]
+        ch_mask = _velocity_channel_mask(bundle, velocity_range_kms)
+        channel_masks.append(ch_mask)
+        valid &= ch_mask[:, None, None]
+        if common_signal is not None:
+            valid &= common_signal
+        valids.append(valid)
+        rms_cubes.append(_base_rms_cube_if_available(bundle))
 
-    if all("MOMENT0" in b.image_ext for b in bundles):
-        maps = []
-        for bundle in bundles:
-            mom0 = np.asarray(bundle.image_ext["MOMENT0"], dtype=float)
-            if mom0.shape != bundle.data.shape[1:]:
-                raise ValueError(f"MOMENT0 shape mismatch: {mom0.shape} vs {(bundle.data.shape[1], bundle.data.shape[2])}")
-            maps.append(mom0)
-        quality_flags.extend(["moment_source:existing_moment0", "weight:none_for_existing_moment0", "noncommon_signal_mask_risk"])
-        return maps, [None] * len(bundles), "existing_moment0", quality_flags
-
-    raise ValueError(
-        "Could not determine comparison maps. Provide bundles with SIGNAL_MASK_USED/SIGNAL_MASK3D_USED, or specify velocity_range_kms, or provide MOMENT0 in every bundle."
-    )
+    common_valid = np.logical_and.reduce(valids)
+    if not np.any(common_valid):
+        raise ValueError("Common valid 3D voxel region is empty.")
+    return common_valid, candidate_source, valids, rms_cubes, qf
 
 
-def _build_common_comparison_mask(
-    moment_maps: Sequence[np.ndarray],
-    sigma_maps: Sequence[np.ndarray | None],
-    common_support: np.ndarray,
+
+def _template_cube_from_common_valid(
+    bundles: Sequence[OTFBundle],
+    common_valid: np.ndarray,
+) -> np.ndarray:
+    stack = []
+    for bundle in bundles:
+        arr = np.asarray(bundle.data, dtype=float)
+        masked = np.where(common_valid, arr, np.nan)
+        stack.append(masked)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        template = np.nanmedian(np.stack(stack, axis=0), axis=0)
+    template = np.asarray(template, dtype=float)
+    template[~common_valid] = np.nan
+    return template
+
+
+
+def _template_sigma_cube(
+    rms_cubes: Sequence[np.ndarray | None],
+    common_valid: np.ndarray,
+) -> np.ndarray | None:
+    if not all(r is not None for r in rms_cubes):
+        return None
+    stack = np.stack([np.asarray(r, dtype=float) for r in rms_cubes if r is not None], axis=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        sigma = np.nanmedian(stack, axis=0)
+    sigma = np.asarray(sigma, dtype=float)
+    sigma[~common_valid] = np.nan
+    return sigma
+
+
+
+def _build_common_voxel_mask(
+    template_cube: np.ndarray,
+    template_sigma_cube: np.ndarray | None,
+    common_valid: np.ndarray,
     *,
     positive_only: bool,
     min_snr: float,
-    min_pixels: int,
-    min_template_fraction: float,
-) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    min_voxels: int,
+    template_fraction: float,
+) -> tuple[np.ndarray, list[str]]:
     qf: list[str] = []
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        template = np.nanmedian(np.stack([np.asarray(m, dtype=float) for m in moment_maps], axis=0), axis=0)
-    finite_all = np.asarray(common_support, dtype=bool)
-    for m in moment_maps:
-        finite_all &= np.isfinite(np.asarray(m, dtype=float))
-    use = finite_all.copy()
-
-    template_outlier_cap_factor = 5.0
+    amp = np.asarray(template_cube, dtype=float) if positive_only else np.abs(np.asarray(template_cube, dtype=float))
+    use = np.asarray(common_valid, dtype=bool) & np.isfinite(amp)
     if positive_only:
-        use &= np.isfinite(template) & (template > 0.0)
-        tref = float(np.nanpercentile(template[use], 95.0)) if np.any(use) else np.nan
-        if np.isfinite(tref) and tref > 0.0 and float(min_template_fraction) > 0.0:
-            use &= template >= float(min_template_fraction) * tref
-            qf.append(f"template_fraction:{float(min_template_fraction):g};template_ref:p95")
-        if np.isfinite(tref) and tref > 0.0:
-            cap = float(template_outlier_cap_factor) * tref
-            before = int(np.count_nonzero(use))
-            use &= template <= cap
-            if int(np.count_nonzero(use)) < before:
-                qf.append(f"template_upper_cap:{float(template_outlier_cap_factor):g}xp95")
+        use &= template_cube > 0.0
     else:
-        use &= np.isfinite(template) & (np.abs(template) > 0.0)
-        at = np.abs(template)
-        tref = float(np.nanpercentile(at[use], 95.0)) if np.any(use) else np.nan
-        if np.isfinite(tref) and tref > 0.0 and float(min_template_fraction) > 0.0:
-            use &= at >= float(min_template_fraction) * tref
-            qf.append(f"template_fraction:{float(min_template_fraction):g};template_ref:p95")
-        if np.isfinite(tref) and tref > 0.0:
-            cap = float(template_outlier_cap_factor) * tref
-            before = int(np.count_nonzero(use))
-            use &= at <= cap
-            if int(np.count_nonzero(use)) < before:
-                qf.append(f"template_upper_cap:{float(template_outlier_cap_factor):g}xp95")
+        use &= amp > 0.0
 
-    if all(s is not None for s in sigma_maps):
-        snr_stack = []
-        for m, s in zip(moment_maps, sigma_maps):
-            marr = np.asarray(m, dtype=float)
-            sarr = np.asarray(s, dtype=float)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                if positive_only:
-                    snr = marr / sarr
-                else:
-                    snr = np.abs(marr) / sarr
-            snr_stack.append(snr)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", category=RuntimeWarning)
-            ref_snr = np.nanmedian(np.stack(snr_stack, axis=0), axis=0)
-        use &= np.isfinite(ref_snr) & (ref_snr >= float(min_snr))
+    if not np.any(use):
+        raise ValueError("Template-based comparison mask is empty before thresholding.")
+
+    amax = float(np.nanmax(amp[use]))
+    if not np.isfinite(amax) or amax <= 0.0:
+        raise ValueError("Template maximum is not positive/finite; cannot build comparison voxel mask.")
+    if float(template_fraction) > 0.0:
+        use &= amp >= float(template_fraction) * amax
+        qf.append(f"template_fraction:{float(template_fraction):g};template_ref:max")
+
+    if template_sigma_cube is not None:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            snr = amp / np.asarray(template_sigma_cube, dtype=float)
+        use &= np.isfinite(snr) & (snr >= float(min_snr))
         qf.append(f"snr_cut:{float(min_snr):g}")
     else:
         qf.append("snr_cut:none")
 
     nuse = int(np.count_nonzero(use))
-    if nuse < int(min_pixels):
+    if nuse < int(min_voxels):
         raise ValueError(
-            f"Comparison region is too small after common-region/SNR selection: {nuse} pixels < min_pixels={min_pixels}."
+            f"Comparison voxel set is too small after template/SNR selection: {nuse} voxels < min_voxels={int(min_voxels)}."
         )
-    return use, template, qf
+    return use, qf
 
 
-# =========================
-# Sum-based strength
-# =========================
 
-def _strengths_from_sum(
-    moment_maps: Sequence[np.ndarray],
-    sigma_maps: Sequence[np.ndarray | None],
+def _strength_err_from_rms_cube(rms_cube: np.ndarray | None, compare_mask: np.ndarray) -> float:
+    if rms_cube is None:
+        return np.nan
+    vals = np.asarray(rms_cube, dtype=float)[np.asarray(compare_mask, dtype=bool)]
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    return float(np.sqrt(np.sum(vals * vals, dtype=np.float64)))
+
+
+
+def _strengths_from_common_voxel_sum(
+    bundles: Sequence[OTFBundle],
     compare_mask: np.ndarray,
-    common_support: np.ndarray,
-    *,
-    min_background_pixels: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str]]:
-    strengths = []
-    errs = []
-    offsets = []
-    qf: list[str] = ["estimator:sum"]
+    rms_cubes: Sequence[np.ndarray | None],
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    qf = ["estimator:common_voxel_sum", "offset_subtraction:none", "normalization:fixed_reference"]
+    strengths = np.full(len(bundles), np.nan, dtype=float)
+    errs = np.full(len(bundles), np.nan, dtype=float)
     use = np.asarray(compare_mask, dtype=bool)
-    finite_all = np.asarray(common_support, dtype=bool)
-    for m in moment_maps:
-        finite_all &= np.isfinite(np.asarray(m, dtype=float))
-    bg = finite_all & (~use)
-    if int(np.count_nonzero(bg)) >= int(min_background_pixels):
-        qf.append("sum_offset:background_median")
-    else:
-        qf.append("sum_offset:none")
-    for m, s in zip(moment_maps, sigma_maps):
-        marr = np.asarray(m, dtype=float)
-        if int(np.count_nonzero(bg)) >= int(min_background_pixels):
-            offset = float(np.nanmedian(marr[bg]))
-        else:
-            offset = 0.0
-        offsets.append(offset)
-        strengths.append(float(np.nansum(marr[use] - offset, dtype=np.float64)))
-        if s is not None:
-            sarr = np.asarray(s, dtype=float)
-            errs.append(float(np.sqrt(np.nansum(np.square(sarr[use]), dtype=np.float64))))
-        else:
-            errs.append(np.nan)
-    return np.asarray(strengths, dtype=float), np.asarray(errs, dtype=float), np.asarray(offsets, dtype=float), qf
-
-
-# =========================
-# Fit-based strength
-# =========================
-
-def _weighted_ratio_fit(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> tuple[float, float]:
-    denom = float(np.sum(w * x * x, dtype=np.float64))
-    if not np.isfinite(denom) or denom <= 0.0:
-        raise ValueError("Degenerate denominator in ratio fit.")
-    a = float(np.sum(w * x * y, dtype=np.float64) / denom)
-    cov = 1.0 / denom
-    return a, float(np.sqrt(cov))
-
-
-def _weighted_affine_fit(x: np.ndarray, y: np.ndarray, w: np.ndarray) -> tuple[float, float, float, np.ndarray]:
-    A = np.column_stack((x, np.ones_like(x, dtype=float)))
-    sw = np.sqrt(np.asarray(w, dtype=float))
-    Aw = A * sw[:, None]
-    yw = y * sw
-    coef, _, _, _ = np.linalg.lstsq(Aw, yw, rcond=None)
-    a = float(coef[0])
-    b = float(coef[1])
-    yfit = a * x + b
-    resid = y - yfit
-    dof = builtins.max(1, x.size - 2)
-    chi2 = float(np.sum(w * resid * resid, dtype=np.float64))
-    sigma2 = chi2 / float(dof)
-    xtwx = (A.T * w[None, :]) @ A
-    cov = np.linalg.pinv(xtwx) * sigma2
-    err_a = float(np.sqrt(cov[0, 0])) if np.isfinite(cov[0, 0]) and cov[0, 0] >= 0.0 else np.nan
-    return a, b, err_a, resid
-
-
-def _robust_fit_to_reference(
-    ref_map: np.ndarray,
-    tgt_map: np.ndarray,
-    compare_mask: np.ndarray,
-    *,
-    sigma_ref: np.ndarray | None,
-    sigma_tgt: np.ndarray | None,
-    clip_sigma: float,
-    max_clip_iter: int,
-) -> tuple[float, float, float, str]:
-    use = np.asarray(compare_mask, dtype=bool)
-    x = np.asarray(ref_map, dtype=float)[use]
-    y = np.asarray(tgt_map, dtype=float)[use]
-    keep = np.isfinite(x) & np.isfinite(y)
-    if sigma_ref is not None:
-        sx = np.asarray(sigma_ref, dtype=float)[use]
-        keep &= np.isfinite(sx) & (sx > 0.0)
-    else:
-        sx = None
-    if sigma_tgt is not None:
-        sy = np.asarray(sigma_tgt, dtype=float)[use]
-        keep &= np.isfinite(sy) & (sy > 0.0)
-    else:
-        sy = None
-    if np.count_nonzero(keep) < 3:
-        raise ValueError("Not enough valid pixels for fit.")
-
-    x = x[keep]
-    y = y[keep]
-    if sx is not None:
-        sx = sx[keep]
-    if sy is not None:
-        sy = sy[keep]
-    if sy is not None and sx is None:
-        w = 1.0 / np.square(sy)
-    elif sy is None and sx is None:
-        w = np.ones_like(x, dtype=float)
-    else:
-        # effective-variance initialization; refined iteratively below using current slope
-        a0_num = float(np.sum(x * y, dtype=np.float64))
-        a0_den = float(np.sum(x * x, dtype=np.float64))
-        a0 = a0_num / a0_den if np.isfinite(a0_den) and a0_den > 0.0 else 1.0
-        var_eff = np.zeros_like(x, dtype=float)
-        if sy is not None:
-            var_eff += np.square(sy)
-        if sx is not None:
-            var_eff += (a0 * sx) ** 2
-        bad = ~np.isfinite(var_eff) | (var_eff <= 0.0)
-        var_eff[bad] = np.nan
-        if np.all(~np.isfinite(var_eff)):
-            w = np.ones_like(x, dtype=float)
-        else:
-            medv = float(np.nanmedian(var_eff[np.isfinite(var_eff)]))
-            var_eff[~np.isfinite(var_eff)] = medv if np.isfinite(medv) and medv > 0.0 else 1.0
-            w = 1.0 / var_eff
-
-    span = float(np.nanpercentile(x, 95.0) - np.nanpercentile(x, 5.0)) if x.size >= 2 else 0.0
-    if not np.isfinite(span) or span <= 0.0:
-        a, err_a = _weighted_ratio_fit(x, y, w)
-        return a, 0.0, err_a, "fit:ratio_fallback"
-
-    current = np.ones_like(x, dtype=bool)
-    a = np.nan
-    b = np.nan
-    err_a = np.nan
-    fit_mode = "fit:affine"
-    for _ in range(builtins.max(1, int(max_clip_iter))):
-        xk = x[current]
-        yk = y[current]
-        wk = w[current]
-        if xk.size < 3:
-            break
-        span_k = float(np.nanpercentile(xk, 95.0) - np.nanpercentile(xk, 5.0)) if xk.size >= 2 else 0.0
-        if not np.isfinite(span_k) or span_k <= 0.0:
-            a, err_a = _weighted_ratio_fit(xk, yk, wk)
-            b = 0.0
-            fit_mode = "fit:ratio_fallback"
-            return a, b, err_a, fit_mode
-        a, b, err_a, resid = _weighted_affine_fit(xk, yk, wk)
-        if sy is not None or sx is not None:
-            if sy is not None:
-                syk = sy[current]
-            else:
-                syk = None
-            if sx is not None:
-                sxk = sx[current]
-            else:
-                sxk = None
-            var_eff = np.zeros_like(xk, dtype=float)
-            if syk is not None:
-                var_eff += np.square(syk)
-            if sxk is not None:
-                var_eff += (a * sxk) ** 2
-            bad = ~np.isfinite(var_eff) | (var_eff <= 0.0)
-            if not np.all(bad):
-                medv = float(np.nanmedian(var_eff[~bad]))
-                var_eff[bad] = medv if np.isfinite(medv) and medv > 0.0 else 1.0
-                wk = 1.0 / var_eff
-                a, b, err_a, resid = _weighted_affine_fit(xk, yk, wk)
-        med = float(np.nanmedian(resid))
-        mad = float(1.4826 * np.nanmedian(np.abs(resid - med)))
-        if not np.isfinite(mad) or mad <= 0.0:
-            break
-        new_local = np.abs(resid - med) <= float(clip_sigma) * mad
-        if np.count_nonzero(new_local) < 3:
-            break
-        new_current = np.zeros_like(current, dtype=bool)
-        idx = np.flatnonzero(current)
-        new_current[idx[new_local]] = True
-        if np.array_equal(new_current, current):
-            break
-        current = new_current
-
-    return a, b, err_a, fit_mode
-
-
-def _strengths_from_fit(
-    moment_maps: Sequence[np.ndarray],
-    sigma_maps: Sequence[np.ndarray | None],
-    compare_mask: np.ndarray,
-    sum_strengths: np.ndarray,
-    sum_offsets: np.ndarray,
-    *,
-    positive_only: bool,
-    clip_sigma: float,
-    max_clip_iter: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, int, list[str], list[str]]:
-    use = np.asarray(compare_mask, dtype=bool)
-    ref_metric = np.full(len(moment_maps), np.nan, dtype=float)
-    for i, m in enumerate(moment_maps):
-        arr = np.asarray(m, dtype=float)
+    for i, bundle in enumerate(bundles):
+        arr = np.asarray(bundle.data, dtype=float)
         vals = arr[use]
         vals = vals[np.isfinite(vals)]
         if vals.size == 0:
             continue
-        off = float(sum_offsets[i]) if np.isfinite(sum_offsets[i]) else 0.0
-        centered = vals - off
-        if positive_only:
-            centered = centered[centered > 0.0]
-            if centered.size == 0:
-                continue
-            ref_metric[i] = float(np.nanpercentile(centered, 90.0))
-        else:
-            ref_metric[i] = float(np.nanpercentile(np.abs(centered), 90.0))
-    if not np.any(np.isfinite(ref_metric)):
-        strength_metric = np.asarray(sum_strengths if positive_only else np.abs(sum_strengths), dtype=float)
-        ref_idx = int(np.nanargmax(strength_metric))
-    else:
-        ref_idx = int(np.nanargmax(ref_metric))
-    ref_map = np.asarray(moment_maps[ref_idx], dtype=float)
-    slopes = np.full(len(moment_maps), np.nan, dtype=float)
-    errs = np.full(len(moment_maps), np.nan, dtype=float)
-    offsets = np.full(len(moment_maps), np.nan, dtype=float)
-    qf = [f"reference_index:{ref_idx}"]
-    slopes[ref_idx] = 1.0
-    errs[ref_idx] = 0.0
-    offsets[ref_idx] = 0.0
-    fit_modes = ["fit:reference"] * len(moment_maps)
-    mode_tags = []
-    for i, (m, s) in enumerate(zip(moment_maps, sigma_maps)):
-        if i == ref_idx:
-            continue
-        a, b, err_a, mode = _robust_fit_to_reference(
-            ref_map,
-            np.asarray(m, dtype=float),
-            compare_mask,
-            sigma_ref=sigma_maps[ref_idx],
-            sigma_tgt=s,
-            clip_sigma=clip_sigma,
-            max_clip_iter=max_clip_iter,
+        strengths[i] = float(np.sum(vals, dtype=np.float64))
+        errs[i] = _strength_err_from_rms_cube(rms_cubes[i], use)
+    return strengths, errs, qf
+
+
+
+def _beam_fwhm_consistency_flags(
+    bundles: Sequence[OTFBundle],
+    *,
+    warn_fractional_mismatch: float = 0.05,
+) -> tuple[list[str], list[float | None]]:
+    vals: list[float | None] = [_beam_fwhm_arcsec(b) for b in bundles]
+    finite = np.asarray([v for v in vals if v is not None and np.isfinite(v) and v > 0.0], dtype=float)
+    qf: list[str] = []
+    if finite.size != len(vals):
+        qf.append("beam_fwhm_check:partial_or_missing")
+        return qf, vals
+    vmin = float(np.nanmin(finite))
+    vmax = float(np.nanmax(finite))
+    if vmin <= 0.0 or not np.isfinite(vmin) or not np.isfinite(vmax):
+        qf.append("beam_fwhm_check:invalid")
+        return qf, vals
+    frac = vmax / vmin - 1.0
+    qf.append(f"beam_fwhm_ratio_maxmin:{vmax / vmin:.6g}")
+    if frac > float(warn_fractional_mismatch):
+        qf.append(f"beam_fwhm_mismatch:>{100.0 * float(warn_fractional_mismatch):.1f}%")
+    return qf, vals
+
+
+
+def _relative_to_reference(
+    raw_strength: np.ndarray,
+    raw_err: np.ndarray,
+    *,
+    reference_index: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    ref = float(raw_strength[reference_index])
+    ref_err = float(raw_err[reference_index]) if np.isfinite(raw_err[reference_index]) else np.nan
+    if not np.isfinite(ref) or ref == 0.0:
+        raise ValueError(
+            f"Reference beam raw_strength is zero or non-finite at reference_index={reference_index}."
         )
-        slopes[i] = a
-        errs[i] = err_a
-        offsets[i] = b
-        fit_modes[i] = mode
-        mode_tags.append(mode)
-    qf.append("estimator:fit")
-    if mode_tags:
-        qf.extend(sorted(set(mode_tags)))
-    return slopes, errs, offsets, ref_idx, qf, fit_modes
+    relative = np.asarray(raw_strength, dtype=float) / ref
+    relative_err = np.full_like(relative, np.nan, dtype=float)
+    relative_err[reference_index] = 0.0
+    for i in range(len(relative)):
+        if i == reference_index:
+            continue
+        num = float(raw_strength[i])
+        num_err = float(raw_err[i]) if np.isfinite(raw_err[i]) else np.nan
+        if not (np.isfinite(num) and np.isfinite(num_err) and num != 0.0):
+            continue
+        frac2 = (num_err / num) ** 2
+        if np.isfinite(ref_err) and ref_err > 0.0:
+            frac2 += (ref_err / ref) ** 2
+        relative_err[i] = float(abs(relative[i]) * np.sqrt(frac2))
+    return relative, relative_err
 
 
-# =========================
-# Public API
-# =========================
 
 def estimate_relative_beam_intensities(
     bundles: Sequence[OTFBundle],
     *,
     input_labels: Sequence[str] | None = None,
-    method: str = "sum",
+    method: str = "common_voxel_sum",
+    reference_index: int = 0,
     edge_margin_beam: float = 1.5,
     velocity_range_kms: tuple[float, float] | None = None,
     min_snr: float = 5.0,
-    min_pixels: int = 16,
+    min_voxels: int | None = None,
+    min_pixels: int | None = None,
     positive_only: bool = True,
+    template_fraction: float | None = None,
     min_template_fraction: float = 0.2,
     relative_weight_threshold: float = 0.10,
-    clip_sigma: float = 4.0,
-    max_clip_iter: int = 5,
 ) -> BeamIntensityEstimateResult:
     """
-    Estimate relative beam intensities from multiple OTFBundle maps.
+    Estimate relative beam intensities from multiple baseline-subtracted 3D cubes.
 
-    The primary identifier is the input order. Results are returned in the
-    same order as ``bundles``. ``input_labels`` can be provided to show
-    human-readable labels alongside ``input_index``.
+    The comparison is performed on a single common 3D voxel set. The mask is
+    built from a template cube, while the actual strength ratio is always
+    computed from the original input cubes.
 
-    The returned object prints a compact summary table by default.
-    Detailed diagnostic columns are available in ``result.detail`` and
-    run-level settings in ``result.config``.
+    Notes
+    -----
+    - ``method='common_voxel_sum'`` is the primary and only supported method.
+    - ``method='sum'`` is accepted as a deprecated alias to the same method.
+    - ``method='fit'`` has been removed.
+    - The reference beam is fixed by ``reference_index``; strongest-beam
+      normalization is not used.
     """
     if not isinstance(bundles, Sequence) or len(bundles) == 0:
         raise ValueError("bundles must be a non-empty sequence of OTFBundle")
-    if method not in {"sum", "fit"}:
-        raise ValueError("method must be 'sum' or 'fit'")
-    if int(min_pixels) < 1:
-        raise ValueError("min_pixels must be >= 1")
 
     bundles = list(bundles)
+    method, method_qf = _resolve_method(method)
+    min_voxels_resolved = _resolve_min_voxels(min_voxels=min_voxels, min_pixels=min_pixels)
+    if min_voxels_resolved < 1:
+        raise ValueError("min_voxels must be >= 1")
+    template_fraction_resolved = _resolve_template_fraction(
+        template_fraction=template_fraction,
+        min_template_fraction=min_template_fraction,
+    )
+    if template_fraction_resolved < 0.0:
+        raise ValueError("template_fraction must be >= 0")
+    if not (0 <= int(reference_index) < len(bundles)):
+        raise ValueError("reference_index is out of range")
+
     if input_labels is not None:
         input_labels = list(input_labels)
         if len(input_labels) != len(bundles):
             raise ValueError("input_labels must have the same length as bundles")
     else:
         input_labels = [None] * len(bundles)
+
     ref0 = bundles[0]
     for b in bundles[1:]:
         if not _same_spatial_grid(ref0, b):
             raise ValueError("All bundles must share the same spatial grid.")
+        if not _same_spectral_grid(ref0, b):
+            raise ValueError("All bundles must share the same spectral grid.")
 
-    moment_maps, sigma_maps, moment_source, global_qf = _moment_maps_from_bundles(
-        bundles,
-        velocity_range_kms=velocity_range_kms,
-    )
+    beam_qf, beam_fwhm_arcsec = _beam_fwhm_consistency_flags(bundles)
 
-    trimmed_supports = []
+    trimmed_supports: list[np.ndarray] = []
     row_quality_flags: list[list[str]] = []
     for bundle in bundles:
         trimmed, qf = _edge_trim_mask(
@@ -906,108 +774,83 @@ def estimate_relative_beam_intensities(
     if not np.any(common_support):
         raise ValueError("Common trimmed support region is empty.")
 
-    compare_mask, template_map, mask_qf = _build_common_comparison_mask(
-        moment_maps,
-        sigma_maps,
-        common_support,
+    common_valid, candidate_source, valids, rms_cubes, global_qf = _common_voxel_candidates(
+        bundles,
+        common_support=common_support,
+        velocity_range_kms=velocity_range_kms,
+        relative_weight_threshold=float(relative_weight_threshold),
+    )
+    global_qf.extend(method_qf)
+    global_qf.extend(beam_qf)
+
+    template_cube = _template_cube_from_common_valid(bundles, common_valid)
+    template_sigma = _template_sigma_cube(rms_cubes, common_valid)
+    if template_sigma is None:
+        global_qf.append("base_rms_usage:none")
+    else:
+        global_qf.append("base_rms_usage:mask_snr_and_error")
+
+    compare_mask, mask_qf = _build_common_voxel_mask(
+        template_cube,
+        template_sigma,
+        common_valid,
         positive_only=bool(positive_only),
         min_snr=float(min_snr),
-        min_pixels=int(min_pixels),
-        min_template_fraction=float(min_template_fraction),
+        min_voxels=int(min_voxels_resolved),
+        template_fraction=float(template_fraction_resolved),
     )
     global_qf.extend(mask_qf)
 
-    sum_strengths, sum_errs, sum_offsets, sum_qf = _strengths_from_sum(
-        moment_maps,
-        sigma_maps,
+    raw_strength, raw_err, strength_qf = _strengths_from_common_voxel_sum(
+        bundles,
         compare_mask,
-        common_support,
-        min_background_pixels=int(min_pixels),
+        rms_cubes,
     )
-    global_qf.extend(sum_qf)
+    global_qf.extend(strength_qf)
 
-    fit_modes = ["fit:not_used"] * len(bundles)
-    if method == "sum":
-        raw_strength = sum_strengths
-        raw_err = sum_errs
-        fit_offsets = np.full(len(bundles), np.nan, dtype=float)
-        offset_correction = sum_offsets
-        ref_idx = int(np.nanargmax(raw_strength if positive_only else np.abs(raw_strength)))
-    else:
-        raw_strength, raw_err, fit_offsets, ref_idx, fit_qf, fit_modes = _strengths_from_fit(
-            moment_maps,
-            sigma_maps,
-            compare_mask,
-            sum_strengths,
-            sum_offsets,
-            positive_only=bool(positive_only),
-            clip_sigma=float(clip_sigma),
-            max_clip_iter=int(max_clip_iter),
-        )
-        global_qf.extend(fit_qf)
-        offset_correction = np.full(len(bundles), np.nan, dtype=float)
-
-    strength_metric = np.asarray(raw_strength if positive_only else np.abs(raw_strength), dtype=float)
-    max_strength = float(np.nanmax(strength_metric))
-    if not np.isfinite(max_strength) or max_strength == 0.0:
-        raise ValueError("Could not normalize relative beam strengths because the maximum raw strength is zero or non-finite.")
-    if bool(positive_only) and max_strength <= 0.0:
+    if bool(positive_only) and float(raw_strength[reference_index]) <= 0.0:
         raise ValueError(
-            "All raw strengths are non-positive while positive_only=True. This usually means the selected comparison region or background correction is inconsistent with emission-dominated comparison."
+            "Reference beam raw_strength is non-positive while positive_only=True. "
+            "This usually means the comparison voxel mask is inconsistent with an emission-dominated region."
         )
-    relative = strength_metric / max_strength
-    relative_err = np.full_like(raw_err, np.nan, dtype=float)
-    strongest_idx = int(np.nanargmax(strength_metric))
-    denom_err = float(raw_err[strongest_idx]) if np.isfinite(raw_err[strongest_idx]) else np.nan
-    for i in range(len(bundles)):
-        num = float(strength_metric[i])
-        num_err = float(raw_err[i]) if np.isfinite(raw_err[i]) else np.nan
-        if i == strongest_idx:
-            relative_err[i] = 0.0
-            continue
-        if not (np.isfinite(num) and np.isfinite(num_err) and num > 0.0 and np.isfinite(max_strength) and max_strength > 0.0):
-            relative_err[i] = np.nan
-            continue
-        frac2 = (num_err / num) ** 2
-        if np.isfinite(denom_err) and denom_err > 0.0:
-            frac2 += (denom_err / max_strength) ** 2
-        relative_err[i] = float(relative[i] * np.sqrt(frac2))
 
-    def _warnings_from_flags(flags: list[str], fit_mode: str) -> str:
+    relative_strength, relative_strength_err = _relative_to_reference(
+        raw_strength,
+        raw_err,
+        reference_index=int(reference_index),
+    )
+
+    def _warnings_from_flags(flags: list[str]) -> str:
         warns = []
         for tag in flags:
             if tag.startswith("beam_fwhm_missing:"):
                 warns.append(tag)
-            elif tag == "noncommon_signal_mask_risk":
+            elif tag.startswith("beam_fwhm_mismatch:"):
                 warns.append(tag)
-        if fit_mode == "fit:ratio_fallback":
-            warns.append(fit_mode)
         return ";".join(sorted(set(warns)))
-
-    sum_offset_mode = "background_median" if "sum_offset:background_median" in global_qf else "none"
-    snr_cut_value = None if "snr_cut:none" in global_qf or all(s is None for s in sigma_maps) else float(min_snr)
-    template_ref = "p95"
-    template_upper_cap_factor = 5.0 if any(str(t).startswith("template_upper_cap:") for t in global_qf) else None
-    weighting_mode = "none_for_existing_moment0" if moment_source == "existing_moment0" else "sigma_map"
 
     summary_rows = []
     detail_rows = []
+    common_valid_voxels = int(np.count_nonzero(common_valid))
+    comparison_voxels = int(np.count_nonzero(compare_mask))
+    support_pixels = int(np.count_nonzero(common_support))
     for i, bundle in enumerate(bundles):
         ident = _resolve_identifiers(bundle, i)
         all_flags = list(row_quality_flags[i]) + list(global_qf)
-        warning_flag = _warnings_from_flags(all_flags, fit_modes[i])
+        warning_flag = _warnings_from_flags(all_flags)
         user_label = input_labels[i]
         input_label = str(user_label) if user_label is not None else f"bundle_{i}"
         base = {
             "input_index": i,
             "input_label": input_label,
-            "relative_strength": float(relative[i]),
-            "relative_strength_err": float(relative_err[i]) if np.isfinite(relative_err[i]) else np.nan,
+            "relative_strength": float(relative_strength[i]),
+            "relative_strength_err": float(relative_strength_err[i]) if np.isfinite(relative_strength_err[i]) else np.nan,
             "raw_strength": float(raw_strength[i]),
             "raw_strength_err": float(raw_err[i]) if np.isfinite(raw_err[i]) else np.nan,
-            "comparison_pixels": int(np.count_nonzero(compare_mask)),
-            "support_pixels": int(np.count_nonzero(common_support)),
-            "is_strongest": bool(i == strongest_idx),
+            "comparison_voxels": comparison_voxels,
+            "common_valid_voxels": common_valid_voxels,
+            "support_pixels": support_pixels,
+            "is_reference": bool(i == int(reference_index)),
         }
         summary_rows.append(base | {"warning_flag": warning_flag})
         detail_rows.append(
@@ -1017,13 +860,10 @@ def estimate_relative_beam_intensities(
                 "ifnum": ident["ifnum"],
                 "plnum": ident["plnum"],
                 "stream_name": ident["stream_name"],
+                "beam_fwhm_arcsec": float(beam_fwhm_arcsec[i]) if beam_fwhm_arcsec[i] is not None and np.isfinite(beam_fwhm_arcsec[i]) else np.nan,
                 "method": method,
-                "moment_source": moment_source,
-                "weighting_mode": weighting_mode,
-                "fit_mode": fit_modes[i],
-                "fit_offset": float(fit_offsets[i]) if np.isfinite(fit_offsets[i]) else np.nan,
-                "offset_correction": float(offset_correction[i]) if np.isfinite(offset_correction[i]) else np.nan,
-                "is_reference_for_fit": bool(i == ref_idx),
+                "candidate_source": candidate_source,
+                "base_rms_available": bool(rms_cubes[i] is not None),
                 "warning_flag": warning_flag,
             }
         )
@@ -1033,27 +873,22 @@ def estimate_relative_beam_intensities(
 
     config = {
         "method": method,
-        "moment_source": moment_source,
         "input_labels": [str(lbl) if lbl is not None else f"bundle_{i}" for i, lbl in enumerate(input_labels)],
+        "reference_index": int(reference_index),
+        "reference_label": str(input_labels[reference_index]) if input_labels[reference_index] is not None else f"bundle_{reference_index}",
         "edge_margin_beam": float(edge_margin_beam),
         "velocity_range_kms": tuple(map(float, velocity_range_kms)) if velocity_range_kms is not None else None,
-        "min_snr": snr_cut_value,
-        "min_pixels": int(min_pixels),
+        "min_snr": float(min_snr) if template_sigma is not None else None,
+        "min_voxels": int(min_voxels_resolved),
         "positive_only": bool(positive_only),
-        "min_template_fraction": float(min_template_fraction),
-        "template_ref": template_ref,
-        "template_upper_cap_factor": template_upper_cap_factor,
+        "template_fraction": float(template_fraction_resolved),
         "relative_weight_threshold": float(relative_weight_threshold),
-        "sum_offset_mode": sum_offset_mode,
-        "weighting_mode": weighting_mode,
-        "clip_sigma": float(clip_sigma) if method == "fit" else None,
-        "max_clip_iter": int(max_clip_iter) if method == "fit" else None,
-        "comparison_pixels": int(np.count_nonzero(compare_mask)),
-        "support_pixels": int(np.count_nonzero(common_support)),
-        "strongest_input_index": strongest_idx,
-        "strongest_input_label": str(input_labels[strongest_idx]) if input_labels[strongest_idx] is not None else f"bundle_{strongest_idx}",
-        "fit_reference_input_index": ref_idx,
-        "fit_reference_input_label": str(input_labels[ref_idx]) if input_labels[ref_idx] is not None else f"bundle_{ref_idx}",
+        "candidate_source": candidate_source,
+        "beam_fwhm_arcsec": [float(v) if v is not None and np.isfinite(v) else None for v in beam_fwhm_arcsec],
+        "comparison_voxels": comparison_voxels,
+        "common_valid_voxels": common_valid_voxels,
+        "support_pixels": support_pixels,
+        "quality_flags": sorted(set(global_qf)),
     }
 
     return BeamIntensityEstimateResult(summary=summary, detail=detail, config=config)
