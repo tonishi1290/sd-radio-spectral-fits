@@ -42,6 +42,7 @@ if __name__ == "__main__":
     if (not _has_show0) and _has_out0:
         matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib import colors as mcolors
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
 
@@ -97,6 +98,12 @@ class TrajectorySamples:
     cmd_source: Optional[str] = None
     cmd_meaning: Optional[str] = None
     off_blocks: Optional[List[Tuple[int, int]]] = None
+    scan_id: Optional[np.ndarray] = None
+    line_index: Optional[np.ndarray] = None
+    line_label: Optional[np.ndarray] = None
+    scan_field_name: Optional[str] = None
+    line_index_field_name: Optional[str] = None
+    line_label_field_name: Optional[str] = None
 
 
 # -----------------------------------------------------------------------------
@@ -231,9 +238,57 @@ def _select_spectral_time_without_spectra(conv, arr):
     raise RuntimeError(f"no usable spectral time field. available={names}")
 
 
+def _extract_scan_related_fields(conv, arr, names: Sequence[str], nrow: int) -> Dict[str, Any]:
+    scan_field = conv._pick_field_name(
+        list(names),
+        None,
+        ["scan", "scan_id", "scanid", "scan_no", "scan_num", "scan_number", "scan_index", "scanindex", "subscan", "subscan_id"],
+    )
+    line_index_field = conv._pick_field_name(
+        list(names),
+        None,
+        ["line_index", "lineindex", "line_no", "line_num", "line_number", "line_id", "lineid", "subscan_index"],
+    )
+    line_label_field = conv._pick_field_name(
+        list(names),
+        None,
+        ["line_label", "linelabel", "line_name", "linename", "scan_label", "scanlabel", "subscan_label"],
+    )
+
+    def _take(name: Optional[str]):
+        if name is None:
+            return None
+        try:
+            out = np.asarray(arr[name])
+        except Exception:
+            return None
+        if out.ndim != 1:
+            out = np.ravel(out)
+        if out.size != int(nrow):
+            return None
+        return out
+
+    line_label = _take(line_label_field)
+    if line_label is not None:
+        line_label = np.asarray([
+            "" if (v is None or str(v).strip().lower() in ("", "nan", "none")) else str(v).strip()
+            for v in np.asarray(line_label, dtype=object)
+        ], dtype=object)
+
+    return {
+        "scan_id": _take(scan_field),
+        "line_index": _take(line_index_field),
+        "line_label": line_label,
+        "scan_field_name": scan_field,
+        "line_index_field_name": line_index_field,
+        "line_label_field_name": line_label_field,
+    }
+
+
+
 def read_spectral_timing_only(conv, db, spec_table_name: str):
     """
-    Return only spectral timing and OBSMODE-like labels.
+    Return only spectral timing, OBSMODE-like labels, and optional scan/line identifiers.
 
     Fast path: ask necstdb for a subset of columns if supported.
     Fallback: read raw records once and access only needed fields without
@@ -245,15 +300,20 @@ def read_spectral_timing_only(conv, db, spec_table_name: str):
         arr_full = conv._read_structured_array_tolerant(db, spec_table_name)
         t_spec, time_meta = _select_spectral_time_without_spectra(conv, arr_full)
         mode_str, pos_field = conv._extract_pos_labels_from_structured(arr_full, len(t_spec))
-        return t_spec, mode_str, time_meta, pos_field
+        scan_meta = _extract_scan_related_fields(conv, arr_full, list(arr_full.dtype.names or []), len(t_spec))
+        return t_spec, mode_str, time_meta, pos_field, scan_meta
 
     names = list(dtype.names)
     pos_field = conv._pick_field_name(names, None, ["position", "obsmode", "obs_mode", "obsMode", "mode", "state", "status", "label"])
     timestamp_field = conv._pick_field_name(names, None, ["timestamp", "time_spectrometer"])
     fallback_field = conv._pick_field_name(names, None, ["time", "t", "unix_time", "unixtime"])
+    scan_meta_fields = _extract_scan_related_fields(conv, np.empty(0, dtype=dtype), names, 0)
 
     needed_cols = []
-    for name in (timestamp_field, fallback_field, pos_field):
+    for name in (timestamp_field, fallback_field, pos_field,
+                 scan_meta_fields.get("scan_field_name"),
+                 scan_meta_fields.get("line_index_field_name"),
+                 scan_meta_fields.get("line_label_field_name")):
         if name is not None and name not in needed_cols:
             needed_cols.append(name)
 
@@ -273,7 +333,8 @@ def read_spectral_timing_only(conv, db, spec_table_name: str):
 
     t_spec, time_meta = _select_spectral_time_without_spectra(conv, arr_subset)
     mode_str, pos_field = conv._extract_pos_labels_from_structured(arr_subset, len(t_spec))
-    return t_spec, mode_str, time_meta, pos_field
+    scan_meta = _extract_scan_related_fields(conv, arr_subset, list(arr_subset.dtype.names or []), len(t_spec))
+    return t_spec, mode_str, time_meta, pos_field, scan_meta
 
 
 # -----------------------------------------------------------------------------
@@ -366,6 +427,12 @@ def _apply_slice_to_samples(samples: TrajectorySamples, sl: slice) -> Trajectory
         cmd_source=samples.cmd_source,
         cmd_meaning=samples.cmd_meaning,
         off_blocks=find_off_blocks(np.asarray(samples.mode_str, dtype=object)[sl]),
+        scan_id=maybe_take(samples.scan_id),
+        line_index=maybe_take(samples.line_index),
+        line_label=maybe_take(samples.line_label),
+        scan_field_name=samples.scan_field_name,
+        line_index_field_name=samples.line_index_field_name,
+        line_label_field_name=samples.line_label_field_name,
     )
     return out
 
@@ -460,6 +527,330 @@ def _format_utc_range_from_unix(t_spec: np.ndarray) -> str:
     dt0 = datetime.fromtimestamp(t0, tz=timezone.utc)
     dt1 = datetime.fromtimestamp(t1, tz=timezone.utc)
     return f"UTC {dt0.strftime('%Y-%m-%d %H:%M:%S')} .. {dt1.strftime('%Y-%m-%d %H:%M:%S')}"
+
+
+def _compute_on_run_ids(mode_str: Sequence[Any]) -> np.ndarray:
+    mode_arr = np.asarray([_normalize_segment_mode(m) for m in mode_str], dtype=object)
+    out = np.full(mode_arr.size, -1, dtype=int)
+    run_id = -1
+    i = 0
+    while i < mode_arr.size:
+        if str(mode_arr[i]) != "ON":
+            i += 1
+            continue
+        j = i + 1
+        while j < mode_arr.size and str(mode_arr[j]) == "ON":
+            j += 1
+        run_id += 1
+        out[i:j] = run_id
+        i = j
+    return out
+
+
+
+def _group_key_valid_mask(values: np.ndarray) -> np.ndarray:
+    arr = np.asarray(values, dtype=object)
+    out = np.zeros(arr.shape, dtype=bool)
+    for i, v in enumerate(arr.tolist()):
+        if v is None:
+            out[i] = False
+        elif isinstance(v, (np.floating, float)):
+            out[i] = bool(np.isfinite(v))
+        elif isinstance(v, (np.integer, int)):
+            out[i] = True
+        else:
+            s = str(v).strip()
+            out[i] = (s != "") and (s.lower() not in ("nan", "none"))
+    return out
+
+
+
+def _select_scan_group_key(samples: TrajectorySamples) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    candidates = [
+        (samples.scan_id, "scan_id"),
+        (samples.line_index, "line_index"),
+        (samples.line_label, "line_label"),
+    ]
+    for values, name in candidates:
+        if values is None:
+            continue
+        arr = np.asarray(values, dtype=object)
+        if arr.size <= 0:
+            continue
+        if np.any(_group_key_valid_mask(arr)):
+            return arr, name
+    return None, None
+
+
+def _frame_longitude_x(frame_name: str) -> bool:
+    return str(frame_name).strip().lower() in ("azel", "radec", "galactic")
+
+
+def _segment_mid_lat_deg(y0: np.ndarray, y1: np.ndarray) -> np.ndarray:
+    return 0.5 * (np.asarray(y0, dtype=float) + np.asarray(y1, dtype=float))
+
+
+def _dx_local_deg(x0: np.ndarray, x1: np.ndarray, y_ref_deg: np.ndarray, frame_name: str) -> np.ndarray:
+    dx = np.asarray(x0, dtype=float) - np.asarray(x1, dtype=float)
+    if _frame_longitude_x(frame_name):
+        dx = _wrap_delta_deg(dx)
+    return dx * np.cos(np.deg2rad(np.asarray(y_ref_deg, dtype=float)))
+
+
+def _segment_value_from_point_value(point_value: np.ndarray) -> np.ndarray:
+    p = np.asarray(point_value, dtype=float)
+    if p.size < 2:
+        return np.empty(0, dtype=float)
+    return 0.5 * (p[:-1] + p[1:])
+
+
+def _compute_colored_on_segments(
+    x: np.ndarray,
+    y: np.ndarray,
+    t: np.ndarray,
+    on_run_ids: np.ndarray,
+    frame_name: str,
+    color_by: str,
+    cmd_x: Optional[np.ndarray] = None,
+    cmd_y: Optional[np.ndarray] = None,
+    scan_group_key: Optional[np.ndarray] = None,
+    color_sign_mode: str = "signed",
+    speed_window_points: int = 2,
+    speed_window_mode: str = "secant",
+) -> Tuple[np.ndarray, np.ndarray, str, bool]:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    t = np.asarray(t, dtype=float)
+    on_run_ids = np.asarray(on_run_ids, dtype=int)
+    metric = str(color_by).strip().lower()
+    sign_mode = str(color_sign_mode).strip().lower()
+    if sign_mode not in ("signed", "abs"):
+        raise ValueError(f"unsupported color_sign_mode={color_sign_mode!r}")
+    speed_mode = str(speed_window_mode).strip().lower()
+    if speed_mode not in ("secant", "component_mean", "magnitude_mean"):
+        raise ValueError(f"unsupported speed_window_mode={speed_window_mode!r}")
+    try:
+        speed_win_pts = int(speed_window_points)
+    except Exception as exc:
+        raise ValueError(f"speed_window_points must be an integer, got {speed_window_points!r}") from exc
+    if speed_win_pts < 2:
+        raise ValueError(f"speed_window_points must be >= 2, got {speed_window_points!r}")
+
+    segments = _make_segments(x, y)
+    if segments.shape[0] <= 0:
+        return segments, np.empty(0, dtype=float), "", False
+
+    same_on_run = (on_run_ids[:-1] >= 0) & (on_run_ids[1:] == on_run_ids[:-1])
+    same_scan = np.ones(same_on_run.shape, dtype=bool)
+    if scan_group_key is not None:
+        scan_group_key = np.asarray(scan_group_key, dtype=object)
+        if scan_group_key.size != x.size:
+            raise ValueError("scan_group_key must have the same length as x/y/t")
+        valid_group = _group_key_valid_mask(scan_group_key)
+        same_scan = valid_group[:-1] & valid_group[1:] & (scan_group_key[:-1] == scan_group_key[1:])
+    seg_mask_base = same_on_run & same_scan
+
+    def _contiguous_true_runs(mask: np.ndarray) -> List[Tuple[int, int]]:
+        mask = np.asarray(mask, dtype=bool)
+        runs: List[Tuple[int, int]] = []
+        i = 0
+        nmask = int(mask.size)
+        while i < nmask:
+            if not bool(mask[i]):
+                i += 1
+                continue
+            j = i + 1
+            while j < nmask and bool(mask[j]):
+                j += 1
+            runs.append((i, j))
+            i = j
+        return runs
+
+    if metric in ("frame_dx", "frame_dy", "frame_dr"):
+        if cmd_x is None or cmd_y is None:
+            raise ValueError(f"color_by={metric} requires command-frame coordinates")
+        cmd_x = np.asarray(cmd_x, dtype=float)
+        cmd_y = np.asarray(cmd_y, dtype=float)
+        y_ref = 0.5 * (y + cmd_y)
+        point_dx_deg = _dx_local_deg(x, cmd_x, y_ref, frame_name)
+        point_dy_deg = y - cmd_y
+        point_dr_deg = np.hypot(point_dx_deg, point_dy_deg)
+        if metric == "frame_dx":
+            seg_value = _segment_value_from_point_value(point_dx_deg) * 3600.0
+            label = "frame dx (enc-cmd) [arcsec]"
+            signed = True
+        elif metric == "frame_dy":
+            seg_value = _segment_value_from_point_value(point_dy_deg) * 3600.0
+            label = "frame dy (enc-cmd) [arcsec]"
+            signed = True
+        else:
+            seg_value = _segment_value_from_point_value(point_dr_deg) * 3600.0
+            label = "frame dr (enc-cmd) [arcsec]"
+            signed = False
+    elif metric in ("frame_vx", "frame_vy", "frame_speed"):
+        if x.size < 2:
+            return np.empty((0, 2, 2), dtype=float), np.empty(0, dtype=float), "", False
+        dt = np.diff(t)
+        mid_lat = _segment_mid_lat_deg(y[:-1], y[1:])
+        dx_deg = _dx_local_deg(x[1:], x[:-1], mid_lat, frame_name)
+        dy_deg = np.diff(y)
+        good_dt = np.isfinite(dt) & (dt > 0.0)
+        vx_inst = np.full(dt.shape, np.nan, dtype=float)
+        vy_inst = np.full(dt.shape, np.nan, dtype=float)
+        vx_inst[good_dt] = dx_deg[good_dt] / dt[good_dt]
+        vy_inst[good_dt] = dy_deg[good_dt] / dt[good_dt]
+
+        vx = vx_inst.copy()
+        vy = vy_inst.copy()
+        if speed_win_pts > 2:
+            runs = _contiguous_true_runs(seg_mask_base & good_dt)
+            vx[:] = np.nan
+            vy[:] = np.nan
+            win_seg = speed_win_pts - 1
+            left = max(0, (win_seg - 1) // 2)
+            right = max(0, win_seg - 1 - left)
+            for a, b in runs:
+                for i in range(a, b):
+                    s0 = max(a, i - left)
+                    s1 = min(b - 1, i + right)
+                    if s1 < s0:
+                        continue
+                    if speed_mode == "secant":
+                        p0 = s0
+                        p1 = s1 + 1
+                        dtw = t[p1] - t[p0]
+                        if np.isfinite(dtw) and (dtw > 0.0):
+                            yref = 0.5 * (y[p0] + y[p1])
+                            vx[i] = _dx_local_deg(x[p1], x[p0], yref, frame_name) / dtw
+                            vy[i] = (y[p1] - y[p0]) / dtw
+                    elif speed_mode == "component_mean":
+                        sl = slice(s0, s1 + 1)
+                        if np.any(np.isfinite(vx_inst[sl])):
+                            vx[i] = float(np.nanmean(vx_inst[sl]))
+                        if np.any(np.isfinite(vy_inst[sl])):
+                            vy[i] = float(np.nanmean(vy_inst[sl]))
+                    else:
+                        sl = slice(s0, s1 + 1)
+                        sp = np.hypot(vx_inst[sl], vy_inst[sl])
+                        if np.any(np.isfinite(sp)):
+                            sp_mean = float(np.nanmean(sp))
+                            if metric == "frame_vx":
+                                if np.any(np.isfinite(vx_inst[sl])):
+                                    sgn = float(np.sign(np.nanmean(vx_inst[sl])))
+                                    vx[i] = sgn * sp_mean
+                            elif metric == "frame_vy":
+                                if np.any(np.isfinite(vy_inst[sl])):
+                                    sgn = float(np.sign(np.nanmean(vy_inst[sl])))
+                                    vy[i] = sgn * sp_mean
+                            else:
+                                vx[i] = sp_mean
+                                vy[i] = 0.0
+        if metric == "frame_vx":
+            seg_value = vx * 3600.0
+            label = "frame vx (enc) [arcsec/s]"
+            signed = True
+        elif metric == "frame_vy":
+            seg_value = vy * 3600.0
+            label = "frame vy (enc) [arcsec/s]"
+            signed = True
+        else:
+            seg_value = np.hypot(vx, vy) * 3600.0
+            label = "frame speed (enc) [arcsec/s]"
+            signed = False
+            if speed_win_pts > 2:
+                label = f"frame speed (enc, {speed_win_pts}-point {speed_mode}) [arcsec/s]"
+    else:
+        raise ValueError(f"unsupported color_by={color_by!r}")
+
+    if metric in ("frame_dx", "frame_dy", "frame_vx", "frame_vy") and sign_mode == "abs":
+        seg_value = np.abs(seg_value)
+        signed = False
+        label = f"|{label.split(' [', 1)[0]}| [{label.split(' [', 1)[1]}" if " [" in label else f"|{label}|"
+
+    finite_metric = np.isfinite(seg_value)
+    seg_mask = seg_mask_base & finite_metric
+    return segments[seg_mask], np.asarray(seg_value[seg_mask], dtype=float), label, signed
+
+
+def _make_metric_norm(metric_values: np.ndarray, *, signed: bool,
+                      color_vmin: Optional[float] = None,
+                      color_vmax: Optional[float] = None,
+                      color_percentile: Optional[float] = None,
+                      color_percentile_mode: str = "central"):
+    vals = np.asarray(metric_values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size <= 0:
+        return None
+
+    auto_vmin = float(np.nanmin(vals))
+    auto_vmax = float(np.nanmax(vals))
+    if not np.isfinite(auto_vmin) or not np.isfinite(auto_vmax):
+        return None
+
+    user_vmin = None if color_vmin is None else float(color_vmin)
+    user_vmax = None if color_vmax is None else float(color_vmax)
+    if user_vmin is not None and not np.isfinite(user_vmin):
+        raise ValueError(f"color_vmin must be finite, got {color_vmin!r}")
+    if user_vmax is not None and not np.isfinite(user_vmax):
+        raise ValueError(f"color_vmax must be finite, got {color_vmax!r}")
+
+    pct = None if color_percentile is None else float(color_percentile)
+    if pct is not None:
+        if not np.isfinite(pct):
+            raise ValueError(f"color_percentile must be finite, got {color_percentile!r}")
+        if not (0.0 < pct <= 100.0):
+            raise ValueError(f"color_percentile must satisfy 0 < q <= 100, got {pct}")
+    pct_mode = str(color_percentile_mode).strip().lower()
+    if pct_mode not in ("central", "zero_upper"):
+        raise ValueError(f"unsupported color_percentile_mode={color_percentile_mode!r}")
+
+    pct_auto_vmin = auto_vmin
+    pct_auto_vmax = auto_vmax
+    if pct is not None:
+        if signed:
+            pct_auto_vmax = float(np.nanpercentile(np.abs(vals), pct))
+            pct_auto_vmin = -pct_auto_vmax
+        else:
+            if pct_mode == "central":
+                tail = max(0.0, 0.5 * (100.0 - pct))
+                pct_auto_vmin = float(np.nanpercentile(vals, tail))
+                pct_auto_vmax = float(np.nanpercentile(vals, 100.0 - tail))
+            else:
+                pct_auto_vmin = 0.0
+                pct_auto_vmax = float(np.nanpercentile(vals, pct))
+
+    if signed:
+        if user_vmin is None and user_vmax is None:
+            vmax_abs = float(max(abs(pct_auto_vmin), abs(pct_auto_vmax)))
+            if vmax_abs <= 0.0:
+                return None
+            return mcolors.TwoSlopeNorm(vmin=-vmax_abs, vcenter=0.0, vmax=vmax_abs)
+
+        if user_vmin is None and user_vmax is not None:
+            vmax_abs = abs(float(user_vmax))
+            if vmax_abs <= 0.0:
+                return None
+            return mcolors.TwoSlopeNorm(vmin=-vmax_abs, vcenter=0.0, vmax=vmax_abs)
+
+        if user_vmax is None and user_vmin is not None:
+            vmax_abs = abs(float(user_vmin))
+            if vmax_abs <= 0.0:
+                return None
+            return mcolors.TwoSlopeNorm(vmin=-vmax_abs, vcenter=0.0, vmax=vmax_abs)
+
+        vmin = float(user_vmin)
+        vmax = float(user_vmax)
+        if vmax <= vmin:
+            raise ValueError(f"color range must satisfy vmin < vmax, got {vmin} >= {vmax}")
+        if vmin < 0.0 < vmax:
+            return mcolors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+        return mcolors.Normalize(vmin=vmin, vmax=vmax)
+
+    vmin = pct_auto_vmin if user_vmin is None else float(user_vmin)
+    vmax = pct_auto_vmax if user_vmax is None else float(user_vmax)
+    if vmax <= vmin:
+        raise ValueError(f"color range must satisfy vmin < vmax, got {vmin} >= {vmax}")
+    return mcolors.Normalize(vmin=vmin, vmax=vmax)
 
 
 # -----------------------------------------------------------------------------
@@ -565,6 +956,17 @@ def _compute_off_block_indices(mode_str: Sequence[Any]) -> np.ndarray:
     return out
 
 
+def _csv_any_or_empty(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (np.floating, float)) and (not np.isfinite(value)):
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("nan", "none"):
+        return ""
+    return s
+
+
 def export_trajectory_csv(samples: TrajectorySamples, csv_path: str) -> pathlib.Path:
     if samples.site is None:
         raise ValueError("samples.site is required for CSV export")
@@ -587,6 +989,7 @@ def export_trajectory_csv(samples: TrajectorySamples, csv_path: str) -> pathlib.
 
     columns = [
         "sample_index", "unix_time", "iso_time", "mode", "mode_norm", "off_block_index",
+        "scan_id", "line_index", "line_label",
         "stream_name", "spec_table_name",
         "site_lat_deg", "site_lon_deg", "site_elev_m",
         "enc_az_deg", "enc_el_deg",
@@ -613,6 +1016,9 @@ def export_trajectory_csv(samples: TrajectorySamples, csv_path: str) -> pathlib.
                 str(mode[i]),
                 _normalize_segment_mode(mode[i]),
                 int(off_idx[i]),
+                _csv_any_or_empty(None if samples.scan_id is None else np.asarray(samples.scan_id, dtype=object)[i]),
+                _csv_any_or_empty(None if samples.line_index is None else np.asarray(samples.line_index, dtype=object)[i]),
+                _csv_any_or_empty(None if samples.line_label is None else np.asarray(samples.line_label, dtype=object)[i]),
                 samples.stream_name,
                 samples.spec_table_name,
                 f"{float(site.lat_deg):.12f}",
@@ -694,6 +1100,14 @@ def load_trajectory_samples_from_csv(csv_path: str,
             return np.asarray([_csv_float_or_nan(r.get(name)) for r in rows], dtype=float)
         return np.asarray([str(r.get(name, "")) for r in rows], dtype=object)
 
+    def obj_col(name: str) -> Optional[np.ndarray]:
+        if rows and (name not in rows[0]):
+            return None
+        arr = np.asarray([_csv_any_or_empty(r.get(name)) for r in rows], dtype=object)
+        if not np.any(_group_key_valid_mask(arr)):
+            return None
+        return arr
+
     t_spec = col("unix_time")
     mode_str = col("mode", numeric=False)
     stream_name = str(rows[0].get("stream_name", "CSV"))
@@ -739,6 +1153,10 @@ def load_trajectory_samples_from_csv(csv_path: str,
     az_col, el_col, meaning = _coord_source_to_columns(coord_source_norm)
     x, y, x_label, y_label, coord_meta = _convert_frame_local(site, t_spec, pointing[az_col], pointing[el_col], coord_frame)
 
+    csv_scan_id = obj_col("scan_id")
+    csv_line_index = obj_col("line_index")
+    csv_line_label = obj_col("line_label")
+
     cmd_x = cmd_y = None
     cmd_meaning = None
     cmd_source_norm = None
@@ -772,6 +1190,12 @@ def load_trajectory_samples_from_csv(csv_path: str,
         cmd_source=cmd_source_norm,
         cmd_meaning=cmd_meaning,
         off_blocks=find_off_blocks(mode_str),
+        scan_id=csv_scan_id,
+        line_index=csv_line_index,
+        line_label=csv_line_label,
+        scan_field_name="scan_id" if csv_scan_id is not None else None,
+        line_index_field_name="line_index" if csv_line_index is not None else None,
+        line_label_field_name="line_label" if csv_line_label is not None else None,
     )
     return select_samples_by_off_blocks(samples, selection=selection, off_block_start=off_block_start, off_block_end=off_block_end)
 
@@ -933,10 +1357,13 @@ def load_trajectory_samples(rawdata: str,
     arr_enc = conv._read_structured_array_tolerant(db, enc_table)
     arr_alt = conv._read_structured_array_tolerant(db, alt_table)
 
-    t_spec_unsorted, mode_unsorted, time_meta, pos_field = read_spectral_timing_only(conv, db, spec_table_name)
+    t_spec_unsorted, mode_unsorted, time_meta, pos_field, scan_meta = read_spectral_timing_only(conv, db, spec_table_name)
     order = np.argsort(np.asarray(t_spec_unsorted, dtype=float))
     t_spec = np.asarray(t_spec_unsorted, dtype=float)[order]
     mode_str = np.asarray(mode_unsorted, dtype=object)[order]
+    scan_id = None if scan_meta.get("scan_id") is None else np.asarray(scan_meta["scan_id"])[order]
+    line_index = None if scan_meta.get("line_index") is None else np.asarray(scan_meta["line_index"])[order]
+    line_label = None if scan_meta.get("line_label") is None else np.asarray(scan_meta["line_label"], dtype=object)[order]
 
     pointing = conv.normalize_pointing(
         t_spec=t_spec,
@@ -1048,6 +1475,12 @@ def load_trajectory_samples(rawdata: str,
         cmd_source=cmd_source_norm,
         cmd_meaning=cmd_meaning,
         off_blocks=find_off_blocks(mode_str),
+        scan_id=scan_id,
+        line_index=line_index,
+        line_label=line_label,
+        scan_field_name=scan_meta.get("scan_field_name"),
+        line_index_field_name=scan_meta.get("line_index_field_name"),
+        line_label_field_name=scan_meta.get("line_label_field_name"),
     )
     return select_samples_by_off_blocks(samples, selection=selection, off_block_start=off_block_start, off_block_end=off_block_end)
 
@@ -1253,7 +1686,15 @@ def plot_trajectory(samples: TrajectorySamples,
                     arrow_alpha: float = 0.25,
                     arrow_color: str = "black",
                     arrow_width: float = 0.0025,
-                    arrow_length_frac: float = 0.015) -> Tuple[plt.Figure, plt.Axes, Dict[str, Any]]:
+                    arrow_length_frac: float = 0.015,
+                    color_by: str = "none",
+                    color_vmin: Optional[float] = None,
+                    color_vmax: Optional[float] = None,
+                    color_percentile: Optional[float] = None,
+                    color_percentile_mode: str = "central",
+                    color_sign_mode: str = "signed",
+                    speed_window_points: int = 2,
+                    speed_window_mode: str = "secant") -> Tuple[plt.Figure, plt.Axes, Dict[str, Any]]:
     if ax is None:
         fig, ax = plt.subplots(figsize=(8, 6), constrained_layout=True)
     else:
@@ -1264,46 +1705,114 @@ def plot_trajectory(samples: TrajectorySamples,
 
     step = max(int(thin_every), 1)
     idx = slice(None, None, step)
+    color_metric = str(color_by).strip().lower()
+
+    full_on_run_ids = _compute_on_run_ids(samples.mode_str)
+    plot_index = np.arange(int(samples.t_spec.size), dtype=int)[idx]
 
     x_raw = _unwrap_if_needed(np.asarray(samples.x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
     y_raw = np.asarray(samples.y)[idx]
+    t_raw = np.asarray(samples.t_spec, dtype=float)[idx]
     mode = np.asarray(samples.mode_str, dtype=object)[idx]
+    on_run_ids = np.asarray(full_on_run_ids, dtype=int)[idx]
+    scan_group_key_raw, scan_group_source = _select_scan_group_key(samples)
+    if scan_group_key_raw is not None:
+        scan_group_key_raw = np.asarray(scan_group_key_raw, dtype=object)[idx]
 
-    finite = np.isfinite(x_raw) & np.isfinite(y_raw)
+    finite = np.isfinite(x_raw) & np.isfinite(y_raw) & np.isfinite(t_raw)
+
+    cmd_x_raw = None
+    cmd_y_raw = None
+    do_overlay_cmd = bool(samples.cmd_x is not None and samples.cmd_y is not None) if overlay_cmd is None else bool(overlay_cmd)
+    need_cmd_metric = color_metric in ("frame_dx", "frame_dy", "frame_dr")
+    if samples.cmd_x is not None and samples.cmd_y is not None and (do_overlay_cmd or need_cmd_metric):
+        cmd_x_raw = _unwrap_if_needed(np.asarray(samples.cmd_x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
+        cmd_y_raw = np.asarray(samples.cmd_y)[idx]
+        finite = finite & np.isfinite(cmd_x_raw) & np.isfinite(cmd_y_raw)
+
     x_raw = x_raw[finite]
     y_raw = y_raw[finite]
+    t_raw = t_raw[finite]
     mode = mode[finite]
+    on_run_ids = on_run_ids[finite]
+    plot_index = plot_index[finite]
+    if cmd_x_raw is not None and cmd_y_raw is not None:
+        cmd_x_raw = cmd_x_raw[finite]
+        cmd_y_raw = cmd_y_raw[finite]
+    if scan_group_key_raw is not None:
+        scan_group_key_raw = scan_group_key_raw[finite]
 
     x, y, display_meta = _prepare_display_xy(x_raw, y_raw, samples.frame_name, equal_aspect=bool(equal_aspect))
 
-    segments = _make_segments(x, y)
-    masks = _make_mode_masks(mode)
+    drew_direction_arrows = False
+    metric_label = None
+    metric_signed = False
+    n_metric_segments = 0
 
-    for key in ("ON", "OFF", "HOT", "OTHER"):
-        mask = masks[key]
-        if mask.size == 0 or not np.any(mask):
-            continue
-        coll = LineCollection(
-            segments[mask],
-            colors=MODE_COLORS[key],
-            linewidths=float(linewidth),
-            alpha=1.0,
-            label=key,
+    if color_metric == "none":
+        segments = _make_segments(x, y)
+        masks = _make_mode_masks(mode)
+
+        for key in ("ON", "OFF", "HOT", "OTHER"):
+            mask = masks[key]
+            if mask.size == 0 or not np.any(mask):
+                continue
+            coll = LineCollection(
+                segments[mask],
+                colors=MODE_COLORS[key],
+                linewidths=float(linewidth),
+                alpha=1.0,
+                label=key,
+            )
+            ax.add_collection(coll)
+    else:
+        metric_segments, metric_values, metric_label, metric_signed = _compute_colored_on_segments(
+            x=x_raw,
+            y=y_raw,
+            t=t_raw,
+            on_run_ids=on_run_ids,
+            frame_name=samples.frame_name,
+            color_by=color_metric,
+            cmd_x=cmd_x_raw,
+            cmd_y=cmd_y_raw,
+            scan_group_key=scan_group_key_raw,
+            color_sign_mode=color_sign_mode,
+            speed_window_points=speed_window_points,
+            speed_window_mode=speed_window_mode,
         )
-        ax.add_collection(coll)
+        n_metric_segments = int(metric_segments.shape[0])
+        if n_metric_segments > 0:
+            metric_segments_disp = metric_segments.copy()
+            metric_x_flat, metric_y_flat, _ = _prepare_display_xy(
+                metric_segments[:, :, 0].reshape(-1),
+                metric_segments[:, :, 1].reshape(-1),
+                samples.frame_name,
+                equal_aspect=bool(equal_aspect),
+            )
+            metric_segments_disp[:, :, 0] = np.asarray(metric_x_flat, dtype=float).reshape(metric_segments.shape[0], metric_segments.shape[1])
+            metric_segments_disp[:, :, 1] = np.asarray(metric_y_flat, dtype=float).reshape(metric_segments.shape[0], metric_segments.shape[1])
+            metric_norm = _make_metric_norm(metric_values, signed=bool(metric_signed),
+                                            color_vmin=color_vmin, color_vmax=color_vmax,
+                                            color_percentile=color_percentile,
+                                            color_percentile_mode=color_percentile_mode)
+            metric_coll = LineCollection(
+                metric_segments_disp,
+                linewidths=float(linewidth),
+                alpha=1.0,
+                norm=metric_norm,
+            )
+            metric_coll.set_array(np.asarray(metric_values, dtype=float))
+            ax.add_collection(metric_coll)
+            cbar = fig.colorbar(metric_coll, ax=ax)
+            cbar.set_label(metric_label or color_metric)
+        else:
+            ax.text(0.02, 0.98, f"No valid ON segments for color_by={color_metric}", transform=ax.transAxes,
+                    ha="left", va="top")
 
-    do_overlay_cmd = bool(samples.cmd_x is not None and samples.cmd_y is not None) if overlay_cmd is None else bool(overlay_cmd)
-    if do_overlay_cmd:
-        cmd_x_raw = _unwrap_if_needed(np.asarray(samples.cmd_x)[idx], samples.frame_name, samples.x_label.split()[0], unwrap_az)
-        cmd_y_raw = np.asarray(samples.cmd_y)[idx]
-        cmd_finite = np.isfinite(cmd_x_raw) & np.isfinite(cmd_y_raw)
-        cmd_x_raw = cmd_x_raw[cmd_finite]
-        cmd_y_raw = cmd_y_raw[cmd_finite]
-        cmd_mode = np.asarray(samples.mode_str, dtype=object)[idx][cmd_finite]
-        cmd_x = cmd_x_raw
-        cmd_y = cmd_y_raw
+    if do_overlay_cmd and cmd_x_raw is not None and cmd_y_raw is not None:
+        cmd_x, cmd_y, _ = _prepare_display_xy(cmd_x_raw, cmd_y_raw, samples.frame_name, equal_aspect=bool(equal_aspect))
         cmd_segments = _make_segments(cmd_x, cmd_y)
-        cmd_masks = _make_mode_masks(cmd_mode)
+        cmd_masks = _make_mode_masks(mode)
         for key in ("ON", "OFF", "HOT", "OTHER"):
             mask = cmd_masks[key]
             if mask.size == 0 or not np.any(mask):
@@ -1317,12 +1826,16 @@ def plot_trajectory(samples: TrajectorySamples,
             ax.add_collection(coll)
 
     if show_points and x.size > 0:
-        color_arr = [MODE_COLORS[_normalize_segment_mode(m)] for m in mode]
-        ax.scatter(x, y, s=float(point_size), c=color_arr, alpha=0.8, linewidths=0)
+        if color_metric == "none":
+            color_arr = [MODE_COLORS[_normalize_segment_mode(m)] for m in mode]
+            ax.scatter(x, y, s=float(point_size), c=color_arr, alpha=0.8, linewidths=0)
+        else:
+            on_mask = np.asarray([_normalize_segment_mode(m) == "ON" for m in mode], dtype=bool)
+            if np.any(on_mask):
+                ax.scatter(x[on_mask], y[on_mask], s=float(point_size), c="black", alpha=0.4, linewidths=0)
 
-    drew_direction_arrows = False
     arrow_mode_norm = str(arrow_mode).strip().lower()
-    if bool(show_direction_arrows) and x.size >= 2:
+    if bool(show_direction_arrows) and x.size >= 2 and color_metric == "none":
         if arrow_mode_norm == "samples":
             drew_direction_arrows = _draw_direction_arrows_samples(
                 ax,
@@ -1349,7 +1862,7 @@ def plot_trajectory(samples: TrajectorySamples,
     ax.autoscale()
     if bool(display_meta.get("reverse_x")):
         ax.invert_xaxis()
-        
+
     if bool(equal_aspect):
         aspect_ratio = float(display_meta.get("aspect_ratio", 1.0) or 1.0)
         if (not np.isfinite(aspect_ratio)) or (aspect_ratio <= 0.0):
@@ -1360,27 +1873,33 @@ def plot_trajectory(samples: TrajectorySamples,
     ax.grid(True, alpha=0.3)
 
     if title is None:
+        metric_title = "" if color_metric == "none" else f", color_by={color_metric}"
         if samples.t_spec.size > 0:
             title = (
-                f"Trajectory ({samples.frame_name}, source={samples.coord_source}, stream={samples.stream_name})\n"
+                f"Trajectory ({samples.frame_name}, source={samples.coord_source}, stream={samples.stream_name}{metric_title})\n"
                 f"{_format_utc_range_from_unix(samples.t_spec)}"
             )
         else:
-            title = f"Trajectory ({samples.frame_name}, source={samples.coord_source}, stream={samples.stream_name})"
+            title = f"Trajectory ({samples.frame_name}, source={samples.coord_source}, stream={samples.stream_name}{metric_title})"
     ax.set_title(title)
 
     if legend:
-        handles = [
-            Line2D([0], [0], color=MODE_COLORS["ON"], lw=2, label="ON"),
-            Line2D([0], [0], color=MODE_COLORS["OFF"], lw=2, label="OFF"),
-            Line2D([0], [0], color=MODE_COLORS["HOT"], lw=2, label="HOT"),
-            Line2D([0], [0], color=MODE_COLORS["OTHER"], lw=2, label="OTHER"),
-        ]
-        if do_overlay_cmd:
+        handles = []
+        if color_metric == "none":
+            handles.extend([
+                Line2D([0], [0], color=MODE_COLORS["ON"], lw=2, label="ON"),
+                Line2D([0], [0], color=MODE_COLORS["OFF"], lw=2, label="OFF"),
+                Line2D([0], [0], color=MODE_COLORS["HOT"], lw=2, label="HOT"),
+                Line2D([0], [0], color=MODE_COLORS["OTHER"], lw=2, label="OTHER"),
+            ])
+        else:
+            handles.append(Line2D([0], [0], color="black", lw=2, label=f"ON colored ({color_metric})"))
+        if do_overlay_cmd and cmd_x_raw is not None and cmd_y_raw is not None:
             handles.append(Line2D([0], [0], color="black", lw=2, alpha=float(cmd_alpha), label=f"cmd overlay ({samples.cmd_source})"))
         if drew_direction_arrows:
             handles.append(Line2D([0], [0], color=str(arrow_color), lw=1.2, alpha=float(arrow_alpha), label="direction"))
-        ax.legend(handles=handles, loc="best")
+        if handles:
+            ax.legend(handles=handles, loc="best")
 
     meta = {
         "stream_name": samples.stream_name,
@@ -1404,8 +1923,17 @@ def plot_trajectory(samples: TrajectorySamples,
         "display_lat0_deg": display_meta.get("lat0_deg"),
         "display_lon0_deg": display_meta.get("lon0_deg"),
         "display_cos_lat0": display_meta.get("cos_lat0"),
+        "color_by": color_metric,
+        "metric_label": metric_label,
+        "metric_signed": bool(metric_signed),
+        "n_metric_segments": int(n_metric_segments),
+        "scan_group_source": scan_group_source,
+        "scan_field_name": samples.scan_field_name,
+        "line_index_field_name": samples.line_index_field_name,
+        "line_label_field_name": samples.line_label_field_name,
     }
     return fig, ax, meta
+
 
 
 # -----------------------------------------------------------------------------
@@ -1458,6 +1986,22 @@ def parse_args(argv: Optional[Sequence[str]] = None):
     p.add_argument("--arrow-alpha", type=float, default=0.25, help="Alpha for direction arrows")
     p.add_argument("--arrow-width", type=float, default=0.0025, help="Quiver width for direction arrows (axes fraction)")
     p.add_argument("--arrow-length-frac", type=float, default=0.015, help="Arrow length as a fraction of the larger plot span; arrows show direction, not speed")
+    p.add_argument("--color-by", default="none", choices=["none", "frame_dx", "frame_dy", "frame_dr", "frame_vx", "frame_vy", "frame_speed"],
+                   help="Color ON scan segments by frame-space enc-cmd difference or by frame-space encoder speed. Transitions between ON scans are excluded.")
+    p.add_argument("--color-vmin", type=float, default=None,
+                   help="Optional lower bound for the color range. For signed metrics, specifying only one of --color-vmin/--color-vmax makes the range symmetric about zero using the absolute value of the specified bound.")
+    p.add_argument("--color-vmax", type=float, default=None,
+                   help="Optional upper bound for the color range. For signed metrics, specifying only one of --color-vmin/--color-vmax makes the range symmetric about zero using the absolute value of the specified bound.")
+    p.add_argument("--color-percentile", type=float, default=None,
+                   help="Optional percentile-based auto-range for --color-by. For signed metrics, q means ±Pq(|value|). For unsigned metrics, the mode is controlled by --color-percentile-mode. Explicit --color-vmin/--color-vmax override the percentile side(s) they specify.")
+    p.add_argument("--color-percentile-mode", default="central", choices=["central", "zero_upper"],
+                   help="How --color-percentile is interpreted for unsigned metrics: central keeps the central q percent of values using [P((100-q)/2), P(100-(100-q)/2)], while zero_upper uses [0, Pq]. Ignored for signed metrics.")
+    p.add_argument("--color-sign-mode", default="signed", choices=["signed", "abs"],
+                   help="For signed metrics (frame_dx, frame_dy, frame_vx, frame_vy), choose signed values or their absolute values. Unsigned metrics are unchanged.")
+    p.add_argument("--speed-window-points", type=int, default=2,
+                   help="Number of points used for velocity metrics (frame_vx, frame_vy, frame_speed). 2 means per-segment instantaneous velocity; values >2 use a same-ON same-scan local window.")
+    p.add_argument("--speed-window-mode", default="secant", choices=["secant", "component_mean", "magnitude_mean"],
+                   help="How to average velocity metrics when --speed-window-points > 2: secant uses the window endpoints, component_mean averages vx and vy separately, magnitude_mean averages the speed magnitude.")
     p.add_argument("--hide-legend", action="store_true", help="Do not show legend")
     p.add_argument("--title", default=None, help="Optional plot title")
     p.add_argument("--out", default=None, help="Output image path (png/pdf/svg). Default: rawbasename_trajectory_<frame>.png")
@@ -1507,12 +2051,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if (args.rawdata is not None) and (args.from_csv is not None):
         raise SystemExit("use either RAWDATA or --from-csv, not both")
 
+    need_cmd_frame = bool(args.overlay_cmd) or str(args.color_by).strip().lower() in ("frame_dx", "frame_dy", "frame_dr")
+
     if args.from_csv is not None:
         samples = load_trajectory_samples_from_csv(
             csv_path=args.from_csv,
             coord_frame=args.coord_frame,
             coord_source=args.coord_source,
-            overlay_cmd=bool(args.overlay_cmd),
+            overlay_cmd=bool(need_cmd_frame),
             cmd_source=args.cmd_source,
             selection=args.selection,
             off_block_start=args.off_block_start,
@@ -1528,7 +2074,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             db_namespace=args.db_namespace,
             coord_frame=args.coord_frame,
             coord_source=args.coord_source,
-            overlay_cmd=bool(args.overlay_cmd),
+            overlay_cmd=bool(need_cmd_frame),
             cmd_source=args.cmd_source,
             azel_correction_apply=args.azel_correction_apply,
             encoder_time_col=args.encoder_time_col,
@@ -1589,6 +2135,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         arrow_alpha=float(args.arrow_alpha),
         arrow_width=float(args.arrow_width),
         arrow_length_frac=float(args.arrow_length_frac),
+        color_by=str(args.color_by),
+        color_vmin=args.color_vmin,
+        color_vmax=args.color_vmax,
+        color_percentile=args.color_percentile,
+        color_percentile_mode=str(args.color_percentile_mode),
+        color_sign_mode=str(args.color_sign_mode),
+        speed_window_points=int(args.speed_window_points),
+        speed_window_mode=str(args.speed_window_mode),
     )
 
     if do_save:

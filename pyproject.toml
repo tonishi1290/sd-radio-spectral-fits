@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sd-radio-spectral-fits"
-version = "1.2.10" 
+version = "1.2.11" 
 description = "Single-dish radio spectral SDFITS writer"
 readme = "README.md"
 requires-python = ">=3.9"
