@@ -607,6 +607,20 @@ def _window_mask_for_axis(
 
 
 
+def _max_true_run_length(mask: np.ndarray) -> int:
+    """Return the longest consecutive run length of True values in a 1-D boolean mask."""
+    arr = np.asarray(mask, dtype=bool).reshape(-1)
+    if arr.size == 0 or not np.any(arr):
+        return 0
+    padded = np.concatenate(([False], arr, [False]))
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(diff == 1)
+    ends = np.flatnonzero(diff == -1)
+    if starts.size == 0 or ends.size == 0:
+        return 0
+    return int(np.max(ends - starts))
+
+
 def _update_wcs_after_channel_slice(table: pd.DataFrame, meta: dict, data_list: list[np.ndarray], ch_start: Optional[int], ch_stop: Optional[int], sliced_flags: Optional[list[bool]] = None) -> tuple[pd.DataFrame, dict]:
     """
     If run_baseline_fit outputs channel-sliced spectra, update row/header WCS so that
@@ -706,6 +720,8 @@ def run_baseline_fit(
     rest_freq: Optional[float] = None,
     qc_sigma: Optional[float] = None,
     qc_abs_peak_k: Optional[float] = None,
+    qc_abs_peak_scope: str = "qc_window",
+    qc_abs_peak_min_consecutive_channels: int = 1,
     qc_apply_flagrow: bool = False,
     apply: bool = True,
     bsl_overwrite: str = "replace",
@@ -841,6 +857,34 @@ def run_baseline_fit(
     fit_windows_req = subtract_windows(base_windows_req, line_windows_req) if line_windows_req else list(base_windows_req)
     qc_windows_req = fit_windows_req if line_windows_req else list(base_windows_req)
     qc_window_source_default = "baseline_minus_line" if line_windows_req else "baseline"
+    # Policy: qc_sigma always uses the QC window. qc_abs_peak_k can use either
+    # the same QC window or the contiguous span between the outermost QC-window
+    # channels (inclusive). The latter is useful for catching strong signal/spurs
+    # inside the line region while avoiding unrelated band-edge channels.
+    qc_abs_peak_scope_in = str(qc_abs_peak_scope).strip().lower()
+    qc_abs_peak_scope_aliases = {
+        "qc_window": "qc_window",
+        "baseline": "qc_window",
+        "baseline_only": "qc_window",
+        "window": "qc_window",
+        "qc_span": "qc_span",
+        "span": "qc_span",
+        "full_spectrum": "qc_span",
+        "full": "qc_span",
+        "all": "qc_span",
+        "all_finite": "qc_span",
+        "all_finite_channels": "qc_span",
+    }
+    if qc_abs_peak_scope_in not in qc_abs_peak_scope_aliases:
+        raise ValueError(
+            "qc_abs_peak_scope must be one of 'qc_window' or 'qc_span' "
+            "(aliases: 'baseline', 'baseline_only', 'window', 'span'; legacy aliases "
+            "'full_spectrum', 'full', 'all', 'all_finite', 'all_finite_channels' map to 'qc_span')."
+        )
+    qc_abs_peak_scope = qc_abs_peak_scope_aliases[qc_abs_peak_scope_in]
+    qc_abs_peak_min_consecutive_channels = int(qc_abs_peak_min_consecutive_channels)
+    if qc_abs_peak_min_consecutive_channels < 1:
+        raise ValueError("qc_abs_peak_min_consecutive_channels must be >= 1.")
     vcorr_candidate_text = ", ".join(_vcorr_candidate_names(v_corr_col))
     row_column_arrays = _get_column_arrays(
         table,
@@ -853,6 +897,7 @@ def run_baseline_fit(
     axis_cache: Dict[tuple, np.ndarray] = {}
     fit_window_mask_cache: Dict[tuple, np.ndarray] = {}
     qc_window_mask_cache: Dict[tuple, np.ndarray] = {}
+    qc_span_mask_cache: Dict[tuple, np.ndarray] = {}
     axis_finite_cache: Dict[tuple, bool] = {}
     ch_slice = slice(ch_start, ch_stop) if (ch_start is not None or ch_stop is not None) else None
     
@@ -866,6 +911,7 @@ def run_baseline_fit(
     keep_mask = [] # For skipping rows if policy=skip
     qc_gross_scores = []
     qc_abs_peaks_k = []
+    qc_abs_peak_run_lengths = []
     qc_window_sources = []
 
     for i in range(n_rows):
@@ -956,13 +1002,33 @@ def run_baseline_fit(
             else:
                 qc_window_source_i = qc_window_source_default
 
+            qc_span_axis_mask = qc_span_mask_cache.get(axis_key)
+            if qc_span_axis_mask is None:
+                if np.any(qc_axis_window_mask):
+                    _idx = np.flatnonzero(qc_axis_window_mask)
+                    qc_span_axis_mask = np.zeros_like(qc_axis_window_mask, dtype=bool)
+                    qc_span_axis_mask[_idx[0]:_idx[-1] + 1] = True
+                else:
+                    qc_span_axis_mask = np.zeros_like(qc_axis_window_mask, dtype=bool)
+                qc_span_mask_cache[axis_key] = qc_span_axis_mask
+
             finite_spec_mask = np.isfinite(spec)
             qc_window_mask = finite_spec_mask & qc_axis_window_mask
             qc_score_i = diffmad_score(spec, window_mask=qc_window_mask)
-            if np.any(qc_window_mask):
-                _vals = np.asarray(spec[qc_window_mask], dtype=float)
+            if qc_abs_peak_scope == "qc_span":
+                abspeak_mask = finite_spec_mask & qc_span_axis_mask
+            else:
+                abspeak_mask = qc_window_mask
+            qc_abs_peak_runlen_i = 0
+            if np.any(abspeak_mask):
+                _vals = np.asarray(spec[abspeak_mask], dtype=float)
                 _med = float(np.median(_vals))
-                qc_abs_peak_i = float(np.max(np.abs(_vals - _med)))
+                _abs_dev = np.abs(_vals - _med)
+                qc_abs_peak_i = float(np.max(_abs_dev))
+                if qc_abs_peak_k is not None:
+                    _exceed_mask = np.zeros_like(abspeak_mask, dtype=bool)
+                    _exceed_mask[abspeak_mask] = (_abs_dev > float(qc_abs_peak_k))
+                    qc_abs_peak_runlen_i = _max_true_run_length(_exceed_mask)
             else:
                 qc_abs_peak_i = np.nan
 
@@ -991,6 +1057,7 @@ def run_baseline_fit(
             keep_mask.append(True)
             qc_gross_scores.append(qc_score_i)
             qc_abs_peaks_k.append(qc_abs_peak_i)
+            qc_abs_peak_run_lengths.append(int(qc_abs_peak_runlen_i))
             qc_window_sources.append(qc_window_source_i)
 
         except Exception as e:
@@ -1010,6 +1077,7 @@ def run_baseline_fit(
                 sliced_flags.append(did_apply_channel_slice)
                 qc_gross_scores.append(np.nan)
                 qc_abs_peaks_k.append(np.nan)
+                qc_abs_peak_run_lengths.append(0)
                 qc_window_sources.append("error")
                 if policy.mode == "warn":
                     print(f"Warning: Baseline fit failed row {i}, kept original.")
@@ -1027,6 +1095,7 @@ def run_baseline_fit(
             sliced_flags = [f for f, k in zip(sliced_flags, keep_bool) if k]
             qc_gross_scores = [q for q, k in zip(qc_gross_scores, keep_bool) if k]
             qc_abs_peaks_k = [q for q, k in zip(qc_abs_peaks_k, keep_bool) if k]
+            qc_abs_peak_run_lengths = [q for q, k in zip(qc_abs_peak_run_lengths, keep_bool) if k]
             qc_window_sources = [q for q, k in zip(qc_window_sources, keep_bool) if k]
             n_rows = len(table)
 
@@ -1057,6 +1126,7 @@ def run_baseline_fit(
     auto_bad_abs = np.zeros(len(table), dtype=bool)
     qc_gross_scores_arr = np.asarray(qc_gross_scores, dtype=float)
     qc_abs_peaks_arr = np.asarray(qc_abs_peaks_k, dtype=float)
+    qc_abs_peak_runlen_arr = np.asarray(qc_abs_peak_run_lengths, dtype=np.int32)
     qc_auto_bad_count = 0
     qc_auto_bad_diff_count = 0
     qc_auto_bad_abs_count = 0
@@ -1091,7 +1161,12 @@ def run_baseline_fit(
             thresh = float(qc_abs_peak_k)
             if thresh < 0:
                 raise ValueError("qc_abs_peak_k must be >= 0.")
-            auto_bad_abs = np.isfinite(qc_abs_peaks_arr) & (qc_abs_peaks_arr > thresh) & (~existing_bad)
+            auto_bad_abs = (
+                np.isfinite(qc_abs_peaks_arr)
+                & (qc_abs_peaks_arr > thresh)
+                & (qc_abs_peak_runlen_arr >= int(qc_abs_peak_min_consecutive_channels))
+                & (~existing_bad)
+            )
         auto_bad = auto_bad_diff | auto_bad_abs
     qc_auto_bad_count = int(np.count_nonzero(auto_bad))
     qc_auto_bad_diff_count = int(np.count_nonzero(auto_bad_diff))
@@ -1099,6 +1174,7 @@ def run_baseline_fit(
     if qc_enabled:
         table["OTF_GROSS_QC_SCORE"] = qc_gross_scores_arr
         table["OTF_GROSS_QC_ABSPEAK_K"] = qc_abs_peaks_arr
+        table["OTF_GROSS_QC_ABSPEAK_RUNLEN"] = qc_abs_peak_runlen_arr
         if len(qc_window_sources) == len(table):
             table["OTF_QC_WINDOW_SOURCE"] = np.asarray(qc_window_sources, dtype=object)
     if qc_apply_flagrow and np.any(auto_bad):
@@ -1157,6 +1233,8 @@ def run_baseline_fit(
             "rest_freq": None if rest_freq is None else float(rest_freq),
             "qc_sigma": None if qc_sigma is None else float(qc_sigma),
             "qc_abs_peak_k": None if qc_abs_peak_k is None else float(qc_abs_peak_k),
+            "qc_abs_peak_scope": str(qc_abs_peak_scope),
+            "qc_abs_peak_min_consecutive_channels": int(qc_abs_peak_min_consecutive_channels),
             "qc_apply_flagrow": bool(qc_apply_flagrow),
             "apply": bool(apply),
             "bsl_overwrite": str(bsl_overwrite),
@@ -1173,6 +1251,8 @@ def run_baseline_fit(
             "auto_bad_applied": int(qc_applied_bad_count),
             "dropped_flagrow": int(dropped_flagrow),
             "qc_window_source_unique": sorted({str(x) for x in qc_window_sources}),
+            "qc_abs_peak_scope": str(qc_abs_peak_scope),
+            "qc_abs_peak_min_consecutive_channels": int(qc_abs_peak_min_consecutive_channels),
         },
     }
     
@@ -1195,6 +1275,8 @@ def run_baseline_fit(
             f"dropped_flagrow={int(dropped_flagrow)}, "
             f"window_sources={qc_window_unique}, "
             f"qc_abs_peak_k={None if qc_abs_peak_k is None else float(qc_abs_peak_k)}, "
+            f"qc_abs_peak_scope={qc_abs_peak_scope}, "
+            f"qc_abs_peak_min_consecutive_channels={int(qc_abs_peak_min_consecutive_channels)}, "
             f"apply_flagrow={bool(qc_apply_flagrow)}"
         )
     
