@@ -501,8 +501,7 @@ $$
 spur を取りこぼしたくなく、本判定 row 数が増えてもよい場合は、
 
 $$
-T_D = 6
-text{ から } 7
+T_D = 6 \text{ から } 7
 $$
 
 を試す余地があります。
@@ -762,3 +761,767 @@ $$
 という設計になります。
 
 本機能は、狭帯域 spur の本判定を置き換えるものではなく、**その前段に入る軽量な候補選別機能**です。
+
+
+---
+
+## 18. 現行実装と提案仕様の整理
+
+この文書では、内容を次の 2 つに分けて扱う。
+
+### 18.1 現行実装として入っているもの
+
+本チャットでの最新版 `calibrate_updated_2026-04-10_badchan.py` には、少なくとも次が入っている。
+
+- HOT と OFF に対する broad shape QC
+- HOT と OFF に対する狭帯域 spur QC
+- 必要なら ON に対する狭帯域 spur QC
+- `bad_channels` による全体共通の fixed bad channel 指定
+- `bad_channel_ranges` による全体共通の fixed bad channel range 指定
+- `bad_channel_map` による group ごとの fixed bad channel 指定
+- `bad_channel_policy="nan"`
+- `bad_channel_policy="interp_linear"`
+- QC 計算時に fixed bad channel を除外する処理
+- 較正計算時に fixed bad channel を `NaN` または補間値で扱う処理
+
+### 18.2 現時点では提案仕様のもの
+
+次は、現時点では提案仕様として扱う。
+
+- `qc_spur_consider_on=True` のときの ON 事前選別機能
+- その事前選別の指標としての $Q_D$
+- ON row の一部だけに rolling median ベース本判定を行う高速化
+
+したがって、読み分けは次のようにする。
+
+- Section 1 から Section 17 までは、主に ON 事前選別の提案仕様
+- Section 18 以降は、現行実装に入っている fixed bad channel 機能と、その運用指針の追記
+
+---
+
+## 19. fixed bad channel 問題の整理
+
+### 19.1 背景
+
+常に同じ raw channel で大きな spur が出る場合、それは row 全体の異常ではなく、特定 channel の恒常的不良である可能性が高い。
+
+raw channel index を $k$、時刻または dump index を $t$、受信系ごとの group を $g$ とする。
+
+各 state の raw spectrum を
+
+$$
+S_{\mathrm{ON}}(k,t), \quad S_{\mathrm{OFF}}(k,t), \quad S_{\mathrm{HOT}}(k,t)
+$$
+
+とする。
+
+fixed bad channel 集合を
+
+$$
+K_{\mathrm{bad}}(g)
+$$
+
+とする。
+
+このとき、問題は
+
+$$
+k \in K_{\mathrm{bad}}(g)
+$$
+
+である channel が常に不良、ということである。
+
+### 19.2 row QC と channel 処理の違い
+
+row QC は、「その row 全体が使えないかどうか」を決める処理である。
+
+一方、fixed bad channel は「その row の一部 channel だけが不良」である。
+
+したがって、fixed bad channel に対して row 全体を `FLAGROW` で落とし続けるのは損失が大きい。
+
+このため、fixed bad channel は row QC とは分離し、channel-level 処理として扱う。
+
+---
+
+## 20. `bad_channels` / `bad_channel_ranges` / `bad_channel_map`
+
+### 20.1 全体共通指定
+
+全 group 共通で bad とみなす raw channel は、次で指定する。
+
+```python
+bad_channels: Optional[Sequence[int]] = None
+bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None
+```
+
+例:
+
+```python
+bad_channels = [1536, 3072]
+bad_channel_ranges = [(2048, 2050)]
+```
+
+ここで `bad_channel_ranges` の `(start, stop)` は、両端を含む inclusive range とする。
+
+### 20.2 group 別指定
+
+group ごとに異なる fixed bad channel を指定したい場合は、次を使う。
+
+```python
+bad_channel_key_columns = ("FDNUM", "IFNUM", "PLNUM")
+bad_channel_map = {
+    (2, 0, 0): [1536],
+    (3, 0, 1): [1536, (2048, 2050)],
+}
+```
+
+ここで key tuple の意味は `bad_channel_key_columns` で決まる。
+
+既定では
+
+$$
+g = (\mathrm{FDNUM}, \mathrm{IFNUM}, \mathrm{PLNUM})
+$$
+
+である。
+
+### 20.3 global と group の合成
+
+ある group $g$ に対する最終 bad channel 集合は、global 設定と map 設定の和集合とする。
+
+$$
+K_{\mathrm{bad}}(g) = K_{\mathrm{global}} \cup K_{\mathrm{map}}(g)
+$$
+
+つまり `bad_channel_map` は global 指定を打ち消すものではなく、加算的に追加するものである。
+
+---
+
+## 21. channel index の定義
+
+`bad_channels`、`bad_channel_ranges`、`bad_channel_map` は、すべて **元の raw spectrum の channel index** で指定する。
+
+これは重要である。
+
+- `ch_range` で切り出した後の local index ではない
+- `vlsrk_range_kms` で切り出した後の local index ではない
+- backend native の raw channel index を使う
+
+内部では、選択後の local channel index へ変換する。
+
+切り出し開始 channel を $k_0$ とすると、local index は
+
+$$
+k_{\mathrm{local}} = k_{\mathrm{raw}} - k_0
+$$
+
+である。
+
+もし指定した raw channel が現在の切り出し範囲外なら、その channel は単に無視する。
+
+---
+
+## 22. 処理フローにおける位置づけ
+
+現行実装では、まず `ch_range` や `vlsrk_range_kms` に従って `on2_arr`、`off2_arr`、`hot2_arr` を作り、その後に fixed bad channel 処理を適用する。
+
+流れは次の通りである。
+
+1. `on2_arr`、`off2_arr`、`hot2_arr` を作る
+2. group ごとに local bad channel 集合を解決する
+3. QC 用配列では fixed bad channel を除外する
+4. 較正用配列では `bad_channel_policy` に従って `NaN` 化または補間する
+5. その後に broad shape QC、狭帯域 spur QC、平均、時間内挿、gain 計算、較正へ進む
+
+したがって、fixed bad channel は
+
+- QC を誤作動させない
+- かつ較正本体も汚さない
+
+という 2 つの役割を同時に持つ。
+
+---
+
+## 23. QC 計算での扱い
+
+fixed bad channel は、spur row 判定や shape QC の対象ではない。
+
+したがって、QC の統計量は
+
+$$
+k \notin K_{\mathrm{bad}}(g)
+$$
+
+の channel だけで計算する。
+
+たとえば residual を
+
+$$
+R(k) = S(k) - B(k)
+$$
+
+と定義し、robust scale を
+
+$$
+\sigma_R = 1.4826 \, \mathrm{MAD}(R)
+$$
+
+と定義するときも、`MAD` や最大値の計算には fixed bad channel を含めない。
+
+これにより、同じ channel の恒常 spur が毎回 HOT/OFF row を自動 flag してしまうことを防ぐ。
+
+---
+
+## 24. `bad_channel_policy="nan"`
+
+### 24.1 定義
+
+既定の policy は `"nan"` とする。
+
+このとき、較正用のスペクトルは
+
+$$
+S'(k,t) =
+\begin{cases}
+\mathrm{NaN} & k \in K_{\mathrm{bad}}(g) \\
+S(k,t) & \text{otherwise}
+\end{cases}
+$$
+
+として扱う。
+
+### 24.2 目的
+
+- fixed bad channel を gain 計算から除外する
+- 情報を勝手に作らない
+- 後段で bad channel が明示的に分かるようにする
+
+### 24.3 特徴
+
+- 最も安全
+- 科学解析の標準として自然
+- ただし見た目は不連続になりやすい
+
+---
+
+## 25. `bad_channel_policy="interp_linear"`
+
+### 25.1 目的
+
+`interp_linear` は、fixed bad channel を隣接 channel の値から 1 次元線形補間で埋める mode である。
+
+この mode の狙いは、
+
+- 見た目の連続性を改善する
+- 1 ch から数 ch の固定 spur による不自然な穴を減らす
+- ただし interpolation は最小限に抑える
+
+ことである。
+
+### 25.2 補間の基本式
+
+連続 bad 区間が
+
+$$
+[k_1, k_2]
+$$
+
+であり、両端の有効 channel が $k_L$ と $k_R$ で、それぞれの値が $S(k_L)$、$S(k_R)$ であるとする。
+
+このとき、$k_1 \le k \le k_2$ に対して
+
+$$
+S'(k) = S(k_L) + \frac{k - k_L}{k_R - k_L} \left( S(k_R) - S(k_L) \right)
+$$
+
+で埋める。
+
+1 ch の bad channel $k_0$ なら、これは
+
+$$
+S'(k_0) = \frac{S(k_0-1) + S(k_0+1)}{2}
+$$
+
+に一致する。
+
+### 25.3 補間の条件
+
+補間は次の条件を満たすときだけ行う。
+
+- 連続 bad channel 数が `bad_channel_interp_max_consecutive_channels` 以下
+- 左右に少なくとも 1 点ずつ有効 channel がある
+- 区間が spectrum の edge に接していない
+
+それ以外は補間せず、その区間は `NaN` のままとする。
+
+### 25.4 なぜ edge を埋めないか
+
+edge では片側の情報しかないため、線形補間ではなく外挿になる。外挿はより不確実で、勝手に構造を作りやすい。
+
+したがって、最小仕様では edge は埋めない。
+
+### 25.5 適用上の注意
+
+`interp_linear` は便利だが、補間値は観測値ではない。したがって、狭い本物の線が bad channel 上にあった場合、その構造は失われる。
+
+このため、科学解析の標準は依然として `"nan"` が安全である。
+
+一方、
+
+- quicklook
+- 図示
+- baseline の見た目の安定化
+- 1 ch 固定 spur が明らかな場合
+
+には `interp_linear` が有用である。
+
+---
+
+## 26. `FLAGROW` との役割分担
+
+fixed bad channel は channel-level の問題であり、それ自体では row 全体を bad にする理由ではない。
+
+したがって、固定 bad channel 自体では `FLAGROW` を立てない。
+
+役割分担は次の通りである。
+
+- fixed bad channel は `bad_channels` / `bad_channel_map` で扱う
+- row 全体の異常は broad shape QC や狭帯域 spur QC で扱う
+- `FLAGROW` は後者に対して使う
+
+この分離が重要である。
+
+---
+
+## 27. 出力列と記録
+
+最新実装では、fixed bad channel 関連の情報として、少なくとも次の列を出力できる。
+
+- `BADCHAN_POLICY`
+- `BADCHAN_N_GLOBAL`
+- `BADCHAN_N_GROUP`
+- `BADCHAN_N_TOTAL`
+- `BADCHAN_INTERP_APPLIED`
+- `BADCHAN_INTERP_NFILLED`
+- `BADCHAN_HAS_EDGE_UNFILLED`
+
+意味は次の通りである。
+
+- `BADCHAN_POLICY`
+  - `nan` か `interp_linear`
+- `BADCHAN_N_GLOBAL`
+  - global 設定に由来する bad channel 数
+- `BADCHAN_N_GROUP`
+  - map 設定に由来する bad channel 数
+- `BADCHAN_N_TOTAL`
+  - 実際にその row へ適用された総 bad channel 数
+- `BADCHAN_INTERP_APPLIED`
+  - 補間が 1 箇所以上実際に行われたか
+- `BADCHAN_INTERP_NFILLED`
+  - 補間で埋めた channel 数
+- `BADCHAN_HAS_EDGE_UNFILLED`
+  - edge に接していて埋められなかった bad channel があるか
+
+また、狭帯域 spur QC 側では引き続き
+
+- `QC_REF_HOT_AUTO_BAD`
+- `QC_REF_OFF_AUTO_BAD`
+- `QC_REF_HOT_SHAPE_AUTO_BAD`
+- `QC_REF_OFF_SHAPE_AUTO_BAD`
+- `QC_REF_HOT_SPUR_AUTO_BAD`
+- `QC_REF_OFF_SPUR_AUTO_BAD`
+- `QC_ON_SPUR_AUTO_BAD`
+- `QC_SIGMA`
+- `QC_SPUR_SIGMA`
+- `QC_SPUR_WINDOW_CH`
+- `QC_SPUR_MAXRUN`
+- `QC_SPUR_CONSIDER_ON`
+- `QC_APPLY_FLAGROW`
+
+などが記録される。
+
+したがって、fixed bad channel と row QC の両方を出力 table 上で追跡できる。
+
+---
+
+## 28. 銀河中心のように広い emission がある場合の考え方
+
+### 28.1 ON に対する注意
+
+銀河中心や line-rich source では、ON に本物の広い emission や複雑な line structure がある。このため、`qc_spur_consider_on=True` のときは、ON の本物の線構造が spur 候補として本判定に送られやすくなる。
+
+したがって、line-rich source では原則として
+
+```python
+qc_spur_consider_on = False
+```
+
+を基本にする方が安全である。
+
+### 28.2 HOT が大量に flag される場合
+
+HOT が大量に flag される場合、原因は 2 つに分かれる。
+
+1. HOT row 自体に本当に row-level の異常が多い
+2. 同じ raw channel の固定 spur が毎回 QC を発火させている
+
+後者なら、問題の本質は row 異常ではなく fixed bad channel である。
+
+この場合は `qc_spur_sigma` の調整で粘るより、まず `bad_channels` あるいは `bad_channel_map` でその channel を明示的に指定すべきである。
+
+---
+
+## 29. 推奨設定
+
+ここでは、現行実装の狭帯域 spur QC と fixed bad channel 機能を、実データでどのように使い始めるかを、なるべく豊富に整理する。
+
+### 29.1 まずの基本方針
+
+最初に大事なのは次の 3 点である。
+
+1. `qc_spur_consider_on` は最初は `False`
+2. fixed bad channel が分かっているなら先に `bad_channels` へ入れる
+3. `qc_apply_flagrow` は最初は `False`
+
+つまり、最初は「件数と挙動を見るだけ」にする。
+
+### 29.2 最小の標準設定
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    qc_spur_consider_on=False,
+    qc_apply_flagrow=False,
+)
+```
+
+この設定は、
+
+- HOT/OFF の broad shape QC
+- HOT/OFF の狭帯域 spur QC
+- ON は見ない
+- まず report 的に挙動を見る
+
+という意味で、最初の出発点として無難である。
+
+### 29.3 fixed 1 ch spur が既知の場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    bad_channels=[1536],
+    bad_channel_policy="nan",
+    qc_spur_consider_on=False,
+    qc_apply_flagrow=False,
+)
+```
+
+この設定では、raw channel 1536 を全 group 共通で bad channel として扱う。
+
+科学解析の標準としては、まず `bad_channel_policy="nan"` を推奨する。
+
+### 29.4 fixed 1 ch spur を補間したい場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    bad_channels=[1536],
+    bad_channel_policy="interp_linear",
+    bad_channel_interp_max_consecutive_channels=1,
+    qc_spur_consider_on=False,
+    qc_apply_flagrow=False,
+)
+```
+
+1 ch 固定 spur なら、この設定はかなり使いやすい。
+
+### 29.5 2 ch から 3 ch の固定 spur が既知の場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    bad_channel_ranges=[(1536, 1538)],
+    bad_channel_policy="interp_linear",
+    bad_channel_interp_max_consecutive_channels=3,
+    qc_spur_consider_on=False,
+    qc_apply_flagrow=False,
+)
+```
+
+この場合、連続長 3 ch までなら線形補間で埋める。
+
+### 29.6 group ごとに異なる固定 spur がある場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    bad_channel_key_columns=("FDNUM", "IFNUM", "PLNUM"),
+    bad_channel_map={
+        (2, 0, 0): [1536],
+        (3, 0, 1): [1536, (2048, 2050)],
+    },
+    bad_channel_policy="nan",
+    qc_spur_consider_on=False,
+    qc_apply_flagrow=False,
+)
+```
+
+複数ビーム、複数 IF、複数偏波で channel 不良位置が違う場合は、この形が最も自然である。
+
+### 29.7 global と group を併用する場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    bad_channels=[1536],
+    bad_channel_map={
+        (3, 0, 1): [(2048, 2050)],
+    },
+    bad_channel_policy="nan",
+    qc_spur_consider_on=False,
+    qc_apply_flagrow=False,
+)
+```
+
+この場合、
+
+- 全 group で ch 1536 を除外
+- さらに特定 group だけ 2048 から 2050 を除外
+
+となる。
+
+### 29.8 銀河中心のように line-rich な source
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    qc_spur_consider_on=False,
+    bad_channel_map={
+        (2, 0, 0): [1536],
+    },
+    bad_channel_policy="nan",
+    qc_apply_flagrow=True,
+)
+```
+
+この場合の考え方は次の通りである。
+
+- ON は本物の line structure が多いので見ない
+- HOT/OFF の row QC は使う
+- fixed bad channel は map で除外する
+- row 全体を落とすのは本当に row-level に異常がある場合だけにする
+
+### 29.9 できるだけ安全側に始める場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.5,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=2,
+    qc_spur_consider_on=False,
+    bad_channel_policy="nan",
+    qc_apply_flagrow=False,
+)
+```
+
+特徴は、
+
+- 狭帯域 spur 判定をやや保守的にする
+- 1 ch から 2 ch の鋭いもの寄りにする
+- 最初は何も自動で落とさない
+
+である。
+
+### 29.10 1 ch spur を重点的に見たい場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.5,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=1,
+    qc_spur_consider_on=False,
+    bad_channel_policy="nan",
+    qc_apply_flagrow=False,
+)
+```
+
+### 29.11 2 ch から 3 ch spur も積極的に見たい場合
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=6.5,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    qc_spur_consider_on=False,
+    bad_channel_policy="nan",
+    qc_apply_flagrow=False,
+)
+```
+
+この設定では、弱めの狭帯域 spur も拾いやすくなるが、候補は増えやすい。
+
+### 29.12 ON も見たいが最初は report only にしたい場合
+
+現行実装には `report only` 専用スイッチはないため、最初は `qc_apply_flagrow=False` で見るのが安全である。
+
+```python
+sc_cal = cal.run_tastar_calibration(
+    input_data=sc_raw,
+    qc_sigma=5.0,
+    qc_spur_sigma=7.0,
+    qc_spur_window_channels=31,
+    qc_spur_max_consecutive_channels=3,
+    qc_spur_consider_on=True,
+    bad_channel_policy="nan",
+    qc_apply_flagrow=False,
+)
+```
+
+ただし line-rich source では、やはり `qc_spur_consider_on=False` を推奨する。
+
+### 29.13 ON 事前選別を将来使う場合の推奨
+
+Section 1 から Section 17 の提案仕様が将来実装された場合、最初の推奨は次である。
+
+- ON pre-screen の内部しきい値は $T_D = 8$
+- `qc_spur_sigma = 7.0`
+- `qc_spur_window_channels = 31`
+- `qc_spur_max_consecutive_channels = 3`
+- 最初は `qc_apply_flagrow = False`
+
+ただし、これも line-rich source では注意が必要である。
+
+### 29.14 `nan` と `interp_linear` の使い分け
+
+#### 科学解析の標準
+
+```python
+bad_channel_policy = "nan"
+```
+
+を推奨する。
+
+#### quicklook や見た目重視
+
+```python
+bad_channel_policy = "interp_linear"
+bad_channel_interp_max_consecutive_channels = 1
+```
+
+から始めるのがよい。
+
+#### 連続 2 ch から 3 ch の固定不良も埋めたい
+
+```python
+bad_channel_policy = "interp_linear"
+bad_channel_interp_max_consecutive_channels = 3
+```
+
+とする。
+
+ただし、長い bad 区間や edge に接する bad 区間は、原理的に不確かさが大きいので、無理に埋めない方が安全である。
+
+---
+
+## 30. 実務上の推奨手順
+
+現実の運用では、次の順で進めるのが分かりやすい。
+
+### Step 1
+
+まず fixed bad channel を known issue として入れる。
+
+- 全 group 共通なら `bad_channels`
+- group 別なら `bad_channel_map`
+
+### Step 2
+
+最初は
+
+```python
+qc_apply_flagrow = False
+```
+
+で走らせる。
+
+### Step 3
+
+出力 table の
+
+- `BADCHAN_*`
+- `QC_REF_HOT_*`
+- `QC_REF_OFF_*`
+- 必要なら `QC_ON_SPUR_*`
+
+を確認する。
+
+### Step 4
+
+fixed bad channel を入れてもなお HOT/OFF が大量に bad なら、その時点で初めて `qc_spur_sigma` や `qc_sigma` を調整する。
+
+### Step 5
+
+挙動に納得してから
+
+```python
+qc_apply_flagrow = True
+```
+
+へ進む。
+
+この順にすると、
+
+- fixed bad channel と row 異常を混同しにくい
+- 何が効いたのかが見えやすい
+- いきなり良い row を大量に捨てる事故を減らせる
+
+---
+
+## 31. まとめ
+
+この文書の更新後の要点は次の通りである。
+
+1. ON 事前選別は依然として提案仕様である
+2. 現行実装には、fixed bad channel を扱う `bad_channels`、`bad_channel_ranges`、`bad_channel_map` が入っている
+3. fixed bad channel は row 異常ではなく channel-level 異常である
+4. したがって、fixed bad channel 自体では `FLAGROW` を立てない
+5. QC 計算では fixed bad channel を除外する
+6. 較正計算では `bad_channel_policy` に従って `NaN` または補間で扱う
+7. 科学解析の標準は `bad_channel_policy="nan"`
+8. quicklook や見た目重視では `bad_channel_policy="interp_linear"` が有用である
+9. line-rich source では原則 `qc_spur_consider_on=False` が安全である
+10. fixed bad channel が既知なら、まず `bad_channels` または `bad_channel_map` を入れてから row QC を調整するべきである

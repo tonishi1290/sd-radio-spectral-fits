@@ -475,6 +475,247 @@ def _narrow_spur_qc_rows(
 
     return auto_bad, score, abspeak, runlen
 
+
+
+def _normalize_external_key_value(value: Any) -> Any:
+    if value is None:
+        return _CAL_KEY_MISSING
+    if isinstance(value, str):
+        if value.strip() == '':
+            return _CAL_KEY_MISSING
+        return value
+    try:
+        if bool(pd.isna(value)):
+            return _CAL_KEY_MISSING
+    except Exception:
+        pass
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _normalize_external_key_tuple(key: Any, key_cols: Sequence[str]) -> tuple[Any, ...]:
+    if not key_cols:
+        return tuple()
+    raw = key if isinstance(key, tuple) else (key,)
+    if len(raw) != len(key_cols):
+        raise ValueError(
+            f"bad_channel_map key length mismatch: expected {len(key_cols)} values for {list(key_cols)}, got {len(raw)} in {key!r}"
+        )
+    return tuple(_normalize_external_key_value(v) for v in raw)
+
+
+def _expand_bad_channel_items(items: Any) -> set[int]:
+    out: set[int] = set()
+    if items is None:
+        return out
+    if isinstance(items, (int, np.integer)):
+        out.add(int(items))
+        return out
+    if isinstance(items, tuple) and len(items) == 2:
+        start = int(items[0])
+        stop = int(items[1])
+        if stop < start:
+            start, stop = stop, start
+        out.update(range(start, stop + 1))
+        return out
+    for item in items:
+        if isinstance(item, (int, np.integer)):
+            out.add(int(item))
+        elif isinstance(item, tuple) and len(item) == 2:
+            start = int(item[0])
+            stop = int(item[1])
+            if stop < start:
+                start, stop = stop, start
+            out.update(range(start, stop + 1))
+        else:
+            raise ValueError(
+                "bad channel entries must be int channel indices or inclusive (start, stop) tuples."
+            )
+    return out
+
+
+def _resolve_global_bad_channels(
+    bad_channels: Sequence[int] | None,
+    bad_channel_ranges: Sequence[tuple[int, int]] | None,
+) -> set[int]:
+    out: set[int] = set()
+    out.update(_expand_bad_channel_items(bad_channels))
+    out.update(_expand_bad_channel_items(bad_channel_ranges))
+    return out
+
+
+def _normalize_bad_channel_map(
+    bad_channel_map: Any,
+    key_cols: Sequence[str],
+) -> dict[tuple[Any, ...], set[int]]:
+    out: dict[tuple[Any, ...], set[int]] = {}
+    if bad_channel_map is None:
+        return out
+    if not isinstance(bad_channel_map, dict):
+        raise ValueError("bad_channel_map must be a dict mapping group keys to channel specs.")
+    for raw_key, raw_value in bad_channel_map.items():
+        norm_key = _normalize_external_key_tuple(raw_key, key_cols)
+        chan_set = _expand_bad_channel_items(raw_value)
+        if norm_key in out:
+            out[norm_key].update(chan_set)
+        else:
+            out[norm_key] = set(chan_set)
+    return out
+
+
+def _raw_bad_channels_to_local_indices(raw_channels: set[int], ch_start: int, ch_stop: int) -> np.ndarray:
+    if not raw_channels:
+        return np.empty(0, dtype=int)
+    local = sorted(int(ch - ch_start) for ch in raw_channels if int(ch) >= int(ch_start) and int(ch) < int(ch_stop))
+    if not local:
+        return np.empty(0, dtype=int)
+    return np.asarray(local, dtype=int)
+
+
+def _apply_nan_to_local_channels(data: np.ndarray, local_bad_idx: np.ndarray) -> np.ndarray:
+    out = np.array(data, dtype=float, copy=True)
+    if out.ndim != 2:
+        raise ValueError(f"spectra must be 2-D, got shape={out.shape}")
+    if local_bad_idx.size > 0:
+        out[:, local_bad_idx] = np.nan
+    return out
+
+
+def _iter_true_runs(mask: np.ndarray):
+    arr = np.asarray(mask, dtype=bool).reshape(-1)
+    if arr.size == 0:
+        return
+    padded = np.concatenate(([False], arr, [False]))
+    diff = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(diff == 1)
+    ends = np.flatnonzero(diff == -1)
+    for s, e in zip(starts, ends):
+        yield int(s), int(e - 1)
+
+
+def _interp_linear_fill_bad_channels_1d(
+    spec: np.ndarray,
+    local_bad_idx: np.ndarray,
+    *,
+    max_consecutive_channels: int,
+) -> tuple[np.ndarray, bool, int, bool]:
+    arr = np.asarray(spec, dtype=float).copy()
+    if arr.ndim != 1:
+        raise ValueError(f"spectrum must be 1-D, got shape={arr.shape}")
+    if local_bad_idx.size == 0:
+        return arr, False, 0, False
+
+    nchan = arr.size
+    bad = np.zeros(nchan, dtype=bool)
+    bad_idx = local_bad_idx[(local_bad_idx >= 0) & (local_bad_idx < nchan)]
+    if bad_idx.size == 0:
+        return arr, False, 0, False
+
+    bad[bad_idx] = True
+    arr[bad] = np.nan
+
+    interp_applied = False
+    nfilled = 0
+    has_edge_unfilled = False
+
+    for start, stop in _iter_true_runs(bad):
+        run_len = stop - start + 1
+        left = start - 1
+        right = stop + 1
+        left_ok = (left >= 0) and np.isfinite(arr[left])
+        right_ok = (right < nchan) and np.isfinite(arr[right])
+
+        if run_len > int(max_consecutive_channels) or (not left_ok) or (not right_ok):
+            has_edge_unfilled = True
+            continue
+
+        x = np.array([left, right], dtype=float)
+        y = np.array([arr[left], arr[right]], dtype=float)
+        xi = np.arange(start, stop + 1, dtype=float)
+        arr[start:stop + 1] = np.interp(xi, x, y)
+        interp_applied = True
+        nfilled += run_len
+
+    return arr, interp_applied, int(nfilled), bool(has_edge_unfilled)
+
+
+def _apply_bad_channel_policy_to_state(
+    spectra: np.ndarray,
+    mapping_state: pd.DataFrame,
+    *,
+    key_cols: Sequence[str],
+    global_bad_channels_raw: set[int],
+    bad_channel_map_norm: dict[tuple[Any, ...], set[int]],
+    ch_start: int,
+    ch_stop: int,
+    bad_channel_policy: str,
+    bad_channel_interp_max_consecutive_channels: int,
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], set[tuple[Any, ...]]]:
+    data_qc = np.array(spectra, dtype=float, copy=True)
+    data_cal = np.array(spectra, dtype=float, copy=True)
+    if data_qc.ndim != 2:
+        raise ValueError(f"spectra must be 2-D, got shape={data_qc.shape}")
+
+    nrow = data_qc.shape[0]
+    n_global = np.zeros(nrow, dtype=np.int32)
+    n_group = np.zeros(nrow, dtype=np.int32)
+    n_total = np.zeros(nrow, dtype=np.int32)
+    interp_applied = np.zeros(nrow, dtype=bool)
+    interp_nfilled = np.zeros(nrow, dtype=np.int32)
+    has_edge_unfilled = np.zeros(nrow, dtype=bool)
+
+    used_map_keys: set[tuple[Any, ...]] = set()
+    group_map = _group_index_map_by_key(mapping_state, key_cols)
+    global_local_idx = _raw_bad_channels_to_local_indices(global_bad_channels_raw, ch_start, ch_stop)
+
+    for key, idxs in group_map.items():
+        idxs = np.asarray(idxs, dtype=int)
+        group_bad_raw = bad_channel_map_norm.get(key, set())
+        if key in bad_channel_map_norm:
+            used_map_keys.add(key)
+        group_local_idx = _raw_bad_channels_to_local_indices(group_bad_raw, ch_start, ch_stop)
+        if global_local_idx.size and group_local_idx.size:
+            total_local_idx = np.unique(np.concatenate((global_local_idx, group_local_idx))).astype(int)
+        elif global_local_idx.size:
+            total_local_idx = global_local_idx.copy()
+        elif group_local_idx.size:
+            total_local_idx = group_local_idx.copy()
+        else:
+            total_local_idx = np.empty(0, dtype=int)
+
+        n_global[idxs] = int(global_local_idx.size)
+        n_group[idxs] = int(group_local_idx.size)
+        n_total[idxs] = int(total_local_idx.size)
+
+        if total_local_idx.size == 0:
+            continue
+
+        data_qc[np.ix_(idxs, total_local_idx)] = np.nan
+        data_cal[np.ix_(idxs, total_local_idx)] = np.nan
+
+        if bad_channel_policy == "interp_linear":
+            for ridx in idxs:
+                filled, applied, nfill, edge_unfilled = _interp_linear_fill_bad_channels_1d(
+                    data_cal[ridx],
+                    total_local_idx,
+                    max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
+                )
+                data_cal[ridx] = filled
+                interp_applied[ridx] = bool(applied)
+                interp_nfilled[ridx] = int(nfill)
+                has_edge_unfilled[ridx] = bool(edge_unfilled)
+
+    info = {
+        "n_global": n_global,
+        "n_group": n_group,
+        "n_total": n_total,
+        "interp_applied": interp_applied,
+        "interp_nfilled": interp_nfilled,
+        "has_edge_unfilled": has_edge_unfilled,
+    }
+    return data_qc, data_cal, info, used_map_keys
+
 def _resolve_existing_columns_ci(table: pd.DataFrame, preferred: Sequence[str]) -> list[str]:
     actual_by_upper: dict[str, str] = {}
     for col in table.columns:
@@ -559,6 +800,13 @@ def make_tastar_dumps(
     qc_spur_window_channels: int = 31,           # rolling-median window [channels] for spur QC
     qc_spur_max_consecutive_channels: int = 3,   # maximum consecutive channels treated as narrow spur
     qc_spur_consider_on: bool = False,           # whether to also evaluate ON rows by the same spur QC
+    bad_channels: Optional[Sequence[int]] = None,
+    bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None,
+    bad_channel_key_columns: Sequence[str] = ("FDNUM", "IFNUM", "PLNUM"),
+    bad_channel_map: Optional[dict[tuple, Sequence[Union[int, Tuple[int, int]]]]] = None,
+    bad_channel_policy: str = "nan",
+    bad_channel_interp_max_consecutive_channels: int = 3,
+    bad_channel_interp_min_valid_neighbors: int = 1,
     qc_apply_flagrow: bool = False,              # Whether to reflect auto QC into FLAGROW
     verbose: bool = True,                         # ログ出力フラグ
     # -----------------------------------------------------
@@ -588,6 +836,14 @@ def make_tastar_dumps(
             f"Invalid gain_mode: {gain_mode!r}. Must be 'hybrid' or 'independent'."
         )
 
+
+    bad_channel_policy_norm = str(bad_channel_policy or "nan").strip().lower()
+    if bad_channel_policy_norm not in ("nan", "interp_linear"):
+        raise ValueError("bad_channel_policy must be 'nan' or 'interp_linear'.")
+    if int(bad_channel_interp_max_consecutive_channels) < 1:
+        raise ValueError("bad_channel_interp_max_consecutive_channels must be >= 1.")
+    if int(bad_channel_interp_min_valid_neighbors) != 1:
+        raise ValueError("bad_channel_interp_min_valid_neighbors currently supports only 1.")
 
     v_corr_col_norm = str(v_corr_col or "VFRAME").strip().upper()
 
@@ -897,6 +1153,52 @@ def make_tastar_dumps(
 
     ref_group_cols = _resolve_existing_columns_ci(mapping_all, ["FDNUM", "IFNUM", "PLNUM", "BACKEND", "MOLECULE"])
 
+    bad_channel_group_cols = _resolve_existing_columns_ci(mapping_all, list(bad_channel_key_columns))
+    global_bad_channels_raw = _resolve_global_bad_channels(bad_channels, bad_channel_ranges)
+    bad_channel_map_norm = _normalize_bad_channel_map(bad_channel_map, list(bad_channel_key_columns))
+
+    on2_qc, on2_use, on_bad_info, on_bad_used_keys = _apply_bad_channel_policy_to_state(
+        on2_arr,
+        mapping_on,
+        key_cols=bad_channel_group_cols,
+        global_bad_channels_raw=global_bad_channels_raw,
+        bad_channel_map_norm=bad_channel_map_norm,
+        ch_start=ch_start,
+        ch_stop=ch_stop,
+        bad_channel_policy=bad_channel_policy_norm,
+        bad_channel_interp_max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
+    )
+    off2_qc, off2_use, off_bad_info, off_bad_used_keys = _apply_bad_channel_policy_to_state(
+        off2_arr,
+        mapping_off,
+        key_cols=bad_channel_group_cols,
+        global_bad_channels_raw=global_bad_channels_raw,
+        bad_channel_map_norm=bad_channel_map_norm,
+        ch_start=ch_start,
+        ch_stop=ch_stop,
+        bad_channel_policy=bad_channel_policy_norm,
+        bad_channel_interp_max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
+    )
+    hot2_qc, hot2_use, hot_bad_info, hot_bad_used_keys = _apply_bad_channel_policy_to_state(
+        hot2_arr,
+        mapping_hot,
+        key_cols=bad_channel_group_cols,
+        global_bad_channels_raw=global_bad_channels_raw,
+        bad_channel_map_norm=bad_channel_map_norm,
+        ch_start=ch_start,
+        ch_stop=ch_stop,
+        bad_channel_policy=bad_channel_policy_norm,
+        bad_channel_interp_max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
+    )
+
+    bad_channel_used_keys = set(on_bad_used_keys) | set(off_bad_used_keys) | set(hot_bad_used_keys)
+    bad_channel_unused_keys = sorted(
+        (_format_calibration_key(list(bad_channel_key_columns), key) for key in bad_channel_map_norm.keys() if key not in bad_channel_used_keys),
+        key=str,
+    )
+    if verbose and bad_channel_unused_keys:
+        print(f"[CALIBRATE] bad_channel_map: {len(bad_channel_unused_keys)} unused key(s). Examples: {bad_channel_unused_keys[:5]}")
+
     hot_input_bad = flagrow_mask(mapping_hot)
     off_input_bad = flagrow_mask(mapping_off)
     on_input_bad = flagrow_mask(mapping_on)
@@ -920,7 +1222,7 @@ def make_tastar_dumps(
     if qc_sigma is not None and len(mapping_hot) > 0:
         hot_shape_auto_bad, hot_shape_scores = grouped_affine_shape_qc(
             mapping_hot,
-            hot2_arr.astype(float, copy=False),
+            hot2_qc.astype(float, copy=False),
             qc_sigma=float(qc_sigma),
             candidate_mask=(~hot_input_bad),
             group_cols=ref_group_cols,
@@ -929,7 +1231,7 @@ def make_tastar_dumps(
     if qc_sigma is not None and len(mapping_off) > 0:
         off_shape_auto_bad, off_shape_scores = grouped_affine_shape_qc(
             mapping_off,
-            off2_arr.astype(float, copy=False),
+            off2_qc.astype(float, copy=False),
             qc_sigma=float(qc_sigma),
             candidate_mask=(~off_input_bad),
             group_cols=ref_group_cols,
@@ -938,7 +1240,7 @@ def make_tastar_dumps(
 
     if qc_spur_sigma is not None and len(mapping_hot) > 0:
         hot_spur_auto_bad, hot_spur_scores, hot_spur_abspeak, hot_spur_runlen = _narrow_spur_qc_rows(
-            hot2_arr.astype(float, copy=False),
+            hot2_qc.astype(float, copy=False),
             candidate_mask=(~hot_input_bad),
             spur_sigma=float(qc_spur_sigma),
             spur_window_channels=int(qc_spur_window_channels),
@@ -946,7 +1248,7 @@ def make_tastar_dumps(
         )
     if qc_spur_sigma is not None and len(mapping_off) > 0:
         off_spur_auto_bad, off_spur_scores, off_spur_abspeak, off_spur_runlen = _narrow_spur_qc_rows(
-            off2_arr.astype(float, copy=False),
+            off2_qc.astype(float, copy=False),
             candidate_mask=(~off_input_bad),
             spur_sigma=float(qc_spur_sigma),
             spur_window_channels=int(qc_spur_window_channels),
@@ -954,7 +1256,7 @@ def make_tastar_dumps(
         )
     if qc_spur_sigma is not None and bool(qc_spur_consider_on) and len(mapping_on) > 0:
         on_spur_auto_bad, on_spur_scores, on_spur_abspeak, on_spur_runlen = _narrow_spur_qc_rows(
-            on2_arr.astype(float, copy=False),
+            on2_qc.astype(float, copy=False),
             candidate_mask=(~on_input_bad),
             spur_sigma=float(qc_spur_sigma),
             spur_window_channels=int(qc_spur_window_channels),
@@ -994,8 +1296,8 @@ def make_tastar_dumps(
 
     t_hot_use = t_hot[hot_keep]
     t_off_use = t_off[off_keep]
-    hot2_use = hot2_arr[hot_keep]
-    off2_use = off2_arr[off_keep]
+    hot2_use = hot2_use[hot_keep]
+    off2_use = off2_use[off_keep]
     mapping_hot_use = mapping_hot.loc[hot_keep].reset_index(drop=True)
     mapping_off_use = mapping_off.loc[off_keep].reset_index(drop=True)
 
@@ -1033,7 +1335,7 @@ def make_tastar_dumps(
         off_idx = off_group_map[key]
 
         t_on_grp = t_on[on_idx]
-        on2_grp = on2_arr[on_idx]
+        on2_grp = on2_use[on_idx]
         t_cal_grp = t_cal_arr[on_idx]
 
         t_hot_grp = t_hot_use[hot_idx]
@@ -1091,6 +1393,14 @@ def make_tastar_dumps(
 
     meta2["TEMPSCAL"] = "TA*"
     table["TEMPSCAL"] = "TA*"
+    if global_bad_channels_raw or bad_channel_map_norm:
+        table["BADCHAN_POLICY"] = bad_channel_policy_norm
+        table["BADCHAN_N_GLOBAL"] = on_bad_info["n_global"].astype(np.int32)
+        table["BADCHAN_N_GROUP"] = on_bad_info["n_group"].astype(np.int32)
+        table["BADCHAN_N_TOTAL"] = on_bad_info["n_total"].astype(np.int32)
+        table["BADCHAN_INTERP_APPLIED"] = on_bad_info["interp_applied"].astype(bool)
+        table["BADCHAN_INTERP_NFILLED"] = on_bad_info["interp_nfilled"].astype(np.int32)
+        table["BADCHAN_HAS_EDGE_UNFILLED"] = on_bad_info["has_edge_unfilled"].astype(bool)
     if qc_spur_sigma is not None and bool(qc_spur_consider_on):
         table["REF_QC_ON_SPUR_SCORE"] = on_spur_scores
         table["REF_QC_ON_SPUR_ABSPEAK"] = on_spur_abspeak
@@ -1123,6 +1433,29 @@ def make_tastar_dumps(
             "on_spur_auto_bad_would_flag": int(np.count_nonzero(on_spur_auto_bad)) if bool(qc_spur_consider_on) else 0,
             "hot_used_rows": int(np.count_nonzero(hot_keep)),
             "off_used_rows": int(np.count_nonzero(off_keep)),
+        }
+
+    if global_bad_channels_raw or bad_channel_map_norm:
+        table.attrs["bad_channel_summary"] = {
+            "policy": bad_channel_policy_norm,
+            "interp_max_consecutive_channels": int(bad_channel_interp_max_consecutive_channels),
+            "global_bad_channels_raw_count": int(len(global_bad_channels_raw)),
+            "bad_channel_group_cols": list(bad_channel_group_cols),
+            "bad_channel_key_columns": list(bad_channel_key_columns),
+            "bad_channel_map_keys": int(len(bad_channel_map_norm)),
+            "bad_channel_map_unused_keys": bad_channel_unused_keys,
+            "on_total_bad_channels_max": int(np.max(on_bad_info["n_total"])) if len(on_bad_info["n_total"]) > 0 else 0,
+            "off_total_bad_channels_max": int(np.max(off_bad_info["n_total"])) if len(off_bad_info["n_total"]) > 0 else 0,
+            "hot_total_bad_channels_max": int(np.max(hot_bad_info["n_total"])) if len(hot_bad_info["n_total"]) > 0 else 0,
+            "on_interp_rows": int(np.count_nonzero(on_bad_info["interp_applied"])),
+            "off_interp_rows": int(np.count_nonzero(off_bad_info["interp_applied"])),
+            "hot_interp_rows": int(np.count_nonzero(hot_bad_info["interp_applied"])),
+            "on_interp_nfilled_total": int(np.sum(on_bad_info["interp_nfilled"])),
+            "off_interp_nfilled_total": int(np.sum(off_bad_info["interp_nfilled"])),
+            "hot_interp_nfilled_total": int(np.sum(hot_bad_info["interp_nfilled"])),
+            "on_has_edge_unfilled_any": bool(np.any(on_bad_info["has_edge_unfilled"])),
+            "off_has_edge_unfilled_any": bool(np.any(off_bad_info["has_edge_unfilled"])),
+            "hot_has_edge_unfilled_any": bool(np.any(hot_bad_info["has_edge_unfilled"])),
         }
 
     if rest_freq is not None:
@@ -1187,6 +1520,13 @@ def tastar_from_rawspec(
     qc_spur_window_channels: int = 31,
     qc_spur_max_consecutive_channels: int = 3,
     qc_spur_consider_on: bool = False,
+    bad_channels: Optional[Sequence[int]] = None,
+    bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None,
+    bad_channel_key_columns: Sequence[str] = ("FDNUM", "IFNUM", "PLNUM"),
+    bad_channel_map: Optional[dict[tuple, Sequence[Union[int, Tuple[int, int]]]]] = None,
+    bad_channel_policy: str = "nan",
+    bad_channel_interp_max_consecutive_channels: int = 3,
+    bad_channel_interp_min_valid_neighbors: int = 1,
     qc_apply_flagrow: bool = False,
     verbose: bool = True,
 ) -> Scantable:
@@ -1214,6 +1554,13 @@ def tastar_from_rawspec(
         qc_spur_window_channels=qc_spur_window_channels,
         qc_spur_max_consecutive_channels=qc_spur_max_consecutive_channels,
         qc_spur_consider_on=qc_spur_consider_on,
+        bad_channels=bad_channels,
+        bad_channel_ranges=bad_channel_ranges,
+        bad_channel_key_columns=bad_channel_key_columns,
+        bad_channel_map=bad_channel_map,
+        bad_channel_policy=bad_channel_policy,
+        bad_channel_interp_max_consecutive_channels=bad_channel_interp_max_consecutive_channels,
+        bad_channel_interp_min_valid_neighbors=bad_channel_interp_min_valid_neighbors,
         qc_apply_flagrow=qc_apply_flagrow,
         verbose=verbose,
     )
@@ -1248,6 +1595,13 @@ def run_tastar_calibration(
     qc_spur_window_channels: int = 31,
     qc_spur_max_consecutive_channels: int = 3,
     qc_spur_consider_on: bool = False,
+    bad_channels: Optional[Sequence[int]] = None,
+    bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None,
+    bad_channel_key_columns: Sequence[str] = ("FDNUM", "IFNUM", "PLNUM"),
+    bad_channel_map: Optional[dict[tuple, Sequence[Union[int, Tuple[int, int]]]]] = None,
+    bad_channel_policy: str = "nan",
+    bad_channel_interp_max_consecutive_channels: int = 3,
+    bad_channel_interp_min_valid_neighbors: int = 1,
     qc_apply_flagrow: bool = False,
     verbose: bool = True,
 ) -> Scantable:
@@ -1297,6 +1651,13 @@ def run_tastar_calibration(
         qc_spur_window_channels=qc_spur_window_channels,
         qc_spur_max_consecutive_channels=qc_spur_max_consecutive_channels,
         qc_spur_consider_on=qc_spur_consider_on,
+        bad_channels=bad_channels,
+        bad_channel_ranges=bad_channel_ranges,
+        bad_channel_key_columns=bad_channel_key_columns,
+        bad_channel_map=bad_channel_map,
+        bad_channel_policy=bad_channel_policy,
+        bad_channel_interp_max_consecutive_channels=bad_channel_interp_max_consecutive_channels,
+        bad_channel_interp_min_valid_neighbors=bad_channel_interp_min_valid_neighbors,
         qc_apply_flagrow=qc_apply_flagrow,
         verbose=verbose,
     )
@@ -1322,6 +1683,17 @@ def run_tastar_calibration(
         'qc_spur_window_channels': int(qc_spur_window_channels),
         'qc_spur_max_consecutive_channels': int(qc_spur_max_consecutive_channels),
         'qc_spur_consider_on': bool(qc_spur_consider_on), 'qc_apply_flagrow': bool(qc_apply_flagrow),
+        'bad_channels': list(bad_channels) if bad_channels is not None else None,
+        'bad_channel_ranges': list(bad_channel_ranges) if bad_channel_ranges is not None else None,
+        'bad_channel_key_columns': list(bad_channel_key_columns),
+        'bad_channel_map_summary': {
+            'n_keys': int(len(bad_channel_map)) if isinstance(bad_channel_map, dict) else 0,
+            'keys': [repr(k) for k in list(bad_channel_map.keys())[:20]] if isinstance(bad_channel_map, dict) else [],
+        },
+        'bad_channel_policy': str(bad_channel_policy),
+        'bad_channel_interp_max_consecutive_channels': int(bad_channel_interp_max_consecutive_channels),
+        'bad_channel_interp_min_valid_neighbors': int(bad_channel_interp_min_valid_neighbors),
+        'bad_channel_summary': dict(res.table.attrs.get('bad_channel_summary', {})),
         'calibration_group_cols': list(_resolve_existing_columns_ci(res.table, ['FDNUM', 'IFNUM', 'PLNUM'])),
         'qc_summary': qc_summary,
         'notes': 'Ta* calibration.',

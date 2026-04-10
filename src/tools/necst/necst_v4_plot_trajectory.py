@@ -483,7 +483,27 @@ def _frame_default_reverse_x(frame_name: str) -> bool:
     return str(frame_name).strip().lower() in ("radec", "galactic")
 
 
-def _prepare_display_xy(x: np.ndarray, y: np.ndarray, frame_name: str, *, equal_aspect: bool) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+def _circular_center_deg(x_deg: np.ndarray) -> float:
+    x = np.asarray(x_deg, dtype=float)
+    finite = np.isfinite(x)
+    if not np.any(finite):
+        return np.nan
+    theta = np.deg2rad(np.mod(x[finite], 360.0))
+    z = np.nanmean(np.exp(1j * theta))
+    if (not np.isfinite(z.real)) or (not np.isfinite(z.imag)) or (abs(z) < 1e-12):
+        return float(x[finite][0])
+    return float(np.mod(np.rad2deg(np.angle(z)), 360.0))
+
+
+def _prepare_display_xy(
+    x: np.ndarray,
+    y: np.ndarray,
+    frame_name: str,
+    *,
+    equal_aspect: bool,
+    display_lon0_deg: Optional[float] = None,
+    longitude_continuous: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
     frame = str(frame_name).strip().lower()
     x = np.asarray(x, dtype=float)
     y = np.asarray(y, dtype=float)
@@ -494,9 +514,9 @@ def _prepare_display_xy(x: np.ndarray, y: np.ndarray, frame_name: str, *, equal_
         "lon0_deg": None,
         "cos_lat0": None,
         "aspect_ratio": 1.0,
+        "longitude_continuous": bool(longitude_continuous),
     }
 
-    sign = -1.0 if meta["reverse_x"] else 1.0
     x_disp = x.copy()
     y_disp = y.copy()
 
@@ -504,7 +524,15 @@ def _prepare_display_xy(x: np.ndarray, y: np.ndarray, frame_name: str, *, equal_
     if not np.any(finite):
         return x_disp, y_disp, meta
 
-    lon0 = float(np.nanmedian(x[finite]))
+    if _frame_longitude_x(frame) and (not bool(longitude_continuous)):
+        if display_lon0_deg is None or (not np.isfinite(display_lon0_deg)):
+            lon0 = _circular_center_deg(x[finite])
+        else:
+            lon0 = float(display_lon0_deg)
+        x_disp = lon0 + _wrap_delta_deg(x - lon0)
+    else:
+        lon0 = float(np.nanmedian(x[finite]))
+
     lat0 = float(np.nanmedian(y[finite]))
     cos_lat0 = float(np.cos(np.deg2rad(lat0)))
     if (not np.isfinite(cos_lat0)) or (abs(cos_lat0) < 1e-12):
@@ -1742,7 +1770,14 @@ def plot_trajectory(samples: TrajectorySamples,
     if scan_group_key_raw is not None:
         scan_group_key_raw = scan_group_key_raw[finite]
 
-    x, y, display_meta = _prepare_display_xy(x_raw, y_raw, samples.frame_name, equal_aspect=bool(equal_aspect))
+    axis_name0 = samples.x_label.split()[0].strip().lower()
+    longitude_continuous = bool(unwrap_az) and (str(samples.frame_name).strip().lower() == "azel") and (axis_name0 == "az")
+
+    x, y, display_meta = _prepare_display_xy(
+        x_raw, y_raw, samples.frame_name,
+        equal_aspect=bool(equal_aspect),
+        longitude_continuous=longitude_continuous,
+    )
 
     drew_direction_arrows = False
     metric_label = None
@@ -1788,6 +1823,8 @@ def plot_trajectory(samples: TrajectorySamples,
                 metric_segments[:, :, 1].reshape(-1),
                 samples.frame_name,
                 equal_aspect=bool(equal_aspect),
+                display_lon0_deg=display_meta.get("lon0_deg"),
+                longitude_continuous=longitude_continuous,
             )
             metric_segments_disp[:, :, 0] = np.asarray(metric_x_flat, dtype=float).reshape(metric_segments.shape[0], metric_segments.shape[1])
             metric_segments_disp[:, :, 1] = np.asarray(metric_y_flat, dtype=float).reshape(metric_segments.shape[0], metric_segments.shape[1])
@@ -1810,7 +1847,12 @@ def plot_trajectory(samples: TrajectorySamples,
                     ha="left", va="top")
 
     if do_overlay_cmd and cmd_x_raw is not None and cmd_y_raw is not None:
-        cmd_x, cmd_y, _ = _prepare_display_xy(cmd_x_raw, cmd_y_raw, samples.frame_name, equal_aspect=bool(equal_aspect))
+        cmd_x, cmd_y, _ = _prepare_display_xy(
+            cmd_x_raw, cmd_y_raw, samples.frame_name,
+            equal_aspect=bool(equal_aspect),
+            display_lon0_deg=display_meta.get("lon0_deg"),
+            longitude_continuous=longitude_continuous,
+        )
         cmd_segments = _make_segments(cmd_x, cmd_y)
         cmd_masks = _make_mode_masks(mode)
         for key in ("ON", "OFF", "HOT", "OTHER"):
