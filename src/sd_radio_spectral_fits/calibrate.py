@@ -621,6 +621,70 @@ def _summarize_spur_peak_channels(
     ]
     return counts, top
 
+def _jsonable_float(value: Any) -> float | None:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    if not np.isfinite(v):
+        return None
+    return v
+
+
+def _summarize_spur_peak_channel_scores(
+    peak_index: np.ndarray,
+    auto_bad: np.ndarray,
+    score: np.ndarray,
+    applied_sigma: np.ndarray,
+    *,
+    ch_start: int,
+    top_n: int = 10,
+) -> tuple[dict[str, dict[str, int | float | None]], list[dict[str, int | float | None]]]:
+    peak = np.asarray(peak_index, dtype=int).reshape(-1)
+    bad = np.asarray(auto_bad, dtype=bool).reshape(-1)
+    sc = np.asarray(score, dtype=float).reshape(-1)
+    thr = np.asarray(applied_sigma, dtype=float).reshape(-1)
+    if not (peak.shape == bad.shape == sc.shape == thr.shape):
+        raise ValueError('peak_index/auto_bad/score/applied_sigma shape mismatch in peak score summary helper.')
+
+    valid = bad & (peak >= 0) & np.isfinite(sc)
+    if not np.any(valid):
+        return {}, []
+
+    raw_peak = peak[valid].astype(np.int64, copy=False) + int(ch_start)
+    sc_valid = sc[valid]
+    thr_valid = thr[valid]
+    uniq = np.unique(raw_peak)
+    stats: dict[str, dict[str, int | float | None]] = {}
+    rows: list[dict[str, int | float | None]] = []
+    for ch in uniq.tolist():
+        mask = raw_peak == ch
+        sc_ch = sc_valid[mask]
+        thr_ch = thr_valid[mask]
+        thr_fin = thr_ch[np.isfinite(thr_ch)]
+        score_median = float(np.median(sc_ch))
+        score_max = float(np.max(sc_ch))
+        threshold_median = _jsonable_float(np.median(thr_fin)) if thr_fin.size > 0 else None
+        threshold_max = _jsonable_float(np.max(thr_fin)) if thr_fin.size > 0 else None
+        excess_median = _jsonable_float(score_median - threshold_median) if threshold_median is not None else None
+        excess_max = _jsonable_float(score_max - threshold_max) if threshold_max is not None else None
+        item: dict[str, int | float | None] = {
+            "channel": int(ch),
+            "count": int(sc_ch.size),
+            "score_median": _jsonable_float(score_median),
+            "score_max": _jsonable_float(score_max),
+            "threshold_median": threshold_median,
+            "threshold_max": threshold_max,
+            "excess_median": excess_median,
+            "excess_max": excess_max,
+        }
+        rows.append(item)
+        stats[str(int(ch))] = {k: v for k, v in item.items() if k != 'channel'}
+
+    rows.sort(key=lambda d: (-int(d['count']), int(d['channel'])))
+    top = rows[:builtins.max(0, int(top_n))]
+    return stats, top
+
 
 def _spur_prescreen_qd_rows(
     spectra: np.ndarray,
@@ -1002,6 +1066,498 @@ def _apply_bad_channel_policy_to_state(
     return data_spur_qc, data_shape_qc, data_cal, info, used_map_keys
 
 
+def _interp_linear_fill_output_bad_channels_1d(
+    spec: np.ndarray,
+    local_bad_idx: np.ndarray,
+    *,
+    max_consecutive_channels: int,
+    min_valid_neighbors: int,
+) -> tuple[np.ndarray, bool, int, bool]:
+    arr = np.asarray(spec, dtype=float).copy()
+    if arr.ndim != 1:
+        raise ValueError(f"spectrum must be 1-D, got shape={arr.shape}")
+    if local_bad_idx.size == 0:
+        return arr, False, 0, False
+
+    nchan = arr.size
+    bad = np.zeros(nchan, dtype=bool)
+    bad_idx = local_bad_idx[(local_bad_idx >= 0) & (local_bad_idx < nchan)]
+    if bad_idx.size == 0:
+        return arr, False, 0, False
+
+    bad[bad_idx] = True
+    arr[bad] = np.nan
+
+    fill_applied = False
+    nfilled = 0
+    has_edge_unfilled = False
+    need_neighbors = int(min_valid_neighbors)
+
+    for start, stop in _iter_true_runs(bad):
+        run_len = stop - start + 1
+        if run_len > int(max_consecutive_channels):
+            has_edge_unfilled = True
+            continue
+
+        left = start - 1
+        while left >= 0 and not np.isfinite(arr[left]):
+            left -= 1
+        right = stop + 1
+        while right < nchan and not np.isfinite(arr[right]):
+            right += 1
+
+        left_ok = (left >= 0) and np.isfinite(arr[left])
+        right_ok = (right < nchan) and np.isfinite(arr[right])
+        n_neighbors = int(left_ok) + int(right_ok)
+        if n_neighbors < need_neighbors:
+            has_edge_unfilled = True
+            continue
+
+        if left_ok and right_ok:
+            x = np.array([left, right], dtype=float)
+            y = np.array([arr[left], arr[right]], dtype=float)
+            xi = np.arange(start, stop + 1, dtype=float)
+            arr[start:stop + 1] = np.interp(xi, x, y)
+        elif left_ok:
+            arr[start:stop + 1] = float(arr[left])
+        elif right_ok:
+            arr[start:stop + 1] = float(arr[right])
+        else:
+            has_edge_unfilled = True
+            continue
+
+        fill_applied = True
+        nfilled += run_len
+
+    return arr, fill_applied, int(nfilled), bool(has_edge_unfilled)
+
+
+
+def _fill_linear_bad_run_inplace(
+    arr: np.ndarray,
+    *,
+    start: int,
+    stop: int,
+    min_valid_neighbors: int,
+) -> tuple[bool, int, bool]:
+    left = int(start) - 1
+    while left >= 0 and not np.isfinite(arr[left]):
+        left -= 1
+    right = int(stop) + 1
+    nchan = int(arr.size)
+    while right < nchan and not np.isfinite(arr[right]):
+        right += 1
+
+    left_ok = (left >= 0) and np.isfinite(arr[left])
+    right_ok = (right < nchan) and np.isfinite(arr[right])
+    n_neighbors = int(left_ok) + int(right_ok)
+    if n_neighbors < int(min_valid_neighbors):
+        return False, 0, True
+
+    if left_ok and right_ok:
+        x = np.array([left, right], dtype=float)
+        y = np.array([arr[left], arr[right]], dtype=float)
+        xi = np.arange(start, stop + 1, dtype=float)
+        arr[start:stop + 1] = np.interp(xi, x, y)
+    elif left_ok:
+        arr[start:stop + 1] = float(arr[left])
+    elif right_ok:
+        arr[start:stop + 1] = float(arr[right])
+    else:
+        return False, 0, True
+
+    return True, int(stop - start + 1), False
+
+
+def _auto_half_window_for_bad_run(run_len: int) -> int:
+    return int(builtins.max(6, int(np.ceil(float(run_len) / 2.0)) + 3))
+
+
+def _weighted_polyfit_coeffs_1d(
+    x: np.ndarray,
+    y: np.ndarray,
+    w: np.ndarray,
+    degree: int,
+) -> np.ndarray | None:
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    w = np.asarray(w, dtype=float)
+    if x.ndim != 1 or y.ndim != 1 or w.ndim != 1:
+        raise ValueError('x, y, w must be 1-D arrays.')
+    if not (x.size == y.size == w.size):
+        raise ValueError('x, y, w must have the same length.')
+    if x.size < int(degree) + 1:
+        return None
+    finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(w) & (w > 0.0)
+    if np.count_nonzero(finite) < int(degree) + 1:
+        return None
+    x_use = x[finite]
+    y_use = y[finite]
+    w_use = w[finite]
+    if int(degree) == 1:
+        design = np.column_stack((np.ones_like(x_use), x_use))
+    elif int(degree) == 2:
+        design = np.column_stack((np.ones_like(x_use), x_use, x_use * x_use))
+    else:
+        raise ValueError(f'Unsupported degree={degree}')
+    sqrt_w = np.sqrt(w_use)
+    design_w = design * sqrt_w[:, None]
+    y_w = y_use * sqrt_w
+    try:
+        coeffs, _, rank, _ = np.linalg.lstsq(design_w, y_w, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+    if int(rank) < int(degree) + 1 or not np.all(np.isfinite(coeffs)):
+        return None
+    return np.asarray(coeffs, dtype=float)
+
+
+def _eval_poly1_at(x: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
+    xx = np.asarray(x, dtype=float)
+    cc = np.asarray(coeffs, dtype=float)
+    return cc[0] + cc[1] * xx
+
+
+def _eval_poly2_at(x: np.ndarray, coeffs: np.ndarray) -> np.ndarray:
+    xx = np.asarray(x, dtype=float)
+    cc = np.asarray(coeffs, dtype=float)
+    return cc[0] + cc[1] * xx + cc[2] * xx * xx
+
+
+def _positive_local_scale(values: np.ndarray) -> float:
+    scale = float(_robust_mad_scale_1d(values))
+    if np.isfinite(scale) and scale > 0.0:
+        return scale
+    arr = np.asarray(values, dtype=float)
+    finite = arr[np.isfinite(arr)]
+    if finite.size > 0:
+        rms = float(np.sqrt(np.mean(finite * finite)))
+        if np.isfinite(rms) and rms > 0.0:
+            return rms
+        amp = float(np.median(np.abs(finite)))
+    else:
+        amp = 1.0
+    return float(np.finfo(float).eps * builtins.max(1.0, amp))
+
+
+def _interp_poly2_weighted_fill_output_bad_channels_1d(
+    spec: np.ndarray,
+    local_bad_idx: np.ndarray,
+    *,
+    max_consecutive_channels: int,
+    min_valid_neighbors: int,
+    half_window_channels: int | None,
+    curvature_sigma_threshold: float,
+    edge_consistency_sigma_max: float,
+    fallback_policy: str,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    arr = np.asarray(spec, dtype=float).copy()
+    if arr.ndim != 1:
+        raise ValueError(f'spectrum must be 1-D, got shape={arr.shape}')
+
+    nchan = int(arr.size)
+    bad = np.zeros(nchan, dtype=bool)
+    bad_idx = np.asarray(local_bad_idx, dtype=int)
+    bad_idx = bad_idx[(bad_idx >= 0) & (bad_idx < nchan)]
+    if bad_idx.size == 0:
+        info = {
+            'fill_applied': False,
+            'fill_nfilled': 0,
+            'has_edge_unfilled': False,
+            'poly2_runs': 0,
+            'linear_runs': 0,
+            'none_runs': 0,
+            'poly2_applied': False,
+            'linear_applied': False,
+            'curvature_score_max': np.nan,
+            'edge_consistency_score_max': np.nan,
+            'local_sigma_median': np.nan,
+        }
+        return arr, info
+
+    bad[bad_idx] = True
+    arr[bad] = np.nan
+
+    fill_applied = False
+    fill_nfilled = 0
+    has_edge_unfilled = False
+    poly2_runs = 0
+    linear_runs = 0
+    none_runs = 0
+    curvature_scores: list[float] = []
+    edge_scores: list[float] = []
+    local_sigmas: list[float] = []
+
+    fallback_policy_norm = str(fallback_policy or 'linear').strip().lower()
+    if fallback_policy_norm not in ('linear', 'none'):
+        raise ValueError("fallback_policy must be 'linear' or 'none'.")
+
+    for start, stop in _iter_true_runs(bad):
+        run_len = int(stop - start + 1)
+        if run_len > int(max_consecutive_channels):
+            has_edge_unfilled = True
+            none_runs += 1
+            continue
+
+        left = int(start) - 1
+        while left >= 0 and not np.isfinite(arr[left]):
+            left -= 1
+        right = int(stop) + 1
+        while right < nchan and not np.isfinite(arr[right]):
+            right += 1
+
+        h = int(half_window_channels) if half_window_channels is not None else _auto_half_window_for_bad_run(run_len)
+        kc = 0.5 * (float(start) + float(stop))
+        all_idx = np.arange(nchan, dtype=float)
+        finite_mask = np.isfinite(arr)
+        neighbor_mask = finite_mask & (np.abs(all_idx - kc) <= float(h))
+        left_mask = all_idx < float(start)
+        right_mask = all_idx > float(stop)
+        n_valid_total = int(np.count_nonzero(neighbor_mask))
+        n_valid_left = int(np.count_nonzero(neighbor_mask & left_mask))
+        n_valid_right = int(np.count_nonzero(neighbor_mask & right_mask))
+
+        def _fallback() -> tuple[bool, int, bool]:
+            if fallback_policy_norm == 'linear':
+                return _fill_linear_bad_run_inplace(
+                    arr,
+                    start=int(start),
+                    stop=int(stop),
+                    min_valid_neighbors=int(min_valid_neighbors),
+                )
+            return False, 0, True
+
+        if n_valid_total < 6 or n_valid_left < 2 or n_valid_right < 2:
+            applied, nfill, edge_unfilled = _fallback()
+            fill_applied = fill_applied or bool(applied)
+            fill_nfilled += int(nfill)
+            has_edge_unfilled = has_edge_unfilled or bool(edge_unfilled)
+            if applied:
+                linear_runs += 1
+            else:
+                none_runs += 1
+            continue
+
+        j = all_idx[neighbor_mask]
+        y = arr[neighbor_mask]
+        x = j - kc
+        if x.size < 6:
+            applied, nfill, edge_unfilled = _fallback()
+            fill_applied = fill_applied or bool(applied)
+            fill_nfilled += int(nfill)
+            has_edge_unfilled = has_edge_unfilled or bool(edge_unfilled)
+            if applied:
+                linear_runs += 1
+            else:
+                none_runs += 1
+            continue
+
+        scaled = np.abs(x) / float(h)
+        w = np.zeros_like(scaled, dtype=float)
+        inside = scaled < 1.0
+        w[inside] = (1.0 - scaled[inside] ** 3) ** 3
+
+        coeff_lin = _weighted_polyfit_coeffs_1d(x, y, w, degree=1)
+        coeff_quad = _weighted_polyfit_coeffs_1d(x, y, w, degree=2)
+        if coeff_lin is None or coeff_quad is None:
+            applied, nfill, edge_unfilled = _fallback()
+            fill_applied = fill_applied or bool(applied)
+            fill_nfilled += int(nfill)
+            has_edge_unfilled = has_edge_unfilled or bool(edge_unfilled)
+            if applied:
+                linear_runs += 1
+            else:
+                none_runs += 1
+            continue
+
+        resid_lin = y - _eval_poly1_at(x, coeff_lin)
+        sigma_loc = float(_positive_local_scale(resid_lin))
+        local_sigmas.append(sigma_loc)
+        xi = np.arange(start, stop + 1, dtype=float) - kc
+        lin_pred = _eval_poly1_at(xi, coeff_lin)
+        quad_pred = _eval_poly2_at(xi, coeff_quad)
+        d_quad_lin = float(np.max(np.abs(quad_pred - lin_pred))) if xi.size > 0 else 0.0
+        curvature_score = float(d_quad_lin / sigma_loc)
+        curvature_scores.append(curvature_score)
+
+        left_ok = (left >= 0) and np.isfinite(arr[left])
+        right_ok = (right < nchan) and np.isfinite(arr[right])
+        if left_ok and right_ok:
+            edge_quad = _eval_poly2_at(np.array([float(left) - kc, float(right) - kc], dtype=float), coeff_quad)
+            edge_truth = np.array([arr[left], arr[right]], dtype=float)
+            edge_score = float(np.max(np.abs(edge_quad - edge_truth)) / sigma_loc)
+        else:
+            edge_score = np.inf
+        edge_scores.append(edge_score)
+
+        use_poly2 = (curvature_score >= float(curvature_sigma_threshold)) and (edge_score <= float(edge_consistency_sigma_max))
+        if use_poly2:
+            arr[start:stop + 1] = quad_pred
+            fill_applied = True
+            fill_nfilled += run_len
+            poly2_runs += 1
+            continue
+
+        applied, nfill, edge_unfilled = _fallback()
+        fill_applied = fill_applied or bool(applied)
+        fill_nfilled += int(nfill)
+        has_edge_unfilled = has_edge_unfilled or bool(edge_unfilled)
+        if applied:
+            linear_runs += 1
+        else:
+            none_runs += 1
+
+    info = {
+        'fill_applied': bool(fill_applied),
+        'fill_nfilled': int(fill_nfilled),
+        'has_edge_unfilled': bool(has_edge_unfilled),
+        'poly2_runs': int(poly2_runs),
+        'linear_runs': int(linear_runs),
+        'none_runs': int(none_runs),
+        'poly2_applied': bool(poly2_runs > 0),
+        'linear_applied': bool(linear_runs > 0),
+        'curvature_score_max': float(np.max(curvature_scores)) if len(curvature_scores) > 0 else np.nan,
+        'edge_consistency_score_max': float(np.max(edge_scores)) if len(edge_scores) > 0 else np.nan,
+        'local_sigma_median': float(np.median(np.asarray(local_sigmas, dtype=float))) if len(local_sigmas) > 0 else np.nan,
+    }
+    return arr, info
+
+
+def _apply_output_bad_channel_fill_to_state(
+    spectra: np.ndarray,
+    mapping_state: pd.DataFrame,
+    *,
+    key_cols: Sequence[str],
+    global_bad_channels_raw: set[int],
+    bad_channel_map_norm: dict[tuple[Any, ...], set[int]],
+    ch_start: int,
+    ch_stop: int,
+    output_bad_channel_fill_policy: str,
+    output_bad_channel_fill_max_consecutive_channels: int,
+    output_bad_channel_fill_min_valid_neighbors: int,
+    output_bad_channel_fill_half_window_channels: int | None,
+    output_bad_channel_fill_curvature_sigma_threshold: float,
+    output_bad_channel_fill_edge_consistency_sigma_max: float,
+    output_bad_channel_fill_fallback_policy: str,
+) -> tuple[np.ndarray, dict[str, np.ndarray], set[tuple[Any, ...]]]:
+    out = np.array(spectra, dtype=float, copy=True)
+    if out.ndim != 2:
+        raise ValueError(f'spectra must be 2-D, got shape={out.shape}')
+
+    nrow = out.shape[0]
+    n_total = np.zeros(nrow, dtype=np.int32)
+    fill_applied = np.zeros(nrow, dtype=bool)
+    fill_nfilled = np.zeros(nrow, dtype=np.int32)
+    has_edge_unfilled = np.zeros(nrow, dtype=bool)
+    poly2_applied = np.zeros(nrow, dtype=bool)
+    linear_applied = np.zeros(nrow, dtype=bool)
+    poly2_runs = np.zeros(nrow, dtype=np.int32)
+    linear_runs = np.zeros(nrow, dtype=np.int32)
+    none_runs = np.zeros(nrow, dtype=np.int32)
+    curvature_score_max = np.full(nrow, np.nan, dtype=float)
+    edge_consistency_score_max = np.full(nrow, np.nan, dtype=float)
+    local_sigma_median = np.full(nrow, np.nan, dtype=float)
+
+    if output_bad_channel_fill_policy == 'none':
+        info = {
+            'n_total': n_total,
+            'fill_applied': fill_applied,
+            'fill_nfilled': fill_nfilled,
+            'has_edge_unfilled': has_edge_unfilled,
+            'poly2_applied': poly2_applied,
+            'linear_applied': linear_applied,
+            'poly2_runs': poly2_runs,
+            'linear_runs': linear_runs,
+            'none_runs': none_runs,
+            'curvature_score_max': curvature_score_max,
+            'edge_consistency_score_max': edge_consistency_score_max,
+            'local_sigma_median': local_sigma_median,
+        }
+        return out, info, set()
+
+    used_map_keys: set[tuple[Any, ...]] = set()
+    group_map = _group_index_map_by_key(mapping_state, key_cols)
+    global_local_idx = _raw_bad_channels_to_local_indices(global_bad_channels_raw, ch_start, ch_stop)
+
+    for key, idxs in group_map.items():
+        idxs = np.asarray(idxs, dtype=int)
+        group_bad_raw = bad_channel_map_norm.get(key, set())
+        if key in bad_channel_map_norm:
+            used_map_keys.add(key)
+        group_local_idx = _raw_bad_channels_to_local_indices(group_bad_raw, ch_start, ch_stop)
+        if global_local_idx.size and group_local_idx.size:
+            total_local_idx = np.unique(np.concatenate((global_local_idx, group_local_idx))).astype(int)
+        elif global_local_idx.size:
+            total_local_idx = global_local_idx.copy()
+        elif group_local_idx.size:
+            total_local_idx = group_local_idx.copy()
+        else:
+            total_local_idx = np.empty(0, dtype=int)
+
+        n_total[idxs] = int(total_local_idx.size)
+        if total_local_idx.size == 0:
+            continue
+
+        for ridx in idxs:
+            if output_bad_channel_fill_policy == 'interp_linear_ta':
+                filled, applied, nfill, edge_unfilled = _interp_linear_fill_output_bad_channels_1d(
+                    out[ridx],
+                    total_local_idx,
+                    max_consecutive_channels=int(output_bad_channel_fill_max_consecutive_channels),
+                    min_valid_neighbors=int(output_bad_channel_fill_min_valid_neighbors),
+                )
+                out[ridx] = filled
+                fill_applied[ridx] = bool(applied)
+                fill_nfilled[ridx] = int(nfill)
+                has_edge_unfilled[ridx] = bool(edge_unfilled)
+                linear_applied[ridx] = bool(applied)
+                linear_runs[ridx] = 1 if bool(applied) else 0
+                none_runs[ridx] = 0 if bool(applied) else 1
+            elif output_bad_channel_fill_policy == 'poly2_weighted_ta':
+                filled, row_info = _interp_poly2_weighted_fill_output_bad_channels_1d(
+                    out[ridx],
+                    total_local_idx,
+                    max_consecutive_channels=int(output_bad_channel_fill_max_consecutive_channels),
+                    min_valid_neighbors=int(output_bad_channel_fill_min_valid_neighbors),
+                    half_window_channels=output_bad_channel_fill_half_window_channels,
+                    curvature_sigma_threshold=float(output_bad_channel_fill_curvature_sigma_threshold),
+                    edge_consistency_sigma_max=float(output_bad_channel_fill_edge_consistency_sigma_max),
+                    fallback_policy=str(output_bad_channel_fill_fallback_policy),
+                )
+                out[ridx] = filled
+                fill_applied[ridx] = bool(row_info['fill_applied'])
+                fill_nfilled[ridx] = int(row_info['fill_nfilled'])
+                has_edge_unfilled[ridx] = bool(row_info['has_edge_unfilled'])
+                poly2_applied[ridx] = bool(row_info['poly2_applied'])
+                linear_applied[ridx] = bool(row_info['linear_applied'])
+                poly2_runs[ridx] = int(row_info['poly2_runs'])
+                linear_runs[ridx] = int(row_info['linear_runs'])
+                none_runs[ridx] = int(row_info['none_runs'])
+                curvature_score_max[ridx] = float(row_info['curvature_score_max']) if np.isfinite(row_info['curvature_score_max']) else np.nan
+                edge_consistency_score_max[ridx] = float(row_info['edge_consistency_score_max']) if np.isfinite(row_info['edge_consistency_score_max']) else np.nan
+                local_sigma_median[ridx] = float(row_info['local_sigma_median']) if np.isfinite(row_info['local_sigma_median']) else np.nan
+            else:
+                raise ValueError(
+                    f'Unsupported output_bad_channel_fill_policy={output_bad_channel_fill_policy!r}'
+                )
+
+    info = {
+        'n_total': n_total,
+        'fill_applied': fill_applied,
+        'fill_nfilled': fill_nfilled,
+        'has_edge_unfilled': has_edge_unfilled,
+        'poly2_applied': poly2_applied,
+        'linear_applied': linear_applied,
+        'poly2_runs': poly2_runs,
+        'linear_runs': linear_runs,
+        'none_runs': none_runs,
+        'curvature_score_max': curvature_score_max,
+        'edge_consistency_score_max': edge_consistency_score_max,
+        'local_sigma_median': local_sigma_median,
+    }
+    return out, info, used_map_keys
+
+
 def _resolve_existing_columns_ci(table: pd.DataFrame, preferred: Sequence[str]) -> list[str]:
     actual_by_upper: dict[str, str] = {}
     for col in table.columns:
@@ -1094,6 +1650,13 @@ def make_tastar_dumps(
     bad_channel_policy: str = "nan",
     bad_channel_interp_max_consecutive_channels: int = 3,
     bad_channel_interp_min_valid_neighbors: int = 1,
+    output_bad_channel_fill_policy: str = "none",
+    output_bad_channel_fill_max_consecutive_channels: int = 3,
+    output_bad_channel_fill_min_valid_neighbors: int = 2,
+    output_bad_channel_fill_half_window_channels: Optional[int] = None,
+    output_bad_channel_fill_curvature_sigma_threshold: float = 1.0,
+    output_bad_channel_fill_edge_consistency_sigma_max: float = 3.0,
+    output_bad_channel_fill_fallback_policy: str = "linear",
     qc_apply_flagrow: bool = False,              # Whether to reflect auto QC into FLAGROW
     verbose: bool = True,                         # ログ出力フラグ
     # -----------------------------------------------------
@@ -1131,6 +1694,22 @@ def make_tastar_dumps(
         raise ValueError("bad_channel_interp_max_consecutive_channels must be >= 1.")
     if int(bad_channel_interp_min_valid_neighbors) != 1:
         raise ValueError("bad_channel_interp_min_valid_neighbors currently supports only 1.")
+    output_bad_channel_fill_policy_norm = str(output_bad_channel_fill_policy or "none").strip().lower()
+    if output_bad_channel_fill_policy_norm not in ("none", "interp_linear_ta", "poly2_weighted_ta"):
+        raise ValueError("output_bad_channel_fill_policy must be 'none', 'interp_linear_ta', or 'poly2_weighted_ta'.")
+    if int(output_bad_channel_fill_max_consecutive_channels) < 1:
+        raise ValueError("output_bad_channel_fill_max_consecutive_channels must be >= 1.")
+    if int(output_bad_channel_fill_min_valid_neighbors) not in (1, 2):
+        raise ValueError("output_bad_channel_fill_min_valid_neighbors must be 1 or 2.")
+    if output_bad_channel_fill_half_window_channels is not None and int(output_bad_channel_fill_half_window_channels) < 1:
+        raise ValueError("output_bad_channel_fill_half_window_channels must be >= 1 when provided.")
+    if not np.isfinite(float(output_bad_channel_fill_curvature_sigma_threshold)) or float(output_bad_channel_fill_curvature_sigma_threshold) <= 0.0:
+        raise ValueError("output_bad_channel_fill_curvature_sigma_threshold must be > 0.")
+    if not np.isfinite(float(output_bad_channel_fill_edge_consistency_sigma_max)) or float(output_bad_channel_fill_edge_consistency_sigma_max) <= 0.0:
+        raise ValueError("output_bad_channel_fill_edge_consistency_sigma_max must be > 0.")
+    output_bad_channel_fill_fallback_policy_norm = str(output_bad_channel_fill_fallback_policy or "linear").strip().lower()
+    if output_bad_channel_fill_fallback_policy_norm not in ("linear", "none"):
+        raise ValueError("output_bad_channel_fill_fallback_policy must be 'linear' or 'none'.")
 
     v_corr_col_norm = str(v_corr_col or "VFRAME").strip().upper()
 
@@ -1683,7 +2262,39 @@ def make_tastar_dumps(
         ta_calc[on_idx] = ta_grp
         
     ta_calc[~np.isfinite(ta_calc)] = np.nan
-    ta = ta_calc.astype(store_dt)
+    ta_out = np.array(ta_calc, dtype=float, copy=True)
+    on_output_fill_info = {
+        'n_total': np.zeros(len(t_on), dtype=np.int32),
+        'fill_applied': np.zeros(len(t_on), dtype=bool),
+        'fill_nfilled': np.zeros(len(t_on), dtype=np.int32),
+        'has_edge_unfilled': np.zeros(len(t_on), dtype=bool),
+        'poly2_applied': np.zeros(len(t_on), dtype=bool),
+        'linear_applied': np.zeros(len(t_on), dtype=bool),
+        'poly2_runs': np.zeros(len(t_on), dtype=np.int32),
+        'linear_runs': np.zeros(len(t_on), dtype=np.int32),
+        'none_runs': np.zeros(len(t_on), dtype=np.int32),
+        'curvature_score_max': np.full(len(t_on), np.nan, dtype=float),
+        'edge_consistency_score_max': np.full(len(t_on), np.nan, dtype=float),
+        'local_sigma_median': np.full(len(t_on), np.nan, dtype=float),
+    }
+    if (global_bad_channels_raw or bad_channel_map_norm) and output_bad_channel_fill_policy_norm != 'none':
+        ta_out, on_output_fill_info, on_output_fill_used_keys = _apply_output_bad_channel_fill_to_state(
+            ta_out,
+            mapping_on,
+            key_cols=bad_channel_group_cols,
+            global_bad_channels_raw=global_bad_channels_raw,
+            bad_channel_map_norm=bad_channel_map_norm,
+            ch_start=ch_start,
+            ch_stop=ch_stop,
+            output_bad_channel_fill_policy=output_bad_channel_fill_policy_norm,
+            output_bad_channel_fill_max_consecutive_channels=int(output_bad_channel_fill_max_consecutive_channels),
+            output_bad_channel_fill_min_valid_neighbors=int(output_bad_channel_fill_min_valid_neighbors),
+            output_bad_channel_fill_half_window_channels=(None if output_bad_channel_fill_half_window_channels is None else int(output_bad_channel_fill_half_window_channels)),
+            output_bad_channel_fill_curvature_sigma_threshold=float(output_bad_channel_fill_curvature_sigma_threshold),
+            output_bad_channel_fill_edge_consistency_sigma_max=float(output_bad_channel_fill_edge_consistency_sigma_max),
+            output_bad_channel_fill_fallback_policy=output_bad_channel_fill_fallback_policy_norm,
+        )
+    ta = ta_out.astype(store_dt)
 
     # -------------------------------------------------------------------------
     # Metadata Table Construction
@@ -1719,6 +2330,18 @@ def make_tastar_dumps(
         table["BADCHAN_INTERP_NFILLED"] = on_bad_info["interp_nfilled"].astype(np.int32)
         table["BADCHAN_HAS_EDGE_UNFILLED"] = on_bad_info["has_edge_unfilled"].astype(bool)
         table["BADCHAN_SHAPE_INTERP_APPLIED"] = on_bad_info["shape_interp_applied"].astype(bool)
+        table["BADCHAN_OUTFILL_POLICY"] = output_bad_channel_fill_policy_norm
+        table["BADCHAN_OUTFILL_APPLIED"] = on_output_fill_info["fill_applied"].astype(bool)
+        table["BADCHAN_OUTFILL_NFILLED"] = on_output_fill_info["fill_nfilled"].astype(np.int32)
+        table["BADCHAN_OUTFILL_HAS_EDGE_UNFILLED"] = on_output_fill_info["has_edge_unfilled"].astype(bool)
+        table["BADCHAN_OUTFILL_POLY2_APPLIED"] = on_output_fill_info["poly2_applied"].astype(bool)
+        table["BADCHAN_OUTFILL_LINEAR_APPLIED"] = on_output_fill_info["linear_applied"].astype(bool)
+        table["BADCHAN_OUTFILL_POLY2_RUNS"] = on_output_fill_info["poly2_runs"].astype(np.int32)
+        table["BADCHAN_OUTFILL_LINEAR_RUNS"] = on_output_fill_info["linear_runs"].astype(np.int32)
+        table["BADCHAN_OUTFILL_NONE_RUNS"] = on_output_fill_info["none_runs"].astype(np.int32)
+        table["BADCHAN_OUTFILL_CURV_SCORE_MAX"] = on_output_fill_info["curvature_score_max"].astype(float)
+        table["BADCHAN_OUTFILL_EDGE_SCORE_MAX"] = on_output_fill_info["edge_consistency_score_max"].astype(float)
+        table["BADCHAN_OUTFILL_LOCAL_SIGMA_MED"] = on_output_fill_info["local_sigma_median"].astype(float)
     if qc_spur_sigma is not None and bool(qc_spur_consider_on):
         table["REF_QC_ON_PRESCREEN_QD"] = on_prescreen_qd
         table["REF_QC_ON_PRESCREEN_CANDIDATE"] = on_prescreen_candidate
@@ -1739,6 +2362,20 @@ def make_tastar_dumps(
         off_spur_auto_bad,
         ch_start=int(ch_start),
     )
+    hot_spur_peak_score_summary, hot_spur_peak_score_top = _summarize_spur_peak_channel_scores(
+        hot_spur_peak_index,
+        hot_spur_auto_bad,
+        hot_spur_scores,
+        hot_spur_threshold,
+        ch_start=int(ch_start),
+    )
+    off_spur_peak_score_summary, off_spur_peak_score_top = _summarize_spur_peak_channel_scores(
+        off_spur_peak_index,
+        off_spur_auto_bad,
+        off_spur_scores,
+        off_spur_threshold,
+        ch_start=int(ch_start),
+    )
 
     hot_spur_top_ch_raw = hot_spur_peak_top[0]["channel"] if len(hot_spur_peak_top) > 0 else None
     hot_spur_top_count = hot_spur_peak_top[0]["count"] if len(hot_spur_peak_top) > 0 else 0
@@ -1748,6 +2385,10 @@ def make_tastar_dumps(
     off_spur_peak_counts_json = json.dumps(off_spur_peak_counts, ensure_ascii=False, sort_keys=True)
     hot_spur_peak_top_json = json.dumps(hot_spur_peak_top, ensure_ascii=False)
     off_spur_peak_top_json = json.dumps(off_spur_peak_top, ensure_ascii=False)
+    hot_spur_peak_score_summary_json = json.dumps(hot_spur_peak_score_summary, ensure_ascii=False, sort_keys=True)
+    off_spur_peak_score_summary_json = json.dumps(off_spur_peak_score_summary, ensure_ascii=False, sort_keys=True)
+    hot_spur_peak_score_top_json = json.dumps(hot_spur_peak_score_top, ensure_ascii=False)
+    off_spur_peak_score_top_json = json.dumps(off_spur_peak_score_top, ensure_ascii=False)
 
     if (qc_sigma is not None) or (qc_spur_sigma is not None):
         table["QC_REF_HOT_AUTO_BAD"] = int(np.count_nonzero(hot_auto_bad))
@@ -1764,6 +2405,10 @@ def make_tastar_dumps(
         table["QC_REF_OFF_SPUR_PEAK_COUNTS_RAW_JSON"] = off_spur_peak_counts_json
         table["QC_REF_HOT_SPUR_PEAK_TOP_RAW_JSON"] = hot_spur_peak_top_json
         table["QC_REF_OFF_SPUR_PEAK_TOP_RAW_JSON"] = off_spur_peak_top_json
+        table["QC_REF_HOT_SPUR_PEAK_SCORE_SUMMARY_RAW_JSON"] = hot_spur_peak_score_summary_json
+        table["QC_REF_OFF_SPUR_PEAK_SCORE_SUMMARY_RAW_JSON"] = off_spur_peak_score_summary_json
+        table["QC_REF_HOT_SPUR_PEAK_SCORE_TOP_RAW_JSON"] = hot_spur_peak_score_top_json
+        table["QC_REF_OFF_SPUR_PEAK_SCORE_TOP_RAW_JSON"] = off_spur_peak_score_top_json
         table["QC_ON_PRESCREEN_CANDIDATE"] = int(np.count_nonzero(on_prescreen_candidate)) if bool(qc_spur_consider_on) else 0
         table["QC_ON_SPUR_AUTO_BAD"] = int(np.count_nonzero(on_spur_auto_bad)) if bool(qc_spur_consider_on) else 0
         table["QC_SIGMA"] = np.nan if qc_sigma is None else float(qc_sigma)
@@ -1790,6 +2435,10 @@ def make_tastar_dumps(
             "off_spur_peak_channel_counts_raw": off_spur_peak_counts,
             "hot_spur_peak_channel_top_raw": hot_spur_peak_top,
             "off_spur_peak_channel_top_raw": off_spur_peak_top,
+            "hot_spur_peak_channel_score_summary_raw": hot_spur_peak_score_summary,
+            "off_spur_peak_channel_score_summary_raw": off_spur_peak_score_summary,
+            "hot_spur_peak_channel_score_top_raw": hot_spur_peak_score_top,
+            "off_spur_peak_channel_score_top_raw": off_spur_peak_score_top,
             "on_spur_prescreen_candidate": int(np.count_nonzero(on_prescreen_candidate)) if bool(qc_spur_consider_on) else 0,
             "on_spur_auto_bad_would_flag": int(np.count_nonzero(on_spur_auto_bad)) if bool(qc_spur_consider_on) else 0,
             "hot_used_rows": int(np.count_nonzero(hot_keep)),
@@ -1800,6 +2449,13 @@ def make_tastar_dumps(
         table.attrs["bad_channel_summary"] = {
             "policy": bad_channel_policy_norm,
             "interp_max_consecutive_channels": int(bad_channel_interp_max_consecutive_channels),
+            "output_fill_policy": output_bad_channel_fill_policy_norm,
+            "output_fill_max_consecutive_channels": int(output_bad_channel_fill_max_consecutive_channels),
+            "output_fill_min_valid_neighbors": int(output_bad_channel_fill_min_valid_neighbors),
+            "output_fill_half_window_channels": (None if output_bad_channel_fill_half_window_channels is None else int(output_bad_channel_fill_half_window_channels)),
+            "output_fill_curvature_sigma_threshold": float(output_bad_channel_fill_curvature_sigma_threshold),
+            "output_fill_edge_consistency_sigma_max": float(output_bad_channel_fill_edge_consistency_sigma_max),
+            "output_fill_fallback_policy": output_bad_channel_fill_fallback_policy_norm,
             "global_bad_channels_raw_count": int(len(global_bad_channels_raw)),
             "shape_interp_applied_rows": int(np.count_nonzero(on_bad_info["shape_interp_applied"])),
             "bad_channel_group_cols": list(bad_channel_group_cols),
@@ -1818,6 +2474,14 @@ def make_tastar_dumps(
             "on_has_edge_unfilled_any": bool(np.any(on_bad_info["has_edge_unfilled"])),
             "off_has_edge_unfilled_any": bool(np.any(off_bad_info["has_edge_unfilled"])),
             "hot_has_edge_unfilled_any": bool(np.any(hot_bad_info["has_edge_unfilled"])),
+            "on_output_fill_rows": int(np.count_nonzero(on_output_fill_info["fill_applied"])),
+            "on_output_fill_nfilled_total": int(np.sum(on_output_fill_info["fill_nfilled"])),
+            "on_output_fill_has_edge_unfilled_any": bool(np.any(on_output_fill_info["has_edge_unfilled"])),
+            "on_output_fill_poly2_rows": int(np.count_nonzero(on_output_fill_info["poly2_applied"])),
+            "on_output_fill_linear_rows": int(np.count_nonzero(on_output_fill_info["linear_applied"])),
+            "on_output_fill_poly2_runs_total": int(np.sum(on_output_fill_info["poly2_runs"])),
+            "on_output_fill_linear_runs_total": int(np.sum(on_output_fill_info["linear_runs"])),
+            "on_output_fill_none_runs_total": int(np.sum(on_output_fill_info["none_runs"])),
         }
 
     if rest_freq is not None:
@@ -1890,6 +2554,13 @@ def tastar_from_rawspec(
     bad_channel_policy: str = "nan",
     bad_channel_interp_max_consecutive_channels: int = 3,
     bad_channel_interp_min_valid_neighbors: int = 1,
+    output_bad_channel_fill_policy: str = "none",
+    output_bad_channel_fill_max_consecutive_channels: int = 3,
+    output_bad_channel_fill_min_valid_neighbors: int = 2,
+    output_bad_channel_fill_half_window_channels: Optional[int] = None,
+    output_bad_channel_fill_curvature_sigma_threshold: float = 1.0,
+    output_bad_channel_fill_edge_consistency_sigma_max: float = 3.0,
+    output_bad_channel_fill_fallback_policy: str = "linear",
     qc_apply_flagrow: bool = False,
     verbose: bool = True,
 ) -> Scantable:
@@ -1925,6 +2596,13 @@ def tastar_from_rawspec(
         bad_channel_policy=bad_channel_policy,
         bad_channel_interp_max_consecutive_channels=bad_channel_interp_max_consecutive_channels,
         bad_channel_interp_min_valid_neighbors=bad_channel_interp_min_valid_neighbors,
+        output_bad_channel_fill_policy=output_bad_channel_fill_policy,
+        output_bad_channel_fill_max_consecutive_channels=output_bad_channel_fill_max_consecutive_channels,
+        output_bad_channel_fill_min_valid_neighbors=output_bad_channel_fill_min_valid_neighbors,
+        output_bad_channel_fill_half_window_channels=output_bad_channel_fill_half_window_channels,
+        output_bad_channel_fill_curvature_sigma_threshold=output_bad_channel_fill_curvature_sigma_threshold,
+        output_bad_channel_fill_edge_consistency_sigma_max=output_bad_channel_fill_edge_consistency_sigma_max,
+        output_bad_channel_fill_fallback_policy=output_bad_channel_fill_fallback_policy,
         qc_apply_flagrow=qc_apply_flagrow,
         verbose=verbose,
     )
@@ -1967,6 +2645,13 @@ def run_tastar_calibration(
     bad_channel_policy: str = "nan",
     bad_channel_interp_max_consecutive_channels: int = 3,
     bad_channel_interp_min_valid_neighbors: int = 1,
+    output_bad_channel_fill_policy: str = "none",
+    output_bad_channel_fill_max_consecutive_channels: int = 3,
+    output_bad_channel_fill_min_valid_neighbors: int = 2,
+    output_bad_channel_fill_half_window_channels: Optional[int] = None,
+    output_bad_channel_fill_curvature_sigma_threshold: float = 1.0,
+    output_bad_channel_fill_edge_consistency_sigma_max: float = 3.0,
+    output_bad_channel_fill_fallback_policy: str = "linear",
     qc_apply_flagrow: bool = False,
     verbose: bool = True,
 ) -> Scantable:
@@ -2024,6 +2709,13 @@ def run_tastar_calibration(
         bad_channel_policy=bad_channel_policy,
         bad_channel_interp_max_consecutive_channels=bad_channel_interp_max_consecutive_channels,
         bad_channel_interp_min_valid_neighbors=bad_channel_interp_min_valid_neighbors,
+        output_bad_channel_fill_policy=output_bad_channel_fill_policy,
+        output_bad_channel_fill_max_consecutive_channels=output_bad_channel_fill_max_consecutive_channels,
+        output_bad_channel_fill_min_valid_neighbors=output_bad_channel_fill_min_valid_neighbors,
+        output_bad_channel_fill_half_window_channels=output_bad_channel_fill_half_window_channels,
+        output_bad_channel_fill_curvature_sigma_threshold=output_bad_channel_fill_curvature_sigma_threshold,
+        output_bad_channel_fill_edge_consistency_sigma_max=output_bad_channel_fill_edge_consistency_sigma_max,
+        output_bad_channel_fill_fallback_policy=output_bad_channel_fill_fallback_policy,
         qc_apply_flagrow=qc_apply_flagrow,
         verbose=verbose,
     )
@@ -2071,6 +2763,26 @@ def run_tastar_calibration(
             top_count = int(res.table["QC_REF_OFF_SPUR_TOP_COUNT"].iloc[0]) if "QC_REF_OFF_SPUR_TOP_COUNT" in res.table.columns else 0
             if pd.notna(top_ch) and top_count > 0:
                 qc_summary["off_spur_peak_channel_top_raw"] = [{"channel": int(top_ch), "count": int(top_count)}]
+        if "hot_spur_peak_channel_score_summary_raw" not in qc_summary and "QC_REF_HOT_SPUR_PEAK_SCORE_SUMMARY_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["hot_spur_peak_channel_score_summary_raw"] = json.loads(str(res.table["QC_REF_HOT_SPUR_PEAK_SCORE_SUMMARY_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "off_spur_peak_channel_score_summary_raw" not in qc_summary and "QC_REF_OFF_SPUR_PEAK_SCORE_SUMMARY_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["off_spur_peak_channel_score_summary_raw"] = json.loads(str(res.table["QC_REF_OFF_SPUR_PEAK_SCORE_SUMMARY_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "hot_spur_peak_channel_score_top_raw" not in qc_summary and "QC_REF_HOT_SPUR_PEAK_SCORE_TOP_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["hot_spur_peak_channel_score_top_raw"] = json.loads(str(res.table["QC_REF_HOT_SPUR_PEAK_SCORE_TOP_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "off_spur_peak_channel_score_top_raw" not in qc_summary and "QC_REF_OFF_SPUR_PEAK_SCORE_TOP_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["off_spur_peak_channel_score_top_raw"] = json.loads(str(res.table["QC_REF_OFF_SPUR_PEAK_SCORE_TOP_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
 
     history = {
         'task': 'sdrsf-make-tastar', 'input': input_name,
@@ -2096,6 +2808,13 @@ def run_tastar_calibration(
         'bad_channel_policy': str(bad_channel_policy),
         'bad_channel_interp_max_consecutive_channels': int(bad_channel_interp_max_consecutive_channels),
         'bad_channel_interp_min_valid_neighbors': int(bad_channel_interp_min_valid_neighbors),
+        'output_bad_channel_fill_policy': str(output_bad_channel_fill_policy),
+        'output_bad_channel_fill_max_consecutive_channels': int(output_bad_channel_fill_max_consecutive_channels),
+        'output_bad_channel_fill_min_valid_neighbors': int(output_bad_channel_fill_min_valid_neighbors),
+        'output_bad_channel_fill_half_window_channels': (None if output_bad_channel_fill_half_window_channels is None else int(output_bad_channel_fill_half_window_channels)),
+        'output_bad_channel_fill_curvature_sigma_threshold': float(output_bad_channel_fill_curvature_sigma_threshold),
+        'output_bad_channel_fill_edge_consistency_sigma_max': float(output_bad_channel_fill_edge_consistency_sigma_max),
+        'output_bad_channel_fill_fallback_policy': str(output_bad_channel_fill_fallback_policy),
         'bad_channel_summary': dict(res.table.attrs.get('bad_channel_summary', {})),
         'calibration_group_cols': list(_resolve_existing_columns_ci(res.table, ['FDNUM', 'IFNUM', 'PLNUM'])),
         'qc_summary': qc_summary,
