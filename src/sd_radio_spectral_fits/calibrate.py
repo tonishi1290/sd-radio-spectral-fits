@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import builtins
+import json
+from statistics import NormalDist
 from typing import Optional, Tuple, Union, Any, Sequence
 
 import numpy as np
@@ -407,6 +409,95 @@ def _rolling_median_1d(values: np.ndarray, window: int) -> np.ndarray:
     return pd.Series(arr).rolling(window=win, center=True, min_periods=1).median().to_numpy(dtype=float)
 
 
+_STD_NORMAL = NormalDist()
+_QC_SPUR_TRIAL_REF_CHANNELS = 512
+_QC_SPUR_ON_PRESCREEN_QD_THRESHOLD = 8.0
+_QC_SPUR_ON_ISO_MIN_RATIO = 3.0
+
+
+def _effective_trial_count_for_narrow_runs(n_valid: int, max_run: int) -> int:
+    n = int(n_valid)
+    lmax = int(max_run)
+    if n <= 0 or lmax <= 0:
+        return 0
+    use_lmax = builtins.min(lmax, n)
+    return int(sum((n - ell + 1) for ell in range(1, use_lmax + 1)))
+
+
+def _trial_corrected_spur_threshold(
+    base_sigma: float,
+    *,
+    n_valid: int,
+    max_run: int,
+    n_ref: int = _QC_SPUR_TRIAL_REF_CHANNELS,
+) -> float:
+    q_ref = float(base_sigma)
+    if not np.isfinite(q_ref) or q_ref < 0.0:
+        raise ValueError('qc_spur_sigma must be finite and >= 0.')
+    m_ref = _effective_trial_count_for_narrow_runs(int(n_ref), int(max_run))
+    m_cur = _effective_trial_count_for_narrow_runs(int(n_valid), int(max_run))
+    if m_ref <= 0 or m_cur <= 0 or q_ref == 0.0:
+        return q_ref
+
+    trial_ratio = float(m_cur) / float(m_ref)
+    if not np.isfinite(trial_ratio) or trial_ratio <= 0.0:
+        return q_ref
+
+    # Moderate thresholds can use the exact NormalDist path safely.
+    # For very large q_ref, 1 - cdf(q_ref) underflows to 0.0 and the old
+    # implementation saturated around inv_cdf(1 - 1e-15) ~= 7.94.
+    # Use a Mills-ratio based asymptotic solve in that regime so that
+    # qc_spur_sigma remains monotonic and effectively unbounded.
+    if q_ref <= 8.0:
+        p_ref = 2.0 * (1.0 - _STD_NORMAL.cdf(q_ref))
+        p_ref = float(np.clip(p_ref, 1.0e-300, 1.0 - 1.0e-15))
+        alpha_row = 1.0 - (1.0 - p_ref) ** float(m_ref)
+        alpha_row = float(np.clip(alpha_row, 1.0e-300, 1.0 - 1.0e-15))
+        p_cur = 1.0 - (1.0 - alpha_row) ** (1.0 / float(m_cur))
+        p_cur = float(np.clip(p_cur, 1.0e-300, 1.0 - 1.0e-15))
+        tail_prob = 1.0 - (p_cur / 2.0)
+        tail_prob = float(np.clip(tail_prob, 1.0e-15, 1.0 - 1.0e-15))
+        return float(_STD_NORMAL.inv_cdf(tail_prob))
+
+    target = 0.5 * q_ref * q_ref + float(np.log(q_ref)) + float(np.log(trial_ratio))
+    q = float(np.sqrt(builtins.max(q_ref * q_ref + 2.0 * float(np.log(trial_ratio)), 1.0e-12)))
+    q = builtins.max(q, 1.0e-12)
+
+    for _ in range(8):
+        g = 0.5 * q * q + float(np.log(q)) - target
+        gp = q + (1.0 / q)
+        step = g / gp
+        q_new = q - step
+        if (not np.isfinite(q_new)) or q_new <= 0.0:
+            break
+        if abs(q_new - q) <= 1.0e-12 * builtins.max(1.0, abs(q)):
+            q = q_new
+            break
+        q = q_new
+
+    return float(builtins.max(q, 0.0))
+
+
+def _compute_abs_normalized_residual_1d(spec: np.ndarray, window: int) -> tuple[np.ndarray | None, float, float]:
+    arr = np.asarray(spec, dtype=float)
+    if arr.ndim != 1:
+        raise ValueError(f'spectrum must be 1-D, got shape={arr.shape}')
+    finite = np.isfinite(arr)
+    if np.count_nonzero(finite) < 3:
+        return None, np.nan, np.nan
+
+    baseline = _rolling_median_1d(arr, int(window))
+    resid = arr - baseline
+    scale = _robust_mad_scale_1d(resid[finite])
+    if not np.isfinite(scale) or scale <= 0.0:
+        return None, np.nan, np.nan
+
+    zabs = np.full(arr.shape, np.nan, dtype=float)
+    zabs[finite] = np.abs(resid[finite]) / float(scale)
+    abspeak = float(np.nanmax(np.abs(resid[finite])))
+    return zabs, abspeak, float(scale)
+
+
 def _narrow_spur_qc_rows(
     spectra: np.ndarray,
     *,
@@ -414,50 +505,61 @@ def _narrow_spur_qc_rows(
     spur_sigma: float,
     spur_window_channels: int,
     spur_max_consecutive_channels: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    trial_correct_by_window_size: bool = False,
+    trial_ref_channels: int = _QC_SPUR_TRIAL_REF_CHANNELS,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     data = np.asarray(spectra, dtype=float)
     if data.ndim != 2:
-        raise ValueError(f"spectra must be 2-D, got shape={data.shape}")
+        raise ValueError(f'spectra must be 2-D, got shape={data.shape}')
 
     nrow = data.shape[0]
     cand = np.ones(nrow, dtype=bool) if candidate_mask is None else np.asarray(candidate_mask, dtype=bool)
     if cand.shape != (nrow,):
-        raise ValueError(f"candidate_mask shape mismatch: {cand.shape} != ({nrow},)")
+        raise ValueError(f'candidate_mask shape mismatch: {cand.shape} != ({nrow},)')
 
     score = np.full(nrow, np.nan, dtype=float)
     abspeak = np.full(nrow, np.nan, dtype=float)
     runlen = np.zeros(nrow, dtype=np.int32)
+    peak_index = np.full(nrow, -1, dtype=np.int32)
+    applied_sigma = np.full(nrow, np.nan, dtype=float)
     auto_bad = np.zeros(nrow, dtype=bool)
 
     thresh_sigma = float(spur_sigma)
     max_run = int(spur_max_consecutive_channels)
     if thresh_sigma < 0:
-        raise ValueError("qc_spur_sigma must be >= 0.")
+        raise ValueError('qc_spur_sigma must be >= 0.')
     if max_run < 1:
-        raise ValueError("qc_spur_max_consecutive_channels must be >= 1.")
+        raise ValueError('qc_spur_max_consecutive_channels must be >= 1.')
 
     for i in range(nrow):
         if not cand[i]:
             continue
 
         spec = data[i]
-        finite = np.isfinite(spec)
-        if np.count_nonzero(finite) < 3:
+        zabs, row_abspeak, _ = _compute_abs_normalized_residual_1d(spec, int(spur_window_channels))
+        if zabs is None:
             continue
 
-        baseline = _rolling_median_1d(spec, int(spur_window_channels))
-        resid = spec - baseline
-        resid_valid = resid[finite]
-        scale = _robust_mad_scale_1d(resid_valid)
-        if not np.isfinite(scale) or scale <= 0.0:
-            continue
+        finite = np.isfinite(zabs)
+        n_valid = int(np.count_nonzero(finite))
+        row_score = float(np.nanmax(zabs[finite]))
+        score[i] = row_score
+        abspeak[i] = float(row_abspeak)
+        peak_index[i] = int(np.nanargmax(zabs))
 
-        abs_resid = np.abs(resid)
-        score[i] = float(np.nanmax(abs_resid[finite] / scale))
-        abspeak[i] = float(np.nanmax(abs_resid[finite]))
+        if bool(trial_correct_by_window_size):
+            row_sigma = _trial_corrected_spur_threshold(
+                thresh_sigma,
+                n_valid=n_valid,
+                max_run=max_run,
+                n_ref=int(trial_ref_channels),
+            )
+        else:
+            row_sigma = float(thresh_sigma)
+        applied_sigma[i] = row_sigma
 
         exceed = np.zeros_like(finite, dtype=bool)
-        exceed[finite] = abs_resid[finite] > (thresh_sigma * scale)
+        exceed[finite] = zabs[finite] > row_sigma
         if not np.any(exceed):
             continue
 
@@ -468,13 +570,184 @@ def _narrow_spur_qc_rows(
         if starts.size == 0 or ends.size == 0:
             continue
 
-        narrow_lengths = [int(e - s) for s, e in zip(starts, ends) if 1 <= int(e - s) <= max_run]
-        if narrow_lengths:
+        best_peak = -1
+        best_score = -np.inf
+        best_runlen = 0
+        for s, e in zip(starts, ends):
+            seg_len = int(e - s)
+            if not (1 <= seg_len <= max_run):
+                continue
+            local_idx = int(s + np.nanargmax(zabs[s:e]))
+            local_score = float(zabs[local_idx])
+            if (local_score > best_score) or (np.isfinite(local_score) and local_score == best_score and seg_len > best_runlen):
+                best_score = local_score
+                best_peak = local_idx
+                best_runlen = seg_len
+
+        if best_peak >= 0:
             auto_bad[i] = True
-            runlen[i] = int(max(narrow_lengths))
+            runlen[i] = int(best_runlen)
+            peak_index[i] = int(best_peak)
 
-    return auto_bad, score, abspeak, runlen
+    return auto_bad, score, abspeak, runlen, peak_index, applied_sigma
 
+
+def _summarize_spur_peak_channels(
+    peak_index: np.ndarray,
+    auto_bad: np.ndarray,
+    *,
+    ch_start: int,
+    top_n: int = 10,
+) -> tuple[dict[str, int], list[dict[str, int]]]:
+    peak = np.asarray(peak_index, dtype=int).reshape(-1)
+    bad = np.asarray(auto_bad, dtype=bool).reshape(-1)
+    if peak.shape != bad.shape:
+        raise ValueError('peak_index/auto_bad shape mismatch in peak summary helper.')
+
+    valid = bad & (peak >= 0)
+    if not np.any(valid):
+        return {}, []
+
+    raw_peak = peak[valid].astype(np.int64, copy=False) + int(ch_start)
+    uniq, cnt = np.unique(raw_peak, return_counts=True)
+    order = np.lexsort((uniq, -cnt))
+    uniq = uniq[order]
+    cnt = cnt[order]
+
+    counts = {str(int(ch)): int(n) for ch, n in zip(uniq.tolist(), cnt.tolist())}
+    top = [
+        {"channel": int(ch), "count": int(n)}
+        for ch, n in zip(uniq[:builtins.max(0, int(top_n))].tolist(), cnt[:builtins.max(0, int(top_n))].tolist())
+    ]
+    return counts, top
+
+
+def _spur_prescreen_qd_rows(
+    spectra: np.ndarray,
+    *,
+    candidate_mask: np.ndarray | None,
+    qd_threshold: float = _QC_SPUR_ON_PRESCREEN_QD_THRESHOLD,
+) -> tuple[np.ndarray, np.ndarray]:
+    data = np.asarray(spectra, dtype=float)
+    if data.ndim != 2:
+        raise ValueError(f'spectra must be 2-D, got shape={data.shape}')
+
+    nrow = data.shape[0]
+    cand0 = np.ones(nrow, dtype=bool) if candidate_mask is None else np.asarray(candidate_mask, dtype=bool)
+    if cand0.shape != (nrow,):
+        raise ValueError(f'candidate_mask shape mismatch: {cand0.shape} != ({nrow},)')
+
+    qd_score = np.full(nrow, np.nan, dtype=float)
+    prescreen_candidate = np.zeros(nrow, dtype=bool)
+
+    thresh = float(qd_threshold)
+    if thresh < 0:
+        raise ValueError('qd_threshold must be >= 0.')
+
+    for i in range(nrow):
+        if not cand0[i]:
+            continue
+        spec = data[i]
+        finite_idx = np.flatnonzero(np.isfinite(spec))
+        if finite_idx.size < 3:
+            continue
+        adjacent = np.diff(finite_idx) == 1
+        if not np.any(adjacent):
+            continue
+        diffs = np.diff(spec[finite_idx])[adjacent]
+        if diffs.size < 2:
+            continue
+        scale_d = _robust_mad_scale_1d(diffs)
+        if not np.isfinite(scale_d) or scale_d <= 0.0:
+            continue
+        qd = float(np.nanmax(np.abs(diffs)) / scale_d)
+        qd_score[i] = qd
+        prescreen_candidate[i] = bool(qd > thresh)
+
+    return prescreen_candidate, qd_score
+
+
+def _nearest_valid_row_indices(valid_mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    valid = np.asarray(valid_mask, dtype=bool).reshape(-1)
+    n = valid.size
+    prev_idx = np.full(n, -1, dtype=np.int32)
+    next_idx = np.full(n, -1, dtype=np.int32)
+    last = -1
+    for i in range(n):
+        prev_idx[i] = last
+        if valid[i]:
+            last = i
+    last = -1
+    for i in range(n - 1, -1, -1):
+        next_idx[i] = last
+        if valid[i]:
+            last = i
+    return prev_idx, next_idx
+
+
+def _on_spur_isolation_scores(
+    spectra: np.ndarray,
+    *,
+    candidate_mask: np.ndarray,
+    peak_index: np.ndarray,
+    score: np.ndarray,
+    valid_neighbor_mask: np.ndarray,
+    spur_window_channels: int,
+    neighbor_half_window_channels: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    data = np.asarray(spectra, dtype=float)
+    if data.ndim != 2:
+        raise ValueError(f'spectra must be 2-D, got shape={data.shape}')
+
+    nrow = data.shape[0]
+    cand = np.asarray(candidate_mask, dtype=bool)
+    peak = np.asarray(peak_index, dtype=int)
+    row_score = np.asarray(score, dtype=float)
+    valid = np.asarray(valid_neighbor_mask, dtype=bool)
+    if cand.shape != (nrow,) or peak.shape != (nrow,) or row_score.shape != (nrow,) or valid.shape != (nrow,):
+        raise ValueError('isolation helper input shape mismatch.')
+
+    iso_score = np.full(nrow, np.nan, dtype=float)
+    neighbor_score = np.full(nrow, np.nan, dtype=float)
+    prev_idx, next_idx = _nearest_valid_row_indices(valid)
+    cache: dict[int, np.ndarray | None] = {}
+
+    def _get_zabs(row_idx: int) -> np.ndarray | None:
+        if row_idx in cache:
+            return cache[row_idx]
+        zabs, _, _ = _compute_abs_normalized_residual_1d(data[row_idx], int(spur_window_channels))
+        cache[row_idx] = zabs
+        return zabs
+
+    half = builtins.max(0, int(neighbor_half_window_channels))
+    nchan = data.shape[1]
+    eps = 1.0e-12
+
+    for i in range(nrow):
+        if (not cand[i]) or (peak[i] < 0) or (not np.isfinite(row_score[i])):
+            continue
+        local_neighbors = []
+        for j in (int(prev_idx[i]), int(next_idx[i])):
+            if j < 0:
+                continue
+            zabs_j = _get_zabs(j)
+            if zabs_j is None:
+                continue
+            p = int(peak[i])
+            lo = builtins.max(0, p - half)
+            hi = builtins.min(nchan, p + half + 1)
+            if hi <= lo:
+                continue
+            local_max = float(np.nanmax(zabs_j[lo:hi]))
+            if np.isfinite(local_max):
+                local_neighbors.append(local_max)
+        if not local_neighbors:
+            continue
+        nbr = float(builtins.max(local_neighbors))
+        neighbor_score[i] = nbr
+        iso_score[i] = float(row_score[i] / builtins.max(nbr, eps))
+
+    return iso_score, neighbor_score
 
 
 def _normalize_external_key_value(value: Any) -> Any:
@@ -651,19 +924,21 @@ def _apply_bad_channel_policy_to_state(
     ch_stop: int,
     bad_channel_policy: str,
     bad_channel_interp_max_consecutive_channels: int,
-) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], set[tuple[Any, ...]]]:
-    data_qc = np.array(spectra, dtype=float, copy=True)
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, np.ndarray], set[tuple[Any, ...]]]:
+    data_spur_qc = np.array(spectra, dtype=float, copy=True)
+    data_shape_qc = np.array(spectra, dtype=float, copy=True)
     data_cal = np.array(spectra, dtype=float, copy=True)
-    if data_qc.ndim != 2:
-        raise ValueError(f"spectra must be 2-D, got shape={data_qc.shape}")
+    if data_spur_qc.ndim != 2:
+        raise ValueError(f'spectra must be 2-D, got shape={data_spur_qc.shape}')
 
-    nrow = data_qc.shape[0]
+    nrow = data_spur_qc.shape[0]
     n_global = np.zeros(nrow, dtype=np.int32)
     n_group = np.zeros(nrow, dtype=np.int32)
     n_total = np.zeros(nrow, dtype=np.int32)
     interp_applied = np.zeros(nrow, dtype=bool)
     interp_nfilled = np.zeros(nrow, dtype=np.int32)
     has_edge_unfilled = np.zeros(nrow, dtype=bool)
+    shape_interp_applied = np.zeros(nrow, dtype=bool)
 
     used_map_keys: set[tuple[Any, ...]] = set()
     group_map = _group_index_map_by_key(mapping_state, key_cols)
@@ -691,11 +966,20 @@ def _apply_bad_channel_policy_to_state(
         if total_local_idx.size == 0:
             continue
 
-        data_qc[np.ix_(idxs, total_local_idx)] = np.nan
+        data_spur_qc[np.ix_(idxs, total_local_idx)] = np.nan
+        data_shape_qc[np.ix_(idxs, total_local_idx)] = np.nan
         data_cal[np.ix_(idxs, total_local_idx)] = np.nan
 
-        if bad_channel_policy == "interp_linear":
-            for ridx in idxs:
+        for ridx in idxs:
+            shape_filled, shape_applied, _, _ = _interp_linear_fill_bad_channels_1d(
+                data_shape_qc[ridx],
+                total_local_idx,
+                max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
+            )
+            data_shape_qc[ridx] = shape_filled
+            shape_interp_applied[ridx] = bool(shape_applied)
+
+            if bad_channel_policy == 'interp_linear':
                 filled, applied, nfill, edge_unfilled = _interp_linear_fill_bad_channels_1d(
                     data_cal[ridx],
                     total_local_idx,
@@ -707,14 +991,16 @@ def _apply_bad_channel_policy_to_state(
                 has_edge_unfilled[ridx] = bool(edge_unfilled)
 
     info = {
-        "n_global": n_global,
-        "n_group": n_group,
-        "n_total": n_total,
-        "interp_applied": interp_applied,
-        "interp_nfilled": interp_nfilled,
-        "has_edge_unfilled": has_edge_unfilled,
+        'n_global': n_global,
+        'n_group': n_group,
+        'n_total': n_total,
+        'interp_applied': interp_applied,
+        'interp_nfilled': interp_nfilled,
+        'has_edge_unfilled': has_edge_unfilled,
+        'shape_interp_applied': shape_interp_applied,
     }
-    return data_qc, data_cal, info, used_map_keys
+    return data_spur_qc, data_shape_qc, data_cal, info, used_map_keys
+
 
 def _resolve_existing_columns_ci(table: pd.DataFrame, preferred: Sequence[str]) -> list[str]:
     actual_by_upper: dict[str, str] = {}
@@ -799,7 +1085,8 @@ def make_tastar_dumps(
     qc_spur_sigma: Optional[float] = None,       # HOT/OFF narrow-band spur QC threshold in residual sigma
     qc_spur_window_channels: int = 31,           # rolling-median window [channels] for spur QC
     qc_spur_max_consecutive_channels: int = 3,   # maximum consecutive channels treated as narrow spur
-    qc_spur_consider_on: bool = False,           # whether to also evaluate ON rows by the same spur QC
+    qc_spur_consider_on: bool = False,           # whether to also evaluate ON rows by state-aware ON spur QC
+    qc_spur_on_apply_flagrow: bool = False,      # whether ON spur auto_bad should also be reflected to FLAGROW
     bad_channels: Optional[Sequence[int]] = None,
     bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None,
     bad_channel_key_columns: Sequence[str] = ("FDNUM", "IFNUM", "PLNUM"),
@@ -1157,7 +1444,7 @@ def make_tastar_dumps(
     global_bad_channels_raw = _resolve_global_bad_channels(bad_channels, bad_channel_ranges)
     bad_channel_map_norm = _normalize_bad_channel_map(bad_channel_map, list(bad_channel_key_columns))
 
-    on2_qc, on2_use, on_bad_info, on_bad_used_keys = _apply_bad_channel_policy_to_state(
+    on2_spur_qc, on2_shape_qc, on2_use, on_bad_info, on_bad_used_keys = _apply_bad_channel_policy_to_state(
         on2_arr,
         mapping_on,
         key_cols=bad_channel_group_cols,
@@ -1168,7 +1455,7 @@ def make_tastar_dumps(
         bad_channel_policy=bad_channel_policy_norm,
         bad_channel_interp_max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
     )
-    off2_qc, off2_use, off_bad_info, off_bad_used_keys = _apply_bad_channel_policy_to_state(
+    off2_spur_qc, off2_shape_qc, off2_use, off_bad_info, off_bad_used_keys = _apply_bad_channel_policy_to_state(
         off2_arr,
         mapping_off,
         key_cols=bad_channel_group_cols,
@@ -1179,7 +1466,7 @@ def make_tastar_dumps(
         bad_channel_policy=bad_channel_policy_norm,
         bad_channel_interp_max_consecutive_channels=int(bad_channel_interp_max_consecutive_channels),
     )
-    hot2_qc, hot2_use, hot_bad_info, hot_bad_used_keys = _apply_bad_channel_policy_to_state(
+    hot2_spur_qc, hot2_shape_qc, hot2_use, hot_bad_info, hot_bad_used_keys = _apply_bad_channel_policy_to_state(
         hot2_arr,
         mapping_hot,
         key_cols=bad_channel_group_cols,
@@ -1222,7 +1509,7 @@ def make_tastar_dumps(
     if qc_sigma is not None and len(mapping_hot) > 0:
         hot_shape_auto_bad, hot_shape_scores = grouped_affine_shape_qc(
             mapping_hot,
-            hot2_qc.astype(float, copy=False),
+            hot2_shape_qc.astype(float, copy=False),
             qc_sigma=float(qc_sigma),
             candidate_mask=(~hot_input_bad),
             group_cols=ref_group_cols,
@@ -1231,37 +1518,66 @@ def make_tastar_dumps(
     if qc_sigma is not None and len(mapping_off) > 0:
         off_shape_auto_bad, off_shape_scores = grouped_affine_shape_qc(
             mapping_off,
-            off2_qc.astype(float, copy=False),
+            off2_shape_qc.astype(float, copy=False),
             qc_sigma=float(qc_sigma),
             candidate_mask=(~off_input_bad),
             group_cols=ref_group_cols,
             min_group_size=3,
         )
 
+    hot_spur_peak_index = np.full(len(mapping_hot), -1, dtype=np.int32)
+    off_spur_peak_index = np.full(len(mapping_off), -1, dtype=np.int32)
+    on_spur_peak_index = np.full(len(mapping_on), -1, dtype=np.int32)
+    hot_spur_threshold = np.full(len(mapping_hot), np.nan, dtype=float)
+    off_spur_threshold = np.full(len(mapping_off), np.nan, dtype=float)
+    on_spur_threshold = np.full(len(mapping_on), np.nan, dtype=float)
+    on_prescreen_candidate = np.zeros(len(mapping_on), dtype=bool)
+    on_prescreen_qd = np.full(len(mapping_on), np.nan, dtype=float)
+    on_iso_scores = np.full(len(mapping_on), np.nan, dtype=float)
+    on_neighbor_scores = np.full(len(mapping_on), np.nan, dtype=float)
+
     if qc_spur_sigma is not None and len(mapping_hot) > 0:
-        hot_spur_auto_bad, hot_spur_scores, hot_spur_abspeak, hot_spur_runlen = _narrow_spur_qc_rows(
-            hot2_qc.astype(float, copy=False),
+        hot_spur_auto_bad, hot_spur_scores, hot_spur_abspeak, hot_spur_runlen, hot_spur_peak_index, hot_spur_threshold = _narrow_spur_qc_rows(
+            hot2_spur_qc.astype(float, copy=False),
             candidate_mask=(~hot_input_bad),
             spur_sigma=float(qc_spur_sigma),
             spur_window_channels=int(qc_spur_window_channels),
             spur_max_consecutive_channels=int(qc_spur_max_consecutive_channels),
+            trial_correct_by_window_size=True,
         )
     if qc_spur_sigma is not None and len(mapping_off) > 0:
-        off_spur_auto_bad, off_spur_scores, off_spur_abspeak, off_spur_runlen = _narrow_spur_qc_rows(
-            off2_qc.astype(float, copy=False),
+        off_spur_auto_bad, off_spur_scores, off_spur_abspeak, off_spur_runlen, off_spur_peak_index, off_spur_threshold = _narrow_spur_qc_rows(
+            off2_spur_qc.astype(float, copy=False),
             candidate_mask=(~off_input_bad),
             spur_sigma=float(qc_spur_sigma),
             spur_window_channels=int(qc_spur_window_channels),
             spur_max_consecutive_channels=int(qc_spur_max_consecutive_channels),
+            trial_correct_by_window_size=True,
         )
     if qc_spur_sigma is not None and bool(qc_spur_consider_on) and len(mapping_on) > 0:
-        on_spur_auto_bad, on_spur_scores, on_spur_abspeak, on_spur_runlen = _narrow_spur_qc_rows(
-            on2_qc.astype(float, copy=False),
+        on_prescreen_candidate, on_prescreen_qd = _spur_prescreen_qd_rows(
+            on2_spur_qc.astype(float, copy=False),
             candidate_mask=(~on_input_bad),
+            qd_threshold=float(_QC_SPUR_ON_PRESCREEN_QD_THRESHOLD),
+        )
+        on_local_auto_bad, on_spur_scores, on_spur_abspeak, on_spur_runlen, on_spur_peak_index, on_spur_threshold = _narrow_spur_qc_rows(
+            on2_spur_qc.astype(float, copy=False),
+            candidate_mask=on_prescreen_candidate,
             spur_sigma=float(qc_spur_sigma),
             spur_window_channels=int(qc_spur_window_channels),
             spur_max_consecutive_channels=int(qc_spur_max_consecutive_channels),
+            trial_correct_by_window_size=True,
         )
+        on_iso_scores, on_neighbor_scores = _on_spur_isolation_scores(
+            on2_spur_qc.astype(float, copy=False),
+            candidate_mask=on_prescreen_candidate,
+            peak_index=on_spur_peak_index,
+            score=on_spur_scores,
+            valid_neighbor_mask=(~on_input_bad),
+            spur_window_channels=int(qc_spur_window_channels),
+            neighbor_half_window_channels=int(qc_spur_max_consecutive_channels),
+        )
+        on_spur_auto_bad = on_local_auto_bad & np.isfinite(on_iso_scores) & (on_iso_scores > float(_QC_SPUR_ON_ISO_MIN_RATIO))
 
     if qc_sigma is not None:
         mapping_hot["REF_QC_SCORE"] = hot_shape_scores
@@ -1273,7 +1589,7 @@ def make_tastar_dumps(
     if qc_apply_flagrow:
         mapping_hot = apply_flagrow(mapping_hot, hot_auto_bad, code=1)
         mapping_off = apply_flagrow(mapping_off, off_auto_bad, code=1)
-        if qc_spur_sigma is not None and bool(qc_spur_consider_on):
+        if qc_spur_sigma is not None and bool(qc_spur_consider_on) and bool(qc_spur_on_apply_flagrow):
             mapping_on = apply_flagrow(mapping_on, on_spur_auto_bad, code=1)
 
     hot_keep = ~flagrow_mask(mapping_hot)
@@ -1285,8 +1601,9 @@ def make_tastar_dumps(
             f"off_shape_auto_bad={int(np.count_nonzero(off_shape_auto_bad))}, "
             f"hot_spur_auto_bad={int(np.count_nonzero(hot_spur_auto_bad))}, "
             f"off_spur_auto_bad={int(np.count_nonzero(off_spur_auto_bad))}, "
+            f"on_spur_prescreen_candidate={int(np.count_nonzero(on_prescreen_candidate)) if bool(qc_spur_consider_on) else 0}, "
             f"on_spur_auto_bad={int(np.count_nonzero(on_spur_auto_bad)) if bool(qc_spur_consider_on) else 0}, "
-            f"apply_flagrow={bool(qc_apply_flagrow)}"
+            f"apply_flagrow={bool(qc_apply_flagrow)}, on_apply_flagrow={bool(qc_spur_on_apply_flagrow)}"
         )
 
     if not np.any(hot_keep):
@@ -1401,11 +1718,37 @@ def make_tastar_dumps(
         table["BADCHAN_INTERP_APPLIED"] = on_bad_info["interp_applied"].astype(bool)
         table["BADCHAN_INTERP_NFILLED"] = on_bad_info["interp_nfilled"].astype(np.int32)
         table["BADCHAN_HAS_EDGE_UNFILLED"] = on_bad_info["has_edge_unfilled"].astype(bool)
+        table["BADCHAN_SHAPE_INTERP_APPLIED"] = on_bad_info["shape_interp_applied"].astype(bool)
     if qc_spur_sigma is not None and bool(qc_spur_consider_on):
+        table["REF_QC_ON_PRESCREEN_QD"] = on_prescreen_qd
+        table["REF_QC_ON_PRESCREEN_CANDIDATE"] = on_prescreen_candidate
         table["REF_QC_ON_SPUR_SCORE"] = on_spur_scores
         table["REF_QC_ON_SPUR_ABSPEAK"] = on_spur_abspeak
         table["REF_QC_ON_SPUR_RUNLEN"] = on_spur_runlen
+        table["REF_QC_ON_SPUR_THRESHOLD"] = on_spur_threshold
+        table["REF_QC_ON_NEIGHBOR_SCORE"] = on_neighbor_scores
+        table["REF_QC_ON_ISO_SCORE"] = on_iso_scores
         table["REF_QC_ON_SPUR_AUTO_BAD"] = on_spur_auto_bad
+    hot_spur_peak_counts, hot_spur_peak_top = _summarize_spur_peak_channels(
+        hot_spur_peak_index,
+        hot_spur_auto_bad,
+        ch_start=int(ch_start),
+    )
+    off_spur_peak_counts, off_spur_peak_top = _summarize_spur_peak_channels(
+        off_spur_peak_index,
+        off_spur_auto_bad,
+        ch_start=int(ch_start),
+    )
+
+    hot_spur_top_ch_raw = hot_spur_peak_top[0]["channel"] if len(hot_spur_peak_top) > 0 else None
+    hot_spur_top_count = hot_spur_peak_top[0]["count"] if len(hot_spur_peak_top) > 0 else 0
+    off_spur_top_ch_raw = off_spur_peak_top[0]["channel"] if len(off_spur_peak_top) > 0 else None
+    off_spur_top_count = off_spur_peak_top[0]["count"] if len(off_spur_peak_top) > 0 else 0
+    hot_spur_peak_counts_json = json.dumps(hot_spur_peak_counts, ensure_ascii=False, sort_keys=True)
+    off_spur_peak_counts_json = json.dumps(off_spur_peak_counts, ensure_ascii=False, sort_keys=True)
+    hot_spur_peak_top_json = json.dumps(hot_spur_peak_top, ensure_ascii=False)
+    off_spur_peak_top_json = json.dumps(off_spur_peak_top, ensure_ascii=False)
+
     if (qc_sigma is not None) or (qc_spur_sigma is not None):
         table["QC_REF_HOT_AUTO_BAD"] = int(np.count_nonzero(hot_auto_bad))
         table["QC_REF_OFF_AUTO_BAD"] = int(np.count_nonzero(off_auto_bad))
@@ -1413,12 +1756,25 @@ def make_tastar_dumps(
         table["QC_REF_OFF_SHAPE_AUTO_BAD"] = int(np.count_nonzero(off_shape_auto_bad))
         table["QC_REF_HOT_SPUR_AUTO_BAD"] = int(np.count_nonzero(hot_spur_auto_bad))
         table["QC_REF_OFF_SPUR_AUTO_BAD"] = int(np.count_nonzero(off_spur_auto_bad))
+        table["QC_REF_HOT_SPUR_TOP_CH_RAW"] = np.nan if hot_spur_top_ch_raw is None else int(hot_spur_top_ch_raw)
+        table["QC_REF_HOT_SPUR_TOP_COUNT"] = int(hot_spur_top_count)
+        table["QC_REF_OFF_SPUR_TOP_CH_RAW"] = np.nan if off_spur_top_ch_raw is None else int(off_spur_top_ch_raw)
+        table["QC_REF_OFF_SPUR_TOP_COUNT"] = int(off_spur_top_count)
+        table["QC_REF_HOT_SPUR_PEAK_COUNTS_RAW_JSON"] = hot_spur_peak_counts_json
+        table["QC_REF_OFF_SPUR_PEAK_COUNTS_RAW_JSON"] = off_spur_peak_counts_json
+        table["QC_REF_HOT_SPUR_PEAK_TOP_RAW_JSON"] = hot_spur_peak_top_json
+        table["QC_REF_OFF_SPUR_PEAK_TOP_RAW_JSON"] = off_spur_peak_top_json
+        table["QC_ON_PRESCREEN_CANDIDATE"] = int(np.count_nonzero(on_prescreen_candidate)) if bool(qc_spur_consider_on) else 0
         table["QC_ON_SPUR_AUTO_BAD"] = int(np.count_nonzero(on_spur_auto_bad)) if bool(qc_spur_consider_on) else 0
         table["QC_SIGMA"] = np.nan if qc_sigma is None else float(qc_sigma)
         table["QC_SPUR_SIGMA"] = np.nan if qc_spur_sigma is None else float(qc_spur_sigma)
         table["QC_SPUR_WINDOW_CH"] = int(qc_spur_window_channels)
         table["QC_SPUR_MAXRUN"] = int(qc_spur_max_consecutive_channels)
+        table["QC_SPUR_TRIAL_REF_CH"] = int(_QC_SPUR_TRIAL_REF_CHANNELS)
         table["QC_SPUR_CONSIDER_ON"] = bool(qc_spur_consider_on)
+        table["QC_SPUR_ON_APPLY_FLAGROW"] = bool(qc_spur_on_apply_flagrow)
+        table["QC_SPUR_ON_PRESCREEN_QD"] = float(_QC_SPUR_ON_PRESCREEN_QD_THRESHOLD)
+        table["QC_SPUR_ON_ISO_MIN_RATIO"] = float(_QC_SPUR_ON_ISO_MIN_RATIO)
         table["QC_APPLY_FLAGROW"] = bool(qc_apply_flagrow)
         table.attrs["qc_summary"] = {
             "hot_input_flagrow_bad": int(np.count_nonzero(hot_input_bad)),
@@ -1430,6 +1786,11 @@ def make_tastar_dumps(
             "off_shape_auto_bad_would_flag": int(np.count_nonzero(off_shape_auto_bad)),
             "hot_spur_auto_bad_would_flag": int(np.count_nonzero(hot_spur_auto_bad)),
             "off_spur_auto_bad_would_flag": int(np.count_nonzero(off_spur_auto_bad)),
+            "hot_spur_peak_channel_counts_raw": hot_spur_peak_counts,
+            "off_spur_peak_channel_counts_raw": off_spur_peak_counts,
+            "hot_spur_peak_channel_top_raw": hot_spur_peak_top,
+            "off_spur_peak_channel_top_raw": off_spur_peak_top,
+            "on_spur_prescreen_candidate": int(np.count_nonzero(on_prescreen_candidate)) if bool(qc_spur_consider_on) else 0,
             "on_spur_auto_bad_would_flag": int(np.count_nonzero(on_spur_auto_bad)) if bool(qc_spur_consider_on) else 0,
             "hot_used_rows": int(np.count_nonzero(hot_keep)),
             "off_used_rows": int(np.count_nonzero(off_keep)),
@@ -1440,6 +1801,7 @@ def make_tastar_dumps(
             "policy": bad_channel_policy_norm,
             "interp_max_consecutive_channels": int(bad_channel_interp_max_consecutive_channels),
             "global_bad_channels_raw_count": int(len(global_bad_channels_raw)),
+            "shape_interp_applied_rows": int(np.count_nonzero(on_bad_info["shape_interp_applied"])),
             "bad_channel_group_cols": list(bad_channel_group_cols),
             "bad_channel_key_columns": list(bad_channel_key_columns),
             "bad_channel_map_keys": int(len(bad_channel_map_norm)),
@@ -1520,6 +1882,7 @@ def tastar_from_rawspec(
     qc_spur_window_channels: int = 31,
     qc_spur_max_consecutive_channels: int = 3,
     qc_spur_consider_on: bool = False,
+    qc_spur_on_apply_flagrow: bool = False,
     bad_channels: Optional[Sequence[int]] = None,
     bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None,
     bad_channel_key_columns: Sequence[str] = ("FDNUM", "IFNUM", "PLNUM"),
@@ -1554,6 +1917,7 @@ def tastar_from_rawspec(
         qc_spur_window_channels=qc_spur_window_channels,
         qc_spur_max_consecutive_channels=qc_spur_max_consecutive_channels,
         qc_spur_consider_on=qc_spur_consider_on,
+        qc_spur_on_apply_flagrow=qc_spur_on_apply_flagrow,
         bad_channels=bad_channels,
         bad_channel_ranges=bad_channel_ranges,
         bad_channel_key_columns=bad_channel_key_columns,
@@ -1595,6 +1959,7 @@ def run_tastar_calibration(
     qc_spur_window_channels: int = 31,
     qc_spur_max_consecutive_channels: int = 3,
     qc_spur_consider_on: bool = False,
+    qc_spur_on_apply_flagrow: bool = False,
     bad_channels: Optional[Sequence[int]] = None,
     bad_channel_ranges: Optional[Sequence[Tuple[int, int]]] = None,
     bad_channel_key_columns: Sequence[str] = ("FDNUM", "IFNUM", "PLNUM"),
@@ -1651,6 +2016,7 @@ def run_tastar_calibration(
         qc_spur_window_channels=qc_spur_window_channels,
         qc_spur_max_consecutive_channels=qc_spur_max_consecutive_channels,
         qc_spur_consider_on=qc_spur_consider_on,
+        qc_spur_on_apply_flagrow=qc_spur_on_apply_flagrow,
         bad_channels=bad_channels,
         bad_channel_ranges=bad_channel_ranges,
         bad_channel_key_columns=bad_channel_key_columns,
@@ -1672,7 +2038,39 @@ def run_tastar_calibration(
         qc_summary.setdefault("off_auto_bad_would_flag", int(res.table["QC_REF_OFF_AUTO_BAD"].iloc[0]) if "QC_REF_OFF_AUTO_BAD" in res.table.columns else 0)
         qc_summary.setdefault("hot_spur_auto_bad_would_flag", int(res.table["QC_REF_HOT_SPUR_AUTO_BAD"].iloc[0]) if "QC_REF_HOT_SPUR_AUTO_BAD" in res.table.columns else 0)
         qc_summary.setdefault("off_spur_auto_bad_would_flag", int(res.table["QC_REF_OFF_SPUR_AUTO_BAD"].iloc[0]) if "QC_REF_OFF_SPUR_AUTO_BAD" in res.table.columns else 0)
+        qc_summary.setdefault("on_spur_prescreen_candidate", int(res.table["QC_ON_PRESCREEN_CANDIDATE"].iloc[0]) if "QC_ON_PRESCREEN_CANDIDATE" in res.table.columns else 0)
         qc_summary.setdefault("on_spur_auto_bad_would_flag", int(res.table["QC_ON_SPUR_AUTO_BAD"].iloc[0]) if "QC_ON_SPUR_AUTO_BAD" in res.table.columns else 0)
+
+        if "hot_spur_peak_channel_counts_raw" not in qc_summary and "QC_REF_HOT_SPUR_PEAK_COUNTS_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["hot_spur_peak_channel_counts_raw"] = json.loads(str(res.table["QC_REF_HOT_SPUR_PEAK_COUNTS_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "off_spur_peak_channel_counts_raw" not in qc_summary and "QC_REF_OFF_SPUR_PEAK_COUNTS_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["off_spur_peak_channel_counts_raw"] = json.loads(str(res.table["QC_REF_OFF_SPUR_PEAK_COUNTS_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "hot_spur_peak_channel_top_raw" not in qc_summary and "QC_REF_HOT_SPUR_PEAK_TOP_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["hot_spur_peak_channel_top_raw"] = json.loads(str(res.table["QC_REF_HOT_SPUR_PEAK_TOP_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "off_spur_peak_channel_top_raw" not in qc_summary and "QC_REF_OFF_SPUR_PEAK_TOP_RAW_JSON" in res.table.columns:
+            try:
+                qc_summary["off_spur_peak_channel_top_raw"] = json.loads(str(res.table["QC_REF_OFF_SPUR_PEAK_TOP_RAW_JSON"].iloc[0]))
+            except Exception:
+                pass
+        if "hot_spur_peak_channel_top_raw" not in qc_summary and "QC_REF_HOT_SPUR_TOP_CH_RAW" in res.table.columns:
+            top_ch = res.table["QC_REF_HOT_SPUR_TOP_CH_RAW"].iloc[0]
+            top_count = int(res.table["QC_REF_HOT_SPUR_TOP_COUNT"].iloc[0]) if "QC_REF_HOT_SPUR_TOP_COUNT" in res.table.columns else 0
+            if pd.notna(top_ch) and top_count > 0:
+                qc_summary["hot_spur_peak_channel_top_raw"] = [{"channel": int(top_ch), "count": int(top_count)}]
+        if "off_spur_peak_channel_top_raw" not in qc_summary and "QC_REF_OFF_SPUR_TOP_CH_RAW" in res.table.columns:
+            top_ch = res.table["QC_REF_OFF_SPUR_TOP_CH_RAW"].iloc[0]
+            top_count = int(res.table["QC_REF_OFF_SPUR_TOP_COUNT"].iloc[0]) if "QC_REF_OFF_SPUR_TOP_COUNT" in res.table.columns else 0
+            if pd.notna(top_ch) and top_count > 0:
+                qc_summary["off_spur_peak_channel_top_raw"] = [{"channel": int(top_ch), "count": int(top_count)}]
 
     history = {
         'task': 'sdrsf-make-tastar', 'input': input_name,
@@ -1682,7 +2080,12 @@ def run_tastar_calibration(
         'gain_mode': gain_mode, 'qc_sigma': str(qc_sigma), 'qc_spur_sigma': str(qc_spur_sigma),
         'qc_spur_window_channels': int(qc_spur_window_channels),
         'qc_spur_max_consecutive_channels': int(qc_spur_max_consecutive_channels),
-        'qc_spur_consider_on': bool(qc_spur_consider_on), 'qc_apply_flagrow': bool(qc_apply_flagrow),
+        'qc_spur_trial_ref_channels': int(_QC_SPUR_TRIAL_REF_CHANNELS),
+        'qc_spur_consider_on': bool(qc_spur_consider_on),
+        'qc_spur_on_apply_flagrow': bool(qc_spur_on_apply_flagrow),
+        'qc_spur_on_prescreen_qd_threshold': float(_QC_SPUR_ON_PRESCREEN_QD_THRESHOLD),
+        'qc_spur_on_iso_min_ratio': float(_QC_SPUR_ON_ISO_MIN_RATIO),
+        'qc_apply_flagrow': bool(qc_apply_flagrow),
         'bad_channels': list(bad_channels) if bad_channels is not None else None,
         'bad_channel_ranges': list(bad_channel_ranges) if bad_channel_ranges is not None else None,
         'bad_channel_key_columns': list(bad_channel_key_columns),
