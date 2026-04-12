@@ -8,7 +8,7 @@ from typing import Sequence
 
 import numpy as np
 
-from .fitsio import Scantable
+from .fitsio import Scantable, stamp_scantable_code_provenance
 
 
 _VALID_MODES = {
@@ -351,4 +351,4 @@ def detect_and_repair_narrow_spurs(
             )
         print(msg)
 
-    return sc
+    return stamp_scantable_code_provenance(sc, stage="detect_and_repair_narrow_spurs")

@@ -9,7 +9,7 @@ from typing import Dict, List, Optional, Tuple, Union, Sequence, Any
 import numpy as np
 import pandas as pd
 
-from .fitsio import Scantable, read_scantable, write_scantable
+from .fitsio import Scantable, read_scantable, write_scantable, stamp_scantable_code_provenance
 from .axis import slice_channels
 from .baseline import fit_polynomial_baseline
 # [MODIFIED] Use new Standardizer
@@ -1168,7 +1168,10 @@ def run_velocity_coadd(
         beameff_vec = beameff_vec[keep]
         tempscal_vec = tempscal_vec[keep]
 
-    sc_all = Scantable(meta=meta_ref, data=data_list, table=table_all)
+    sc_all = stamp_scantable_code_provenance(
+        Scantable(meta=meta_ref, data=data_list, table=table_all),
+        stage="run_velocity_coadd_input_merge",
+    )
     
     axis_type = str(axis_type).strip().lower()
     if axis_type not in ("freq", "vel"):
@@ -1808,7 +1811,10 @@ def run_velocity_coadd(
             "note": "Mixed BEAMEFF was present but normalization was explicitly disabled (danger mode).",
         })
 
-    res = Scantable(meta=meta_out, data=out_data, table=out_table, history=history)
+    res = stamp_scantable_code_provenance(
+        Scantable(meta=meta_out, data=out_data, table=out_table, history=history),
+        stage="run_velocity_coadd",
+    )
 
     if output_path:
         write_scantable(output_path, res, overwrite=overwrite, tempscal=meta_out["TEMPSCAL"], data_scale=meta_out["TEMPSCAL"])

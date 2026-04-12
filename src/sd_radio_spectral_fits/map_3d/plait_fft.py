@@ -13,6 +13,7 @@ from scipy.signal.windows import tukey
 
 from .otf_bundle import OTFBundle
 from .otf_bundle_io import validate_otf_bundle
+from .provenance import append_bundle_provenance_step
 from ..ranges import parse_windows, window_to_mask
 
 
@@ -723,6 +724,42 @@ def plait_fft_cubes(
                 "input_family_diagnostic_ext": sorted(image_ext.keys()),
             },
         )
+        append_bundle_provenance_step(
+            out_bundle,
+            input_bundles=[x_bundle, y_bundle],
+            op_id="otf.plait.combine.v1",
+            module=__name__,
+            function="plait_fft_cubes",
+            kind="main",
+            params_input={
+                "linefree_velocity_windows_kms": list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or []),
+                "noise_mode": str(noise_mode),
+                "plait_noise_mode": str(plait_noise_mode),
+                "pad_frac": float(pad_frac),
+                "apodize": bool(apodize),
+                "apodize_alpha": float(apodize_alpha),
+                "support_taper": bool(support_taper),
+                "support_taper_width_pix": support_taper_width_pix,
+                "science_mask_mode": str(science_mask_mode),
+                "fft_workers": fft_workers,
+                "dtype": str(dtype),
+                "diagnostics": bool(diagnostics),
+                "min_plait_size_pix": int(min_plait_size_pix),
+                "small_map_policy": str(small_map_policy),
+                "quality_gate_mode": str(quality_gate_mode),
+                "min_improvement_frac": float(min_improvement_frac),
+            },
+            params_resolved={
+                "selected_method": "fallback_average_small_map",
+                "plait_noise_mode": plait_noise_mode_norm,
+            },
+            results_summary={
+                "cube_shape": [int(v) for v in out_bundle.data.shape],
+                "sigma_x_rep": float(noise_x.sigma_rep),
+                "sigma_y_rep": float(noise_y.sigma_rep),
+                "valid_voxels": int(np.count_nonzero(np.isfinite(out_bundle.data))),
+            },
+        )
         from .mosaic import attach_mosaic_products
         attach_mosaic_products(
             out_bundle,
@@ -734,6 +771,7 @@ def plait_fft_cubes(
             gain_min=0.5,
             overwrite=True,
             in_place=True,
+            _record_provenance=True,
         )
         return out_bundle
 
@@ -841,6 +879,45 @@ def plait_fft_cubes(
             "input_family_diagnostic_ext": sorted(image_ext.keys()),
         },
     )
+    append_bundle_provenance_step(
+        out_bundle,
+        input_bundles=[x_bundle, y_bundle],
+        op_id="otf.plait.combine.v1",
+        module=__name__,
+        function="plait_fft_cubes",
+        kind="main",
+        params_input={
+            "linefree_velocity_windows_kms": list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or []),
+            "noise_mode": str(noise_mode),
+            "plait_noise_mode": str(plait_noise_mode),
+            "pad_frac": float(pad_frac),
+            "apodize": bool(apodize),
+            "apodize_alpha": float(apodize_alpha),
+            "support_taper": bool(support_taper),
+            "support_taper_width_pix": support_taper_width_pix,
+            "science_mask_mode": str(science_mask_mode),
+            "fft_workers": fft_workers,
+            "dtype": str(dtype),
+            "diagnostics": bool(diagnostics),
+            "min_plait_size_pix": int(min_plait_size_pix),
+            "small_map_policy": str(small_map_policy),
+            "quality_gate_mode": str(quality_gate_mode),
+            "min_improvement_frac": float(min_improvement_frac),
+        },
+        params_resolved={
+            "selected_method": selection.selected_method,
+            "plait_noise_mode": plait_noise_mode_norm,
+            "support_taper_width_pix_used": support_taper_width_pix,
+        },
+        results_summary={
+            "cube_shape": [int(v) for v in out_bundle.data.shape],
+            "sigma_x_rep": float(noise_x.sigma_rep),
+            "sigma_y_rep": float(noise_y.sigma_rep),
+            "sigma_out_plait": float(selection.sigma_plait),
+            "sigma_out_avg": float(selection.sigma_average),
+            "valid_voxels": int(np.count_nonzero(np.isfinite(out_bundle.data))),
+        },
+    )
     bw_gain_map = _estimate_bw_flatfield_gain_approx(
         x_support,
         y_support,
@@ -868,5 +945,6 @@ def plait_fft_cubes(
         gain_min=0.5,
         overwrite=True,
         in_place=True,
+        _record_provenance=True,
     )
     return out_bundle

@@ -19,6 +19,7 @@ from .basketweave import solve_basket_weave_offsets, apply_basket_weave_correcti
 from .otf_bundle import OTFBundle
 from .otf_bundle_io import read_otf_bundle, write_otf_bundle, gridresult_to_otf_bundle, validate_otf_bundle
 from .otf_family_grid import grid_otf_family
+from .provenance import get_provenance, get_provenance_summary, extract_provenance_table, format_provenance, show_provenance
 from .cube_coadd import coadd_family_cubes
 from .mosaic import attach_mosaic_products, attach_mosaic_products_from_mask, mosaic_bundles, mosaic_fits
 from .plait_fft import plait_fft_cubes
@@ -94,6 +95,11 @@ __all__ = [
     "write_otf_bundle",
     "gridresult_to_otf_bundle",
     "validate_otf_bundle",
+    "get_provenance",
+    "get_provenance_summary",
+    "extract_provenance_table",
+    "format_provenance",
+    "show_provenance",
     "grid_otf_family",
     "coadd_family_cubes",
     "attach_mosaic_products",

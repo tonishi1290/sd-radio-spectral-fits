@@ -13,7 +13,7 @@ from importlib.metadata import version, PackageNotFoundError
 try:
     __version__ = version("sd-radio-spectral-fits") 
 except PackageNotFoundError:
-    __version__ = "1.2.16" # インストール前は手動の値をフォールバックにする
+    __version__ = "1.3.0" # インストール前は手動の値をフォールバックにする
 
 SWNAME = "sd_radio_spectral_fits" # これを定義しておかないと __all__ で怒られます
 
@@ -30,6 +30,7 @@ from .fitsio import (
     Scantable,
     read_scantable,
     write_scantable,
+    stamp_scantable_code_provenance,
 )
 from .calibrate import (
     run_tastar_calibration,
@@ -52,6 +53,8 @@ from .scantable_utils import (
     set_beameff,
     apply_relative_scale,
     apply_global_scale,
+    summarize_provenance,
+    print_provenance,
 )
 
 from .atmosphere import (
@@ -86,5 +89,8 @@ __all__ = [
     "set_beameff",
     "apply_relative_scale",
     "apply_global_scale",
+    "summarize_provenance",
+    "print_provenance",
     "run_velocity_regrid",
+    "stamp_scantable_code_provenance",
 ]

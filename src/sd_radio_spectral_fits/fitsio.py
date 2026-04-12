@@ -10,6 +10,12 @@ import pandas as pd
 from astropy.io import fits
 from astropy.time import Time
 
+try:
+    from . import __version__ as _PACKAGE_CODE_VERSION, SWNAME as _PACKAGE_SWNAME
+except Exception:  # pragma: no cover
+    _PACKAGE_CODE_VERSION = "unknown"
+    _PACKAGE_SWNAME = "sd_radio_spectral_fits"
+
 # Temperature scale helpers (package-local; keep Single Source of Truth)
 from .tempscale import (
     normalize_tempscal,
@@ -80,6 +86,52 @@ class Scantable:
             table=self.table.copy(),
             history=self.history.copy()
         )
+
+
+def stamp_scantable_code_provenance(
+    scantable: Scantable,
+    *,
+    stage: str | None = None,
+    update_meta: bool = True,
+    update_history: bool = True,
+) -> Scantable:
+    """Stamp the current package identity onto a produced/updated Scantable.
+
+    Definitions
+    -----------
+    - meta['SWNAME'], meta['SWVER']:
+      software identity recorded in the Scantable/FITS header space.
+    - history['code_software'], history['code_version']:
+      software identity recorded in provenance/history space.
+    - history['code_stage']:
+      optional stage label for the operation that produced/updated this Scantable.
+
+    Notes
+    -----
+    This function is intended for *producer/update* code paths.
+    It intentionally overwrites the top-level current software identity so that
+    the returned Scantable answers the question: "which software version produced
+    this current analysis state?"
+
+    In contrast, :func:`read_scantable` does not call this function automatically,
+    because simply reading an older file must not rewrite its producer provenance.
+    """
+    if not isinstance(scantable.meta, dict):
+        scantable.meta = {}
+    if not isinstance(scantable.history, dict):
+        scantable.history = {}
+
+    if update_meta:
+        scantable.meta["SWNAME"] = _PACKAGE_SWNAME
+        scantable.meta["SWVER"] = _PACKAGE_CODE_VERSION
+
+    if update_history:
+        scantable.history["code_software"] = _PACKAGE_SWNAME
+        scantable.history["code_version"] = _PACKAGE_CODE_VERSION
+        if stage is not None:
+            scantable.history["code_stage"] = str(stage)
+
+    return scantable
 
 
 # =========================================================
@@ -187,9 +239,17 @@ def write_scantable(
     """
     Scantable オブジェクトを FITS ファイルとして保存します。
     """
-    # 元のオブジェクトを壊さないよう、テーブルのみコピーして作業する
+    # 元のオブジェクトを壊さないよう、テーブル/メタ/履歴をコピーして作業する
     df = scantable.table.copy()
-    meta = scantable.meta
+    meta = dict(scantable.meta or {})
+    history = dict(scantable.history or {})
+
+    # Write-time fallback stamp: only fill when missing.
+    # 解析途中で既に記録された code_version があればそれを優先する。
+    meta.setdefault("SWNAME", _PACKAGE_SWNAME)
+    meta.setdefault("SWVER", _PACKAGE_CODE_VERSION)
+    history.setdefault("code_software", _PACKAGE_SWNAME)
+    history.setdefault("code_version", _PACKAGE_CODE_VERSION)
     
     # データ列へ格上げ(Promote)すべき重要キーワード
     promote_keys = [
@@ -211,7 +271,7 @@ def write_scantable(
         meta=meta,
         data=scantable.data,
         table=df,
-        history=scantable.history,
+        history=history,
         spectrum_column=spectrum_column,
         overwrite=overwrite,
         **kwargs

@@ -6,6 +6,7 @@ from astropy.table import Table
 
 from .otf_bundle import OTFBundle
 from .otf_bundle_io import validate_otf_bundle
+from .provenance import append_bundle_provenance_step
 from .plait_fft import (
     _velocity_axis_from_header,
     _make_linefree_mask_from_velocity_windows,
@@ -127,11 +128,35 @@ def coadd_family_cubes(
     out_bundle.meta["linefree_velocity_windows_kms"] = list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or [])
     out_bundle.meta["baseline_subtracted"] = bool(any(bool(b.meta.get("baseline_subtracted", False)) for b in bundles))
     out_bundle.meta["noise_mode"] = "empirical_rms_per_spectrum"
+    append_bundle_provenance_step(
+        out_bundle,
+        input_bundles=list(bundles),
+        op_id="otf.coadd.family.v1",
+        module=__name__,
+        function="coadd_family_cubes",
+        kind="main",
+        params_input={
+            "linefree_velocity_windows_kms": list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or []),
+            "strict_shape": bool(strict_shape),
+            "strict_wcs": bool(strict_wcs),
+        },
+        params_resolved={
+            "n_input": int(len(bundles)),
+            "family_label": None if fam is None else str(fam),
+            "noise_mode": "empirical_rms_per_spectrum",
+        },
+        results_summary={
+            "cube_shape": [int(v) for v in out_bundle.data.shape],
+            "valid_voxels": int(np.count_nonzero(np.isfinite(out_bundle.data))),
+            "support_npix": int(np.count_nonzero(out_bundle.support_mask)) if out_bundle.support_mask is not None else None,
+        },
+    )
     from .mosaic import attach_mosaic_products
     attach_mosaic_products(
         out_bundle,
         linefree_velocity_windows_kms=linefree_velocity_windows_kms,
         overwrite=True,
         in_place=True,
+        _record_provenance=True,
     )
     return out_bundle

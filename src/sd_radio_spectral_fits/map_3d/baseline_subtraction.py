@@ -81,6 +81,7 @@ except Exception:  # pragma: no cover
 
 from .otf_bundle import OTFBundle
 from .otf_bundle_io import read_otf_bundle, write_otf_bundle, validate_otf_bundle
+from .provenance import append_bundle_provenance_step
 from .mosaic import attach_mosaic_products_from_mask
 
 
@@ -3926,7 +3927,7 @@ def _refresh_mosaic_after_baseline(
     linefree_mask_used: np.ndarray,
     update_mosaic_products: bool,
     gain_min: float,
-) -> None:
+) -> bool:
     for key in ("MOSAIC_RMS_OBS", "MOSAIC_RMS", "MOSAIC_WEIGHT"):
         bundle.image_ext.pop(key, None)
     bundle.table_ext.pop("MOSAIC_INFO", None)
@@ -3937,9 +3938,12 @@ def _refresh_mosaic_after_baseline(
             linefree_mask_1d=np.asarray(lf, dtype=bool),
             gain_min=float(gain_min),
             in_place=True,
+            _record_provenance=False,
         )
-    elif update_mosaic_products and lf.ndim != 1:
+        return True
+    if update_mosaic_products and lf.ndim != 1:
         logging.info("Skipping mosaic product refresh for 3D voxel line-free mask.")
+    return False
 
 
 
@@ -3973,12 +3977,13 @@ def _update_bundle_after_baseline(
         data_out=np.asarray(data_out, dtype=np.float32),
         linefree_mask_used=np.asarray(linefree_mask_used, dtype=bool),
     )
-    _refresh_mosaic_after_baseline(
+    mosaic_products_updated = _refresh_mosaic_after_baseline(
         out,
         linefree_mask_used=np.asarray(linefree_mask_used, dtype=bool),
         update_mosaic_products=bool(update_mosaic_products),
         gain_min=float(gain_min),
     )
+    out.meta["baseline_mosaic_products_updated"] = bool(mosaic_products_updated)
     lf_arr = np.asarray(linefree_mask_used, dtype=bool)
     sig_arr = np.asarray(signal_mask_used, dtype=bool)
     out.meta["baseline_linefree_mask_kind"] = ("global_1d" if lf_arr.ndim == 1 else "voxel_3d")
@@ -4043,6 +4048,20 @@ def make_baseline_viewer_bundle(
     out.meta["baseline_viewer_mode"] = mode
     out.meta["baseline_viewer_fill_value"] = float(fill_value)
     out.meta["baseline_viewer_mask_key"] = key
+    append_bundle_provenance_step(
+        out,
+        input_bundles=[bundle],
+        op_id="otf.baseline.viewer.v1",
+        module=__name__,
+        function="make_baseline_viewer_bundle",
+        kind="main",
+        params_input={"mode": str(mode), "fill_value": float(fill_value)},
+        params_resolved={"mask_key": str(key)},
+        results_summary={
+            "cube_shape": [int(v) for v in out.data.shape],
+            "selected_voxels": int(np.count_nonzero(mask)),
+        },
+    )
     return out
 
 def subtract_baseline_from_bundle(
@@ -4379,6 +4398,77 @@ def subtract_baseline_from_bundle(
     out.meta["baseline_linefree_auto_method"] = None if linefree_cfg is None else str(getattr(linefree_cfg, "auto_method", "agg_1d"))
     out.meta["baseline_ripple_apply_stage"] = str(ripple_apply_stage)
     out.meta["baseline_safe_velocity_windows_kms"] = None if safe_velocity_windows_kms is None else list(safe_velocity_windows_kms)
+    append_bundle_provenance_step(
+        out,
+        input_bundles=[bundle],
+        op_id="otf.baseline.subtract.v1",
+        module=__name__,
+        function="subtract_baseline_from_bundle",
+        kind="main",
+        params_input={
+            "linefree_mode": linefree_mode,
+            "linefree_velocity_windows_kms": linefree_velocity_windows_kms,
+            "exclude_v_windows": exclude_v_windows,
+            "load_prior_from_input": bool(load_prior_from_input),
+            "ripple_freqs": None if ripple_freqs is None else [float(v) for v in ripple_freqs],
+            "ripple_mode": str(ripple_mode),
+            "safe_velocity_windows_kms": safe_velocity_windows_kms,
+            "ripple_apply_stage": str(ripple_apply_stage),
+            "reproducible_mode": reproducible_mode,
+            "add_qc_ext": bool(add_qc_ext),
+            "update_mosaic_products": bool(update_mosaic_products),
+            "gain_min": float(gain_min),
+        },
+        params_config={
+            "linefree_cfg": linefree_cfg,
+            "ripple_cfg": ripple_cfg,
+            "baseline_cfg": baseline_cfg,
+        },
+        params_resolved={
+            "effective_linefree_mode": str(effective_linefree_mode),
+            "linefree_mask_kind": out.meta.get("baseline_linefree_mask_kind"),
+            "signal_mask_kind": out.meta.get("baseline_signal_mask_kind"),
+            "linefree_shape": out.meta.get("baseline_linefree_shape"),
+            "signal_shape": out.meta.get("baseline_signal_shape"),
+            "ripple_freqs_used": [float(v) for v in freqs],
+            "mosaic_products_updated": bool(out.meta.get("baseline_mosaic_products_updated", False)),
+        },
+        results_summary={
+            "cube_shape": [int(v) for v in out.data.shape],
+            "linefree_ntrue": int(out.meta.get("baseline_linefree_ntrue", 0)),
+            "signal_ntrue": int(out.meta.get("baseline_signal_ntrue", 0)),
+            "ripple_nfreq": int(out.meta.get("baseline_ripple_nfreq", 0)),
+            "qc_ext_added": bool(add_qc_ext),
+        },
+    )
+    if bool(out.meta.get("baseline_mosaic_products_updated", False)):
+        append_bundle_provenance_step(
+            out,
+            input_bundles=None,
+            op_id="otf.mosaic.attach_mask.v1",
+            module="{}.mosaic".format(__name__.rsplit('.', 1)[0]),
+            function="attach_mosaic_products_from_mask",
+            kind="aux",
+            aux="mosaic_products",
+            params_input={
+                "linefree_mask_1d_nchan": int(nchan),
+                "gain_min": float(gain_min),
+                "in_place": True,
+            },
+            params_resolved={
+                "rms_source": out.meta.get("mosaic_rms_source"),
+                "gain_source": out.meta.get("mosaic_gain_source"),
+                "trust_source": out.meta.get("mosaic_trust_source"),
+                "gain_min_used": out.meta.get("mosaic_gain_min_used"),
+                "weight_formula": out.meta.get("mosaic_weight_formula"),
+                "numerator_formula": out.meta.get("mosaic_numerator_formula"),
+            },
+            results_summary={
+                "linefree_nchan": int(np.count_nonzero(np.asarray(lf, dtype=bool))) if np.asarray(lf, dtype=bool).ndim == 1 else None,
+                "image_ext_written": ["MOSAIC_GAIN", "MOSAIC_RMS_OBS", "MOSAIC_TRUST", "MOSAIC_WEIGHT", "MOSAIC_RMS"],
+                "table_ext_written": ["MOSAIC_INFO"],
+            },
+        )
     return out
 
 

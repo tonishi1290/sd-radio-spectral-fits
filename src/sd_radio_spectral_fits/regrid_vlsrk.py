@@ -11,6 +11,7 @@ import pandas as pd
 
 from .axis import freq_axis_from_wcs, radio_velocity_kms
 from .doppler import get_doppler_factor, C_KMS
+from .fitsio import Scantable, stamp_scantable_code_provenance
 
 # =========================================================
 # 1. データ構造 & ヘルパー
@@ -988,7 +989,10 @@ def _slice_data_and_rows(sc, idxs: np.ndarray, ch_start: Optional[int], ch_stop:
             nchan0 = int(len(data_sel[0])) if len(data_sel) > 0 else 0
             table = _slice_row_wcs_columns(table, ch_start, ch_stop, nchan0)
             meta = _slice_meta_wcs_if_present(meta, ch_start, ch_stop, nchan0)
-        return Scantable(meta=meta, data=data_sel, table=table, history=dict(sc.history))
+        return stamp_scantable_code_provenance(
+            Scantable(meta=meta, data=data_sel, table=table, history=dict(sc.history)),
+            stage="select_rows_and_channels",
+        )
 
     data_arr = np.asarray(sc.data)
     data_sel = np.asarray(data_arr[idxs], dtype=float)
@@ -1002,7 +1006,10 @@ def _slice_data_and_rows(sc, idxs: np.ndarray, ch_start: Optional[int], ch_stop:
         nchan_new = int(data_sel.shape[1])
         table = _slice_row_wcs_columns(table, ch_start, ch_stop, nchan_new)
         meta = _slice_meta_wcs_if_present(meta, ch_start, ch_stop, nchan_new)
-    return Scantable(meta=meta, data=data_sel, table=table, history=dict(sc.history))
+    return stamp_scantable_code_provenance(
+        Scantable(meta=meta, data=data_sel, table=table, history=dict(sc.history)),
+        stage="select_rows_and_channels",
+    )
 
 
 def _prepare_row_selection(n_rows: int, rows=None, exclude_rows=None, max_dumps: int = 0) -> np.ndarray:
@@ -1196,7 +1203,10 @@ def run_velocity_regrid(
         drop_allnan_rows=bool(drop_allnan_rows),
     )
 
-    res = Scantable(meta=meta_out, data=np.asarray(out_matrix, dtype=np.float32), table=out_table, history=hist)
+    res = stamp_scantable_code_provenance(
+        Scantable(meta=meta_out, data=np.asarray(out_matrix, dtype=np.float32), table=out_table, history=hist),
+        stage="run_velocity_regrid",
+    )
     if output_path:
         write_scantable(output_path, res, overwrite=overwrite)
     return res

@@ -8,7 +8,7 @@ from typing import List, Tuple, Optional, Union, Sequence, Dict, Any
 import numpy as np
 import pandas as pd
 
-from .fitsio import Scantable, read_scantable, write_scantable
+from .fitsio import Scantable, read_scantable, write_scantable, stamp_scantable_code_provenance
 # [MODIFIED] Use robust axis helpers from regrid_vlsrk
 from .regrid_vlsrk import vlsrk_axis_for_spectrum
 from .ranges import parse_windows, window_to_mask
@@ -1280,7 +1280,10 @@ def run_baseline_fit(
             f"apply_flagrow={bool(qc_apply_flagrow)}"
         )
     
-    res = Scantable(meta=meta, data=final_data, table=table, history=new_history)
+    res = stamp_scantable_code_provenance(
+        Scantable(meta=meta, data=final_data, table=table, history=new_history),
+        stage="run_baseline_fit",
+    )
 
     if output_path:
         write_scantable(output_path, res, overwrite=overwrite)

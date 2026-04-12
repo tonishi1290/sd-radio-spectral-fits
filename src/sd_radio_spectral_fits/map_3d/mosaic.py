@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import warnings
+import time
 
 import numpy as np
 from astropy.io import fits
@@ -8,6 +9,7 @@ from astropy.table import Table
 
 from .otf_bundle import OTFBundle
 from .otf_bundle_io import read_otf_bundle, validate_otf_bundle, write_otf_bundle
+from .provenance import append_bundle_provenance_step
 from .plait_fft import (
     _estimate_rms_map_from_arrays,
     _make_linefree_mask_from_velocity_windows,
@@ -235,7 +237,9 @@ def attach_mosaic_products_from_mask(
     trust_source: str | None = None,
     gain_min: float = 0.5,
     in_place: bool = False,
+    _record_provenance: bool = True,
 ) -> OTFBundle:
+    _t0_prov = time.perf_counter()
     out = bundle if in_place else bundle.copy(deep=True)
     gain, rms_obs, trust, weight, info = estimate_mosaic_products_from_mask(
         out,
@@ -269,6 +273,31 @@ def attach_mosaic_products_from_mask(
     out.meta["mosaic_gain_min_used"] = float(info["gain_min_used"])
     out.meta["mosaic_weight_formula"] = str(info["weight_formula"])
     out.meta["mosaic_numerator_formula"] = str(info["numerator_formula"])
+    if _record_provenance:
+        append_bundle_provenance_step(
+            out,
+            input_bundles=None,
+            op_id="otf.mosaic.attach_mask.v1",
+            module=__name__,
+            function="attach_mosaic_products_from_mask",
+            kind="aux",
+            aux="mosaic_products",
+            params_input={
+                "linefree_mask_1d_nchan": int(np.asarray(linefree_mask_1d, dtype=bool).shape[0]),
+                "gain_source": gain_source,
+                "trust_source": trust_source,
+                "gain_min": float(gain_min),
+                "in_place": bool(in_place),
+            },
+            params_resolved=info,
+            results_summary={
+                "shape_2d": [int(v) for v in gain.shape],
+                "linefree_nchan": int(info["linefree_nchan"]),
+                "image_ext_written": ["MOSAIC_GAIN", "MOSAIC_RMS_OBS", "MOSAIC_TRUST", "MOSAIC_WEIGHT", "MOSAIC_RMS"],
+                "table_ext_written": ["MOSAIC_INFO"],
+            },
+            duration_sec=float(time.perf_counter() - _t0_prov),
+        )
     return out
 
 def attach_mosaic_products(
@@ -282,7 +311,9 @@ def attach_mosaic_products(
     gain_min: float = 0.5,
     overwrite: bool = False,
     in_place: bool = False,
+    _record_provenance: bool = True,
 ) -> OTFBundle:
+    _t0_prov = time.perf_counter()
     out = bundle if in_place else bundle.copy(deep=True)
     have_all = all(k in out.image_ext for k in ("MOSAIC_GAIN", "MOSAIC_RMS_OBS", "MOSAIC_TRUST", "MOSAIC_WEIGHT"))
     if (not overwrite) and have_all and (gain_map is None) and (trust_map is None) and (linefree_velocity_windows_kms is None):
@@ -323,6 +354,32 @@ def attach_mosaic_products(
     out.meta["mosaic_gain_min_used"] = float(info["gain_min_used"])
     out.meta["mosaic_weight_formula"] = str(info["weight_formula"])
     out.meta["mosaic_numerator_formula"] = str(info["numerator_formula"])
+    if _record_provenance:
+        append_bundle_provenance_step(
+            out,
+            input_bundles=None,
+            op_id="otf.mosaic.attach.v1",
+            module=__name__,
+            function="attach_mosaic_products",
+            kind="aux",
+            aux="mosaic_products",
+            params_input={
+                "linefree_velocity_windows_kms": list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or []),
+                "gain_source": gain_source,
+                "trust_source": trust_source,
+                "gain_min": float(gain_min),
+                "overwrite": bool(overwrite),
+                "in_place": bool(in_place),
+            },
+            params_resolved=info,
+            results_summary={
+                "shape_2d": [int(v) for v in gain.shape],
+                "linefree_nchan": int(info["linefree_nchan"]),
+                "image_ext_written": ["MOSAIC_GAIN", "MOSAIC_RMS_OBS", "MOSAIC_TRUST", "MOSAIC_WEIGHT", "MOSAIC_RMS"],
+                "table_ext_written": ["MOSAIC_INFO"],
+            },
+            duration_sec=float(time.perf_counter() - _t0_prov),
+        )
     return out
 
 
@@ -363,6 +420,7 @@ def mosaic_bundles(
                 gain_min=float(gain_min),
                 overwrite=True,
                 in_place=False,
+                _record_provenance=False,
             )
         )
 
@@ -448,6 +506,32 @@ def mosaic_bundles(
     out_bundle.meta["mosaic_weight_formula"] = "trust * gain^2 / rms_obs^2"
     out_bundle.meta["mosaic_numerator_formula"] = "trust * gain / rms_obs^2 * data"
     out_bundle.meta["linefree_velocity_windows_kms"] = list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or [])
+    append_bundle_provenance_step(
+        out_bundle,
+        input_bundles=prepared,
+        op_id="otf.mosaic.combine.v1",
+        module=__name__,
+        function="mosaic_bundles",
+        kind="main",
+        params_input={
+            "linefree_velocity_windows_kms": list(_resolve_velocity_windows_spec(linefree_velocity_windows_kms) or []),
+            "strict_shape": bool(strict_shape),
+            "strict_wcs": bool(strict_wcs),
+            "strict_unit": bool(strict_unit),
+            "overwrite_mosaic_products": bool(overwrite_mosaic_products),
+            "gain_min": float(gain_min),
+        },
+        params_resolved={
+            "n_input": int(len(prepared)),
+            "family_label": "MOSAIC",
+            "gain_min_used": float(gain_min),
+        },
+        results_summary={
+            "cube_shape": [int(v) for v in out_bundle.data.shape],
+            "valid_voxels": int(np.count_nonzero(np.isfinite(out_bundle.data))),
+            "support_npix": int(np.count_nonzero(out_bundle.support_mask)) if out_bundle.support_mask is not None else None,
+        },
+    )
     attach_mosaic_products(
         out_bundle,
         linefree_velocity_windows_kms=linefree_velocity_windows_kms,
@@ -458,6 +542,7 @@ def mosaic_bundles(
         gain_min=float(gain_min),
         overwrite=True,
         in_place=True,
+        _record_provenance=True,
     )
     return out_bundle
 

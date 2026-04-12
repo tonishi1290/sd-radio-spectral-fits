@@ -13,7 +13,7 @@ from .axis import wcs_slice_channels, channel_slice_from_vrange_union
 from .doppler import compute_vcorr_series
 from .rawspec import load_rawspec_auto
 
-from .fitsio import Scantable, write_scantable
+from .fitsio import Scantable, write_scantable, stamp_scantable_code_provenance
 from .scantable_utils import _parse_row_selector, _df_to_native_endian, _resolve_table_timestamps
 from .qc_flagrow import (
     ensure_flagrow_column,
@@ -2517,7 +2517,10 @@ def make_tastar_dumps(
             if col in table.columns:
                 del table[col]
 
-    return Scantable(meta=meta2, data=ta, table=table)
+    return stamp_scantable_code_provenance(
+        Scantable(meta=meta2, data=ta, table=table),
+        stage="run_tastar_calibration",
+    )
 
 
 def tastar_from_rawspec(
@@ -2833,7 +2836,7 @@ def run_tastar_calibration(
         )
         if verbose: print(f"Saved: {output_path}")
 
-    return res
+    return stamp_scantable_code_provenance(res, stage="run_tastar_calibration")
 
 
 def recalibrate_tastar(
@@ -2953,4 +2956,4 @@ def recalibrate_tastar(
     res.history = scantable.history.copy()
     res.history["notes"] = res.history.get("notes", "") + f" | Recalibrated to tau={new_tau}"
     
-    return res
+    return stamp_scantable_code_provenance(res, stage="recalibrate_tastar")

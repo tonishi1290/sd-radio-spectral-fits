@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import time
 from pathlib import Path
 from types import SimpleNamespace
 import warnings
@@ -23,6 +24,7 @@ from .gridder import (
     _print_effective_beam_summary,
 )
 from .otf_bundle_io import gridresult_to_otf_bundle, write_otf_bundle
+from .provenance import append_bundle_provenance_step, summarize_scantable_input
 
 
 def _deepcopy_meta(meta):
@@ -95,6 +97,8 @@ def grid_otf_family(
     overwrite: bool = False,
 ):
     """Grid one family (e.g. X or Y) of OTF scantables into an OTFBundle."""
+    _t0_prov = time.perf_counter()
+    input_scantable_summary = summarize_scantable_input(scantables)
     runtime_config = _effective_config(
         config,
         reproducible_mode=reproducible_mode,
@@ -226,6 +230,60 @@ def grid_otf_family(
             "baseline_subtracted": False,
         },
     )
+    append_bundle_provenance_step(
+        bundle,
+        input_bundles=[],
+        op_id="otf.grid.family.v1",
+        module=__name__,
+        function="grid_otf_family",
+        kind="main",
+        params_input={
+            "family_label": str(family_label),
+            "coord_sys": str(coord_sys),
+            "projection": str(projection),
+            "out_scale": str(out_scale),
+            "dv_kms": dv_kms,
+            "vmin_kms": vmin_kms,
+            "vmax_kms": vmax_kms,
+            "linefree_velocity_windows_kms": list(linefree_velocity_windows_kms or []) if linefree_velocity_windows_kms is not None else None,
+            "ref_coord": ref_coord,
+            "ref_lon": ref_lon,
+            "ref_lat": ref_lat,
+            "reproducible_mode": reproducible_mode,
+            "workers": workers,
+            "sort_neighbors": sort_neighbors,
+            "verbose": verbose,
+            "otf_input_state": otf_input_state,
+            "otf_scan_region": otf_scan_region,
+            "existing_turn_labels": existing_turn_labels,
+            "otf_scan_existing_is_turn": otf_scan_existing_is_turn,
+        },
+        params_config=runtime_config,
+        params_resolved={
+            "family_label": str(family_label),
+            "coord_sys": str(coord_sys),
+            "projection": str(projection),
+            "ref_lon_used_deg": float(lon0),
+            "ref_lat_used_deg": float(lat0),
+            "out_scale_used": str(out_scale_norm),
+            "dv_kms_used": None if dv_use is None else float(dv_use),
+            "vmin_kms_used": None if vmin_use is None else float(vmin_use),
+            "vmax_kms_used": None if vmax_use is None else float(vmax_use),
+            "weight_mode_used": str(weight_mode),
+            "rep_beameff_used": float(rep_beameff) if np.isfinite(rep_beameff) else None,
+            "otf_scan_summary": otf_scan_summary,
+            "input_scantable_summary": input_scantable_summary,
+        },
+        results_summary={
+            "cube_shape": [int(v) for v in bundle.data.shape],
+            "support_npix": int(np.count_nonzero(bundle.support_mask)) if bundle.support_mask is not None else None,
+            "variance_source": bundle.meta.get("variance_source"),
+            "restfreq_hz": bundle.meta.get("RESTFREQ"),
+            "specsys": bundle.meta.get("SPECSYS"),
+            "meta_keys": sorted(str(k) for k in (res.meta or {}).keys()),
+        },
+        duration_sec=float(time.perf_counter() - _t0_prov),
+    )
     from .mosaic import attach_mosaic_products
 
     attach_mosaic_products(
@@ -233,6 +291,7 @@ def grid_otf_family(
         linefree_velocity_windows_kms=linefree_velocity_windows_kms,
         overwrite=True,
         in_place=True,
+        _record_provenance=True,
     )
     if output_fits is not None:
         write_otf_bundle(bundle, output_fits, overwrite=overwrite)

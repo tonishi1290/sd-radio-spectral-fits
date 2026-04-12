@@ -22,6 +22,11 @@ Dependencies:
 
 from typing import Any, Dict, List, Optional, Sequence, Union, Set
 from collections.abc import Mapping
+from collections import Counter
+import ast
+import builtins
+import json
+import pprint
 import warnings
 import numpy as np
 import pandas as pd
@@ -32,7 +37,7 @@ import astropy.units as u
 # fitsioからのインポート
 # 循環参照を防ぐため、本来はTYPE_CHECKINGブロックを使うか遅延インポートが望ましいですが、
 # 実行時にクラス定義が必要なためトップレベルでインポートします。
-from .fitsio import Scantable, read_scantable
+from .fitsio import Scantable, read_scantable, stamp_scantable_code_provenance
 
 
 # =========================================================
@@ -205,6 +210,298 @@ def _resolve_table_timestamps(table: pd.DataFrame) -> Optional[pd.DatetimeIndex]
 # =========================================================
 # 1. Inspection (確認・表示)
 # =========================================================
+
+def _parse_maybe_structured_text(x: Any) -> Any:
+    """Best-effort parser for structured provenance values stored as text.
+
+    HISTORY extension の VALUE は FITS round-trip 後に文字列へ落ちることがある。
+    そこで dict/list/tuple/bool/None/number らしい文字列は、可能なら
+    JSON または Python literal として復元する。
+    復元できなければ元の値を返す。
+    """
+    if isinstance(x, (dict, list, tuple, int, float, bool)) or x is None:
+        return x
+
+    if isinstance(x, bytes):
+        x = x.decode(errors="ignore")
+
+    if not isinstance(x, str):
+        return x
+
+    s = x.strip()
+    if s == "":
+        return s
+
+    if s[0] in "{[":
+        try:
+            return json.loads(s)
+        except Exception:
+            pass
+
+    if s[0] in "{[(" or s in ("None", "True", "False") or s[0].isdigit() or s[0] in ("-", "+", "'", '"'):
+        try:
+            return ast.literal_eval(s)
+        except Exception:
+            pass
+
+    return x
+
+
+def _to_builtin_scalar(x: Any) -> Any:
+    """Convert NumPy scalars to Python built-in scalars when possible."""
+    if isinstance(x, np.generic):
+        return x.item()
+    return x
+
+
+def _clean_value(x: Any) -> Any:
+    """Normalize scalars for human-readable provenance summaries."""
+    x = _to_builtin_scalar(x)
+    if isinstance(x, float) and np.isnan(x):
+        return None
+    return x
+
+
+def _summarize_series_unique(s: pd.Series, *, max_unique: int = 12) -> Dict[str, Any]:
+    """Summarize unique values in one provenance-related column."""
+    vals: List[Any] = []
+    for v in pd.Series(s).tolist():
+        vv = _clean_value(v)
+        if vv is None:
+            continue
+        vals.append(vv)
+
+    if len(vals) == 0:
+        return {
+            "n_nonnull": 0,
+            "n_unique": 0,
+            "values": [],
+        }
+
+    cnt: Counter = Counter()
+    for v in vals:
+        try:
+            key = v if isinstance(v, (str, int, float, bool, tuple)) else repr(v)
+        except Exception:
+            key = repr(v)
+        cnt[key] += 1
+
+    most_common = cnt.most_common(max_unique)
+    return {
+        "n_nonnull": int(len(vals)),
+        "n_unique": int(len(cnt)),
+        "values": [{"value": k, "count": int(c)} for k, c in most_common],
+    }
+
+
+def _group_row_provenance(table: pd.DataFrame, *, max_rows: int = 20) -> Dict[str, Any]:
+    """Group row-level provenance columns into compact combinations."""
+    preferred = [
+        "FRONTEND", "BACKEND", "SAMPLER",
+        "FDNUM", "IFNUM", "PLNUM", "POLARIZA",
+        "OBSFREQ", "LO1FREQ", "LO2FREQ", "LO3FREQ",
+        "SIDEBAND", "SB1", "SB2", "SB3",
+        "TEMPSCAL", "CALSTAT", "SPECSYS", "SSYSOBS",
+    ]
+    cols = [c for c in preferred if c in table.columns]
+    if not cols:
+        return {"group_columns": [], "groups": []}
+
+    tmp = table[cols].copy()
+    for c in tmp.columns:
+        tmp[c] = tmp[c].map(_clean_value)
+
+    grouped = (
+        tmp.groupby(cols, dropna=False)
+        .size()
+        .reset_index(name="n_rows")
+        .sort_values("n_rows", ascending=False)
+    )
+
+    out: List[Dict[str, Any]] = []
+    n_show = builtins.min(max_rows, len(grouped))
+    for i in range(n_show):
+        row = grouped.iloc[i].to_dict()
+        row = {k: _to_builtin_scalar(v) for k, v in row.items()}
+        out.append(row)
+
+    return {
+        "group_columns": cols,
+        "groups": out,
+        "n_groups_total": int(len(grouped)),
+    }
+
+
+def summarize_provenance(sc_or_path: Union[Scantable, str]) -> Dict[str, Any]:
+    """Summarize provenance from a Scantable object or FITS path.
+
+    Parameters
+    ----------
+    sc_or_path : Scantable or str
+        - Scantable
+        - FITS file path readable by ``read_scantable``
+
+    Returns
+    -------
+    summary : dict
+        ``meta`` / row-level provenance / ``history`` provenance を人間が
+        追いやすい形に整理した辞書。
+    """
+    if isinstance(sc_or_path, str):
+        sc = read_scantable(sc_or_path)
+        source = sc_or_path
+    else:
+        sc = sc_or_path
+        source = None
+
+    meta = dict(getattr(sc, "meta", {}) or {})
+    table = getattr(sc, "table", None)
+    history_raw = dict(getattr(sc, "history", {}) or {})
+
+    meta_keys_preferred = [
+        "SWNAME", "SWVER",
+        "OBJECT", "TELESCOP", "INSTRUME",
+        "SITELAT", "SITELONG", "SITEELEV",
+        "OBSGEO-X", "OBSGEO-Y", "OBSGEO-Z",
+        "RESTFRQ", "RESTFREQ",
+        "SPECSYS", "SSYSOBS",
+        "CTYPE1", "CRVAL1", "CDELT1", "CRPIX1",
+        "BUNIT", "TEMPSCAL",
+        "FRONTEND", "BACKEND", "SAMPLER",
+        "OBSFREQ", "LO1FREQ", "LO2FREQ", "LO3FREQ",
+        "SIDEBAND", "SB1", "SB2", "SB3",
+    ]
+    meta_summary = {k: meta[k] for k in meta_keys_preferred if k in meta}
+
+    history_parsed: Dict[str, Any] = {}
+    for k, v in history_raw.items():
+        history_parsed[k] = _parse_maybe_structured_text(v)
+
+    history_keys = list(history_parsed.keys())
+
+    software_provenance = {
+        "meta": {
+            k: meta[k]
+            for k in ["SWNAME", "SWVER"]
+            if k in meta
+        },
+        "history": {
+            k: history_parsed[k]
+            for k in ["code_software", "code_version", "code_stage", "created_at_utc"]
+            if k in history_parsed
+        },
+    }
+
+    history_focus_keys = [
+        "code_software",
+        "code_version",
+        "code_stage",
+        "task",
+        "input",
+        "created_at_utc",
+        "baseline_history",
+        "scale_history",
+        "velocity_regrid",
+        "qc_summary",
+        "notes",
+        "stage",
+        "mode",
+        "group_mode",
+        "rows",
+        "exclude_rows",
+        "t_hot_k",
+        "tau_zenith",
+        "rest_freq",
+        "v_corr_col",
+        "fitsio_migration",
+    ]
+    history_focus = {k: history_parsed[k] for k in history_focus_keys if k in history_parsed}
+
+    row_column_candidates = [
+        "FRONTEND", "BACKEND", "SAMPLER",
+        "FDNUM", "IFNUM", "PLNUM", "POLARIZA",
+        "OBSFREQ", "LO1FREQ", "LO2FREQ", "LO3FREQ",
+        "SIDEBAND", "SB1", "SB2", "SB3",
+        "TEMPSCAL", "CALSTAT", "SPECSYS", "SSYSOBS",
+        "SCAN", "SUBSCAN", "INTGRP", "OBSMODE", "OBJECT",
+        "FLAGROW",
+    ]
+
+    if table is None:
+        row_columns_present: List[str] = []
+        row_unique: Dict[str, Any] = {}
+        row_groups: Dict[str, Any] = {"group_columns": [], "groups": []}
+        n_rows: Optional[int] = None
+    else:
+        row_columns_present = [c for c in row_column_candidates if c in table.columns]
+        row_unique = {
+            c: _summarize_series_unique(table[c])
+            for c in row_columns_present
+        }
+        row_groups = _group_row_provenance(table)
+        n_rows = int(len(table))
+
+    return {
+        "source": source,
+        "n_rows": n_rows,
+        "software_provenance": software_provenance,
+        "meta_summary": meta_summary,
+        "meta_keys_all": sorted(meta.keys()),
+        "row_provenance_columns": row_columns_present,
+        "row_provenance_unique": row_unique,
+        "row_provenance_groups": row_groups,
+        "history_keys_all": history_keys,
+        "history_focus": history_focus,
+        "history_parsed": history_parsed,
+    }
+
+
+def print_provenance(
+    sc_or_path: Union[Scantable, str],
+    *,
+    show_all_history: bool = False,
+    max_history_chars: int = 2000,
+) -> None:
+    """Pretty-print provenance summary for a Scantable object or FITS path."""
+    s = summarize_provenance(sc_or_path)
+
+    print("=" * 80)
+    print("PROVENANCE SUMMARY")
+    print("=" * 80)
+
+    if s["source"] is not None:
+        print(f"[source] {s['source']}")
+    print(f"[n_rows] {s['n_rows']}")
+
+    print("\n[software_provenance]")
+    pprint.pprint(s["software_provenance"], sort_dicts=False)
+
+    print("\n[meta_summary]")
+    pprint.pprint(s["meta_summary"], sort_dicts=False)
+
+    print("\n[row_provenance_columns]")
+    pprint.pprint(s["row_provenance_columns"])
+
+    print("\n[row_provenance_groups]")
+    pprint.pprint(s["row_provenance_groups"], sort_dicts=False)
+
+    print("\n[history_keys_all]")
+    pprint.pprint(s["history_keys_all"])
+
+    if show_all_history:
+        print("\n[history_parsed]")
+        txt = pprint.pformat(s["history_parsed"], sort_dicts=False, width=120)
+    else:
+        print("\n[history_focus]")
+        txt = pprint.pformat(s["history_focus"], sort_dicts=False, width=120)
+
+    if len(txt) > max_history_chars:
+        print(txt[:max_history_chars] + "\n... (truncated) ...")
+    else:
+        print(txt)
+
+    print("=" * 80)
+
 
 def describe_columns(sc: Scantable) -> None:
     """
@@ -707,11 +1004,14 @@ def merge_scantables(
 
     merged_hist = {"merged_count": len(inputs), "shifted_scan_id": shift_scan_id}
 
-    return Scantable(
-        meta=base_meta,
-        data=all_data,
-        table=merged_table,
-        history=merged_hist
+    return stamp_scantable_code_provenance(
+        Scantable(
+            meta=base_meta,
+            data=all_data,
+            table=merged_table,
+            history=merged_hist
+        ),
+        stage="merge_scantables",
     )
 
 # =========================================================
@@ -952,7 +1252,10 @@ def filter_scantable(
     if rows is not None:
         new_hist["filter_rows"] = str(rows)
 
-    return Scantable(meta=new_meta, data=new_data, table=new_table, history=new_hist)
+    return stamp_scantable_code_provenance(
+        Scantable(meta=new_meta, data=new_data, table=new_table, history=new_hist),
+        stage="filter_scantable",
+    )
 
 
 def select_rows(sc: Scantable, rows: Union[str, slice, Sequence[int], int]) -> Scantable:
@@ -979,7 +1282,10 @@ def select_rows(sc: Scantable, rows: Union[str, slice, Sequence[int], int]) -> S
     new_hist = sc.history.copy()
     new_hist["select_rows"] = str(rows)
 
-    return Scantable(meta=new_meta, data=new_data, table=new_table, history=new_hist)
+    return stamp_scantable_code_provenance(
+        Scantable(meta=new_meta, data=new_data, table=new_table, history=new_hist),
+        stage="select_rows",
+    )
 
 
 # =========================================================

@@ -11,9 +11,11 @@ from .config import GridResult
 from .wcs_proj import build_spatial_wcs_dict
 from .fits_io import _fill_header_metadata
 from .otf_bundle import OTFBundle
+from .provenance import PROV_EXTNAME, provenance_records_to_table, provenance_table_to_records, update_header_provenance_summary
 
 _MASK_NAMES = {"VALID_MASK", "SUPPORT_MASK", "MASK", "VALID_MASK_AND", "VALID_MASK_UNION", "LINEFREE", "LINEFREE_USED", "LINEFREE_PRIOR", "LINEFREE3D", "LINEFREE3D_USED", "LINEFREE3D_PRIOR", "SIGNAL_MASK_USED", "SIGNAL_MASK3D_USED"}
 _IMAGE_CORE_NAMES = {"VARIANCE", "VALID_MASK", "SUPPORT_MASK"}
+_RESERVED_TABLE_NAMES = {PROV_EXTNAME}
 _U8_IMAGE_NAMES = {"BASE_FLG"}
 
 
@@ -200,13 +202,22 @@ def _table_to_bintable_hdu(table: Table, name: str):
         raise TypeError(f"Could not convert table extension {name!r} into BinTableHDU") from exc
 
 
-def write_otf_bundle(bundle: OTFBundle, path: str, *, overwrite: bool = False) -> None:
+def write_otf_bundle(
+    bundle: OTFBundle,
+    path: str,
+    *,
+    overwrite: bool = False,
+    checksum: bool = True,
+    output_verify: str = "exception",
+) -> None:
     validate_otf_bundle(bundle, require_variance=False)
     header = bundle.header.copy()
     if bundle.unit is not None and "BUNIT" not in header:
         header["BUNIT"] = str(bundle.unit)
     if bundle.family_label is not None:
         header["FAMILY"] = str(bundle.family_label)
+    prov_records = list(bundle.meta.get("provenance", []) or [])
+    update_header_provenance_summary(header, prov_records, bundle_id=bundle.meta.get("bundle_id"))
     primary = fits.PrimaryHDU(data=np.asarray(bundle.data, dtype=np.float32), header=header)
     hdus = [primary]
     if bundle.variance is not None:
@@ -230,11 +241,17 @@ def write_otf_bundle(bundle: OTFBundle, path: str, *, overwrite: bool = False) -
         hdus.append(fits.ImageHDU(data=data, name=uname))
 
     for name, table in bundle.table_ext.items():
+        uname = str(name).upper()
+        if uname in _RESERVED_TABLE_NAMES and prov_records:
+            continue
         if not isinstance(table, Table):
             table = Table(table)
-        hdus.append(_table_to_bintable_hdu(table, str(name).upper()))
+        hdus.append(_table_to_bintable_hdu(table, uname))
 
-    fits.HDUList(hdus).writeto(path, overwrite=overwrite)
+    if prov_records:
+        hdus.append(_table_to_bintable_hdu(provenance_records_to_table(prov_records), PROV_EXTNAME))
+
+    fits.HDUList(hdus).writeto(path, overwrite=overwrite, checksum=checksum, output_verify=output_verify)
 
 
 def read_otf_bundle(path: str) -> OTFBundle:
@@ -249,6 +266,7 @@ def read_otf_bundle(path: str) -> OTFBundle:
         support_mask = None
         image_ext: dict[str, np.ndarray] = {}
         table_ext: dict[str, Table] = {}
+        prov_records = None
         for hdu in hdul[1:]:
             name = str(hdu.name).upper()
             if isinstance(hdu, (fits.ImageHDU, fits.CompImageHDU)):
@@ -262,7 +280,19 @@ def read_otf_bundle(path: str) -> OTFBundle:
                 else:
                     image_ext[name] = np.asarray(arr)
             elif isinstance(hdu, fits.BinTableHDU):
-                table_ext[name] = Table(hdu.data)
+                if name == PROV_EXTNAME:
+                    try:
+                        prov_records = provenance_table_to_records(Table(hdu.data))
+                    except Exception:
+                        table_ext[name] = Table(hdu.data)
+                else:
+                    table_ext[name] = Table(hdu.data)
+        meta = {"source_path": str(Path(path))}
+        if prov_records:
+            meta["provenance_schema"] = str(header.get("PRVSCHEM", "") or "otf-prov-v1")
+            meta["provenance"] = prov_records
+            if "BNDLID" in header:
+                meta["bundle_id"] = str(header.get("BNDLID"))
         bundle = OTFBundle(
             data=np.asarray(data),
             header=header,
@@ -273,6 +303,6 @@ def read_otf_bundle(path: str) -> OTFBundle:
             family_label=header.get("FAMILY"),
             image_ext=image_ext,
             table_ext=table_ext,
-            meta={"source_path": str(Path(path))},
+            meta=meta,
         )
     return bundle
