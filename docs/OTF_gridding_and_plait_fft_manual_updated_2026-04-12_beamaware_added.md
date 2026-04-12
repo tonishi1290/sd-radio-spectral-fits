@@ -1,4 +1,4 @@
-# OTF gridding + FFT/PLAIT basketweave 実装マニュアル（現在の実装版 + 2026-03-26 増補改訂）
+# OTF gridding + FFT/PLAIT basketweave 実装マニュアル（現在の実装版 + 2026-04-12 beam-aware kernel 増補改訂）
 
 
 ## 1. この文書の対象
@@ -17,7 +17,7 @@
 
 この文書では、**現在の推奨経路**だけを扱います。過去の設計経緯や旧方式の説明は入れていません。
 
-この版では、kernel に関する記述を **現在の code / spec / kernel 詳細説明書** に合わせて再点検し、特に `sf` の formal default を `convsupport=3`、推奨の 2 本立てを `sf + convsupport=3` と `gjinc + mangum + signed` にそろえています。
+この版では、kernel に関する記述を **現在の code / spec / kernel 詳細説明書** に合わせて再点検し、特に `sf` の formal default を `convsupport=3`、推奨の 2 本立てを `sf + convsupport=3` と `gjinc + mangum + signed` にそろえたうえで、2026-04-12 時点の `sf_beam` / `gjinc_beam`、`SF(4)` / `SF(5)`、pixel-based と beam-aware の違い、`gauss` の explicit width/support 指定も追加で整理しています。
 
 ---
 
@@ -1654,12 +1654,14 @@ $$
 現在の実装では、OTF gridding に使う public kernel は
 
 - `kernel='sf'`
+- `kernel='sf_beam'`
 - `kernel='gjinc'`
+- `kernel='gjinc_beam'`
 - `kernel='gauss'`
 
 です。
 
-このうち、実務上まず考えるべきなのは **`sf` と `gjinc`** です。`gauss` は比較用・単純参照用としては有用ですが、通常の標準推奨 kernel として最初に選ぶものではありません。
+このうち、実務上まず考えるべきなのは **`sf` / `sf_beam` と `gjinc` / `gjinc_beam`** です。`gauss` は比較用・単純参照用としては有用で、さらに explicit な `gwidth_*` / `support_radius_*` を与えれば実質的に beam-aware な Gaussian としても使えますが、通常の標準推奨 kernel として最初に選ぶものではありません。
 
 ### 10.2.1 まず最初に知っておくべき推奨
 
@@ -1760,9 +1762,9 @@ kernel 関連では、次の語を混同しないでください。
 ### 10.2.3 現在の public パラメータ
 
 - `kernel`
-  - `'sf'`, `'gjinc'`, `'gauss'`
+  - `'sf'`, `'sf_beam'`, `'gjinc'`, `'gjinc_beam'`, `'gauss'`
 - `kernel_preset`
-  - `gjinc` に対して主に `'mangum'` または `'casa'`
+  - `gjinc` / `gjinc_beam` に対して主に `'mangum'` または `'casa'`
   - 後方互換 alias として `'mangum2007' -> 'mangum'`, `'legacy' -> 'casa'`
 - `kernel_sign`
   - `'auto'`, `'signed'`, `'positive_only'`
@@ -1770,8 +1772,14 @@ kernel 関連では、次の語を混同しないでください。
   - `sf` の public support radius パラメータ
   - 現在の formal default は `3`
   - 現在実装では integer 的な値を想定し、`convsupport < 3` は warning 対象
+- `sf_beam_match_convsupport`
+  - `sf_beam` を design point `cell=beam/3` で `SF(3)`, `SF(4)`, `SF(5)`, `SF(6)` のどれに合わせるかを指定する整数パラメータ
+  - 現在実装で受ける値は `3`, `4`, `5`, `6`
+- `sf_beam_support_beam`, `sf_beam_shape_c`
+  - `sf_beam` の beam-aware な support と shape を明示指定したいときに使う
 - `gwidth_pix`, `gwidth_beam`
 - `jwidth_pix`, `jwidth_beam`
+- `gjinc_beam_gwidth_beam`, `gjinc_beam_jwidth_beam`, `gjinc_beam_support_beam`
 - `truncate`
 - `support_radius_pix`, `support_radius_beam`
 
@@ -1779,15 +1787,19 @@ kernel 関連では、次の語を混同しないでください。
 
 - `sf` では、public には `convsupport` を使います
 - `sf` に対して `support_radius_pix`, `support_radius_beam`, `truncate` を与える使い方は、現在実装では禁止です
+- `sf_beam` では `sf_beam_match_convsupport` または `sf_beam_support_beam` / `sf_beam_shape_c` を使います
 - `gjinc` では `kernel_preset`, `kernel_sign`, `jwidth_*`, `gwidth_*`, `truncate`, `support_radius_*` が意味を持ちます
-- `gauss` と `sf` は正の kernel なので、`kernel_sign='signed'` を明示しても、現在実装では `positive_only` と同等に扱います
+- `gjinc_beam` では `kernel_preset` と `gjinc_beam_*` が意味を持ち、generic な `gwidth_*` / `jwidth_*` / `truncate` / `support_radius_*` は使いません
+- `gauss` と `sf` / `sf_beam` は正の kernel なので、`kernel_sign='signed'` を明示しても、現在実装では `positive_only` と同等に扱います
 
 通常は、explicit width を細かくいじる前に、まず
 
 - `sf, convsupport=3`
 - `gjinc, kernel_preset='mangum', kernel_sign='signed'`
+- `sf_beam, sf_beam_match_convsupport=3`
+- `gjinc_beam, kernel_preset='mangum', kernel_sign='signed'`
 
-のどちらかから始めるのが安全です。
+のどれかから始めるのが安全です。
 
 ### 10.2.4 `cell_arcsec` と `beam_fwhm_arcsec`
 
@@ -1798,14 +1810,19 @@ kernel を理解するときに最も間違えやすいのは、`beam_fwhm_arcse
 - `cell_arcsec`
   - 出力 map の pixel size [arcsec/pixel]
 
-現在の kernel 実装は public preset としては **pixel-based** です。したがって kernel の物理幅は `cell_arcsec` を通して決まります。一方、最終的な nominal effective beam は
+現在の kernel 実装では、**legacy / default 側の public preset は pixel-based** です。したがって `sf`, `gjinc`, `gauss` を preset ベースで使うと、kernel の物理幅は `cell_arcsec` を通して決まります。一方、2026-04-12 版では `sf_beam`, `gjinc_beam` を追加しており、こちらは kernel の物理幅・support を beam 単位で持ちます。
+
+最終的な nominal effective beam は
 
 - 入力ビーム
 - gridding kernel の物理幅
+- 出力 sampling としての `cell_arcsec`
 
 の両方で決まります。
 
 このため、`cell_arcsec` は小さすぎても大きすぎてもよくありません。実務上の第一近似として、**`cell_arcsec ≈ beam_fwhm_arcsec / 3`** を基本にしてください。現在実装では `cell_arcsec=None` のとき、この目安が既定として解決されます。
+
+beam-aware kernel を使う場合でも、**`cell_arcsec` が完全に無関係になるわけではありません**。beam-aware で一定にできるのは kernel の物理幅・support であり、出力 grid の Nyquist や map sampling そのものは依然として `cell_arcsec` に依存します。
 
 ### 10.2.5 `sf` と `gjinc` と `gauss` の簡単な使い分け
 
@@ -2266,3 +2283,314 @@ out = mosaic_fits(
 です。
 
 この順に進めれば、現在の実装の長所を活かしつつ、BW と後段 mosaic を無理なく運用できます。
+
+
+## 14.4 2026-04-12 増補: pixel-based と beam-aware の考え方
+
+この節は、今回追加した `sf_beam` / `gjinc_beam` と、従来の pixel-based kernel の違いを workflow 目線でまとめたものです。
+
+### 14.4.1 何が違うのか
+
+記号を次で固定します。
+
+- $B$: 入力ビーム FWHM [arcsec]
+- $d$: 出力 pixel size `cell_arcsec` [arcsec/pixel]
+- $r$: dump 位置と output pixel center の距離 [arcsec]
+- $u = r/d$: cell 基準の無次元半径
+- $q = r/B$: beam 基準の無次元半径
+
+**pixel-based** kernel では、kernel の幅・support はまず $u$ で決まります。したがって `cell_arcsec` を変えると、kernel の**物理幅そのもの**も一緒に変わります。
+
+**beam-aware** kernel では、kernel の幅・support はまず $q$ で決まります。したがって `cell_arcsec` を変えても、kernel の**物理幅と support を beam 単位で固定**できます。
+
+### 14.4.2 どういうときに pixel-based を使うか
+
+次のような場合は、まず pixel-based を使うのが自然です。
+
+- まず現行 default と同じ考え方で安全に map を作りたい
+- `cell_arcsec ≈ beam_fwhm_arcsec / 3` を採る
+- CASA / casacore の public semantics に近い設定で理解したい
+- `SF(3)` や `GJINC(mangum/casa)` をそのまま使いたい
+
+実務上の第一選択は引き続き
+
+- `sf + convsupport=3`
+- `gjinc + mangum + signed`
+
+の 2 本立てです。
+
+### 14.4.3 どういうときに beam-aware を使うか
+
+次のような場合は、beam-aware の意味があります。
+
+- 出力 sampling と kernel の物理 smoothing scale を分離したい
+- `cell_arcsec` を beam/3 以外へ動かしたいが、kernel の物理幅は維持したい
+- 同じ観測を複数の `cell_arcsec` で比較しても、kernel の物理意味を変えたくない
+- 実際の物理 beam に対して support を何 beam 分使うかで考えたい
+
+言い換えると、**`cell_arcsec` を「保存形式・表示形式・後段処理上の sampling」として動かしたい**ときに beam-aware を検討する意味があります。
+
+### 14.4.4 効果をどう読むか
+
+今回の synthetic validation では、概ね次が確認されました。
+
+- `sf_beam` は design point `cell = beam/3` で `SF(3)`, `SF(4)`, `SF(5)`, `SF(6)` によく一致する
+- `gjinc_beam` は design point `cell = beam/3` で `gjinc(mangum)` / `gjinc(casa)` に極めてよく一致する
+- `cell_arcsec` を変えると、pixel-based 側は kernel の物理幅も一緒に変わるが、beam-aware 側はそれを保つ
+
+したがって、**design point の再現**と**design point から外したときの物理幅維持**を両立したい場合に beam-aware は有用です。
+
+## 14.5 2026-04-12 増補: `SF(3)`, `SF(4)`, `SF(5)`, `SF(6)` の意味
+
+### 14.5.1 `SF(4)` と `SF(5)` を入れる意味
+
+今回の検討では `SF(3)` と `SF(6)` だけでなく、`SF(4)` と `SF(5)` も source-level に再現して比較しました。これにより、`SF(3)` と `SF(6)` の両端だけを無理に結ぶのではなく、**`SF(3) -> SF(4) -> SF(5) -> SF(6)` を連続 family として見る**方が正しいことが確認できました。
+
+### 14.5.2 official table に基づく対応
+
+現在の `sf` は casacore の `SPHFN` coefficient table と `Sph_Conv::value()` の解決則を意識した実装です。`sphparm=1.0` では、`SF(3-6)` は次のように解決されます。
+
+| public | support width $m$ | jmax | design point での support [beam] |
+|---|---:|---:|---:|
+| `SF(3)` | 6 | 3 | 1.000 |
+| `SF(4)` | 8 | 4 | 1.333 |
+| `SF(5)` | 8 | 5 | 1.667 |
+| `SF(6)` | 8 | 6 | 2.000 |
+
+ここで重要なのは、`SF(4)`, `SF(5)`, `SF(6)` はすべて support width $m=8$ を使い、違いは主に `jmax` に入ることです。したがって、`SF(4)` と `SF(5)` は単なる補間ではありません。
+
+### 14.5.3 design point での nominal broadening
+
+代表条件 $B=350$ arcsec, $d=B/3$ での source-level 再現では、nominal output PSF FWHM は概ね
+
+- `SF(3)` : 約 423 arcsec
+- `SF(4)` : 約 451 arcsec
+- `SF(5)` : 約 503 arcsec
+- `SF(6)` : 約 560 arcsec
+
+でした。
+
+uploaded manual に元からあった代表値
+
+- `SF(3)` : 約 426 arcsec
+- `SF(6)` : 約 563 arcsec
+
+とも 1 % 未満で整合しており、今回の再現は元文書と矛盾していません。
+
+### 14.5.4 実務上どう使うか
+
+- `SF(3)`
+  - formal default
+  - broadening と安全性の中庸
+- `SF(4)`
+  - `SF(3)` より少し broad
+  - `SF(6)` ほどではない
+  - smooth 側へ少し振りたいときの中間候補
+- `SF(5)`
+  - かなり smooth 側
+  - 欠損や edge に対しては見かけ上安定に見えやすいが、分解能と peak はかなり落ちる
+- `SF(6)`
+  - ALMA singledish 文脈では重要な値
+  - ただしこの package の内部比較ではかなり broad
+  - formal default ではなく、明示的に broadening を許容するときに使う
+
+## 14.6 2026-04-12 増補: `gauss` をどう理解するか
+
+### 14.6.1 `gauss` に専用の `gauss_beam` が無い理由
+
+`gauss` は、現在の public 実装でも
+
+- `gwidth_pix`, `gwidth_beam`
+- `support_radius_pix`, `support_radius_beam`
+- `truncate`
+
+を使って幅と support を明示できます。したがって、**Gaussian については、専用の `gauss_beam` という別 kernel 名を増やさなくても、explicit な beam 単位指定で実質的に beam-aware な Gaussian を作れます。**
+
+### 14.6.2 それでも `cell_arcsec` は残る
+
+ただし、ここで「beam-aware / pixel-based を考えなくてよい」と言い切ってはいけません。`gwidth_beam` や `support_radius_beam` を与えれば kernel の**物理幅**は `cell_arcsec` から切り離せますが、出力 sampling としての `cell_arcsec`、したがって Nyquist と最終 map の aliasing 条件は依然として残ります。
+
+要するに、`gauss` では
+
+- kernel の形状を explicit に決める
+- そのうえで、`cell_arcsec` は output grid の問題として別に考える
+
+のが正しい理解です。
+
+### 14.6.3 `gauss` の実務的な位置づけ
+
+- 比較用・参照用として有用
+- 単純な positive smoothing として理解しやすい
+- 強い点源の ringing を避けたいときの比較対象として有用
+- ただし default / 第一推奨 kernel ではない
+
+## 14.7 2026-04-12 増補: beam-aware kernel の command examples
+
+以下では `grid_otf_family(...)` の入口からそのまま使う例を示します。`grid_otf(...)` 直呼びでなくても、`MapConfig` に設定すれば同じ kernel が通ります。
+
+### 14.7.1 `sf_beam` を `SF(3)` に合わせて使う
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=350.0 / 3.0,
+    kernel='sf_beam',
+    sf_beam_match_convsupport=3,
+    weight_mode='rms',
+    reproducible_mode=True,
+    verbose=True,
+)
+
+x_bundle = grid_otf_family(x_scans, cfg, family_label='X')
+y_bundle = grid_otf_family(y_scans, cfg, family_label='Y')
+```
+
+### 14.7.2 `sf_beam` を `SF(4)` に合わせて使う
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=100.0,  # beam/3 から少し動かしても kernel の物理幅を保ちたい
+    kernel='sf_beam',
+    sf_beam_match_convsupport=4,
+    weight_mode='rms',
+    verbose=True,
+)
+```
+
+### 14.7.3 `sf_beam` を support / shape で直接指定する
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=241,
+    ny=241,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=80.0,
+    kernel='sf_beam',
+    sf_beam_support_beam=4.0 / 3.0,
+    sf_beam_shape_c=13.737787961959839,
+    weight_mode='rms',
+    verbose=True,
+)
+```
+
+この例は design point `cell=beam/3` で `SF(4)` に合わせた連続 beam-aware spheroidal を、cell を変えた状態でもそのまま使いたいときの形です。
+
+### 14.7.4 `gjinc_beam` を Mangum preset で使う
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=90.0,
+    kernel='gjinc_beam',
+    kernel_preset='mangum',
+    kernel_sign='signed',
+    weight_mode='rms',
+    verbose=True,
+)
+```
+
+このとき design point `cell=beam/3` に対応する beam-aware 幅は概ね
+
+- `gjinc_beam_jwidth_beam = 1.55 / 3 ≈ 0.5167`
+- `gjinc_beam_gwidth_beam = 2.52 * sqrt(log(2)) / 3 ≈ 0.6993`
+- `gjinc_beam_support_beam = 1.0`
+
+です。
+
+### 14.7.5 `gjinc_beam` を CASA preset で使う
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=90.0,
+    kernel='gjinc_beam',
+    kernel_preset='casa',
+    kernel_sign='positive_only',
+    weight_mode='rms',
+    verbose=True,
+)
+```
+
+design point では `gjinc(casa)` の beam-aware support は first null 由来で概ね `0.97675 beam` です。
+
+### 14.7.6 `gauss` を explicit beam parameters で使う
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=90.0,
+    kernel='gauss',
+    gwidth_beam=0.28,
+    support_radius_beam=0.84,
+    weight_mode='rms',
+    verbose=True,
+)
+```
+
+このように `gauss` は別名の `gauss_beam` がなくても、explicit 指定で実質的に beam-aware な Gaussian を作れます。なお `cell_arcsec` は output grid の Nyquist を決めるので、依然として別に考える必要があります。
+
+### 14.7.7 `grid_otf_family(...)` から X/Y を揃えて PLAIT する例
+
+```python
+cfg = MapConfig(
+    x0=-3600.0,
+    y0=-3600.0,
+    nx=201,
+    ny=201,
+    beam_fwhm_arcsec=350.0,
+    cell_arcsec=90.0,
+    kernel='gjinc_beam',
+    kernel_preset='mangum',
+    kernel_sign='signed',
+    weight_mode='rms',
+    reproducible_mode=True,
+    verbose=True,
+)
+
+x_bundle = grid_otf_family(x_scans, cfg, family_label='X')
+y_bundle = grid_otf_family(y_scans, cfg, family_label='Y')
+plait = basketweave_cubes(
+    x_bundle,
+    y_bundle,
+    linefree_velocity_windows_kms=[(-30.0, -10.0), (20.0, 50.0)],
+    plait_noise_mode='family_channel',
+)
+```
+
+### 14.7.8 実務的な使い分けの短い指針
+
+- **まず安全に全体像**
+  - `sf + convsupport=3`
+- **少し smooth 側へ**
+  - `sf_beam + sf_beam_match_convsupport=4`
+- **かなり smooth 側へ**
+  - `SF(5)` や `SF(6)` 相当。ただし broadening を強く許容する
+- **sharpness 重視**
+  - `gjinc + mangum + signed`
+- **sharpness を保ったまま cell を動かしたい**
+  - `gjinc_beam + mangum`
+- **単純な positive smoothing を explicit に使いたい**
+  - `gauss` に `gwidth_*` / `support_radius_*` を与える

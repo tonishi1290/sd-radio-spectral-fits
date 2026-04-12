@@ -1,9 +1,9 @@
 # `map_3d` OTF gridding kernel 詳細説明書
 
-Date: 2026-03-29  
-Revision: r5  
+Date: 2026-04-12  
+Revision: r12  
 Target package: `map_3d`  
-Scope: OTF gridding における空間 kernel の理論・実装・既定値・使い分け・未実装事項・注意点
+Scope: OTF gridding における空間 kernel の理論・実装・既定値・使い分け・beam-aware 拡張・未実装事項・注意点
 
 ---
 
@@ -136,15 +136,22 @@ $$
 - **pixel-based**: kernel の幅・support を cell size $d$ 基準で定義する  
 - **beam-aware**: kernel の幅・support を beam size $B$ 基準で定義する
 
-**現在の public preset はすべて pixel-based** である。beam-aware 指定子 (`*_beam`, `support_radius_beam`) は後方互換のため残しているが、public default の中心ではない。
+**legacy / default 側の public preset は pixel-based** である。一方、2026-04-12 版では `sf_beam` と `gjinc_beam` を dedicated な beam-aware kernel として追加した。`gauss` は専用の `gauss_beam` を持たないが、`gwidth_beam` と `support_radius_beam` を explicit に与えることで、実質的に beam-aware な Gaussian として使える。
 
 ---
 
 ## 3. このパッケージの基本設計方針
 
-### 3.1 公開 preset はすべて pixel-based
+### 3.1 legacy preset は pixel-based、beam-aware は dedicated kernel
 
-現在の `map_3d` では、公開 preset はすべて pixel-based に統一している。すなわち、kernel の幅や support はまず `cell_arcsec` 基準で決まる。
+現在の `map_3d` では、legacy / default 側の public preset は pixel-based に統一している。すなわち、`sf`, `gjinc`, `gauss` を preset ベースで使うと、kernel の幅や support はまず `cell_arcsec` 基準で決まる。
+
+一方、2026-04-12 版では、beam-aware を dedicated kernel として切り出した。
+
+- `sf_beam`: 連続 beam-aware spheroidal kernel
+- `gjinc_beam`: 連続 beam-aware GJINC kernel
+
+したがって、「pixel-based の public default を保つこと」と「beam-aware kernel を導入すること」は両立している。
 
 ### 3.2 `beam_fwhm_arcsec` と `cell_arcsec` の役割分担
 
@@ -284,6 +291,16 @@ $$
 
 ### 5.1 public kernel 名
 
+現在の public kernel 名は次である。
+
+- `sf`
+- `sf_beam`
+- `gjinc`
+- `gjinc_beam`
+- `gauss`
+
+`sf` / `gjinc` は従来からの pixel-based kernel、`sf_beam` / `gjinc_beam` は今回追加した beam-aware kernel である。`gauss` は専用の `gauss_beam` を持たないが、explicit width / support 指定により実質的に beam-aware に使える。
+
 現在の public `kernel` は次の 3 種類である。
 
 1. `sf`  
@@ -336,8 +353,11 @@ $$
 - `kernel_preset`  
 - `kernel_sign`  
 - `convsupport`  
+- `sf_beam_match_convsupport`  
+- `sf_beam_support_beam`, `sf_beam_shape_c`  
 - `gwidth_pix`, `gwidth_beam`  
 - `jwidth_pix`, `jwidth_beam`  
+- `gjinc_beam_gwidth_beam`, `gjinc_beam_jwidth_beam`, `gjinc_beam_support_beam`  
 - `truncate`  
 - `support_radius_pix`, `support_radius_beam`  
 - `estimator`, `n_min_avg`, `n_min_plane`
@@ -349,6 +369,13 @@ $$
 `explicit pix > explicit beam > preset default`
 
 の順に優先する。`sf` は例外であり、public には `convsupport` だけを使う。
+
+2026-04-12 版では、さらに
+
+- `sf_beam`: `sf_beam_support_beam` / `sf_beam_shape_c` を explicit 指定、または `sf_beam_match_convsupport` を使う
+- `gjinc_beam`: `gjinc_beam_*` を explicit 指定、または `kernel_preset='mangum'` / `'casa'` を使う
+
+という dedicated beam-aware 解決経路を追加した。
 
 ### 6.3 `cell_arcsec=None`
 
@@ -1268,3 +1295,377 @@ kernel evaluator 自体は source-level にかなり寄せたが、synthetic OTF
 - `SF vs GJINC` 比較メモ  
 - kernel 仕様書  
 - 現在の patch 一式
+
+
+## 22. 2026-04-12 増補: beam-aware kernel, `SF(4)`, `SF(5)`, `gauss` の整理
+
+この節は、今回の改修で追加・確認した内容を、既存本文を削らずに 1 か所へ統合したものです。ここでは
+
+1. `sf_beam` / `gjinc_beam` をなぜ別 kernel として導入したか
+2. `SF(3)`, `SF(4)`, `SF(5)`, `SF(6)` を official table ベースでどう理解するか
+3. `gauss` をどう扱えばよいか
+4. 実装・性能・使い分けをどう読むか
+
+をまとめます。
+
+### 22.1 なぜ beam-aware を別 kernel にしたか
+
+現在の `sf` は、generic な連続 PSWF ではなく、casacore の `Sph_Conv` / `SPHFN` の考え方を意識した**離散 family** 実装です。したがって、これをそのまま連続 beam-aware 化することと、数学的に意味のある連続 spheroidal kernel を作ることは同じではありません。
+
+このため実装上は
+
+- `sf`: official / pixel-based / CASA-compatible semantics
+- `sf_beam`: 連続 beam-aware spheroidal kernel
+
+と分けるのが最も自然です。
+
+`gjinc` についても同様で、public default としての `gjinc(mangum/casa)` は pixel-based のまま残しつつ、
+
+- `gjinc_beam`: design point `cell=beam/3` で `gjinc` に一致する連続 beam-aware GJINC
+
+を別 kernel として導入した方が、意味が明確です。
+
+### 22.2 current public API の整理
+
+2026-04-12 版の kernel 関連 public API は次です。
+
+#### `sf`
+
+- `kernel='sf'`
+- `convsupport`
+- internal では `sphparm=1.0` 固定
+
+#### `sf_beam`
+
+- `kernel='sf_beam'`
+- `sf_beam_match_convsupport`
+- `sf_beam_support_beam`
+- `sf_beam_shape_c`
+
+#### `gjinc`
+
+- `kernel='gjinc'`
+- `kernel_preset='mangum'` or `'casa'`
+- `kernel_sign`
+- `jwidth_pix`, `jwidth_beam`
+- `gwidth_pix`, `gwidth_beam`
+- `truncate`
+- `support_radius_pix`, `support_radius_beam`
+
+#### `gjinc_beam`
+
+- `kernel='gjinc_beam'`
+- `kernel_preset='mangum'` or `'casa'`
+- `kernel_sign`
+- `gjinc_beam_jwidth_beam`
+- `gjinc_beam_gwidth_beam`
+- `gjinc_beam_support_beam`
+
+#### `gauss`
+
+- `kernel='gauss'`
+- `gwidth_pix` or `gwidth_beam`
+- `truncate` or `support_radius_pix` or `support_radius_beam`
+
+### 22.3 `SF(3)`, `SF(4)`, `SF(5)`, `SF(6)` の official table 再現
+
+#### 22.3.1 source-level 解決則
+
+current implementation では `sphparm=1.0` を採るので
+
+$$
+ialpha = 	ext{clip}(
+\lfloor 2\,sphparm + 1 \rfloor,
+1, 5)
+= 3
+$$
+
+であり、対応する weighting exponent は実効的に $\alpha = 1$ です。
+
+`convsupport = c` に対して、source-level の解決則は
+
+$$
+isupp = 	ext{clip}(\lfloor 2c \rfloor, 4, 8)
+$$
+
+$$
+jmax = 
+\min(\lfloor c \rfloor, 7)
+$$
+
+です。したがって `SF(3-6)` は次のようになります。
+
+| public | support width $m$ | jmax | design point support [beam] |
+|---|---:|---:|---:|
+| `SF(3)` | 6 | 3 | 1.000 |
+| `SF(4)` | 8 | 4 | 1.333 |
+| `SF(5)` | 8 | 5 | 1.667 |
+| `SF(6)` | 8 | 6 | 2.000 |
+
+ここから分かるように、`SF(4)` と `SF(5)` は**公式 table 上も意味のある中間 family**です。`SF(3)` と `SF(6)` の間を勝手に補間しただけではありません。
+
+#### 22.3.2 design point での nominal broadening
+
+代表条件 $B = 350$ arcsec, $d = B/3$ での source-level 再現では、nominal output PSF FWHM は次でした。
+
+| kernel | nominal output PSF FWHM [arcsec] |
+|---|---:|
+| `SF(3)` | 423.062 |
+| `SF(4)` | 451.184 |
+| `SF(5)` | 502.669 |
+| `SF(6)` | 559.912 |
+
+元の manual に載っていた代表値
+
+- `SF(3)` : 426.225 arcsec
+- `SF(6)` : 563.252 arcsec
+
+とも 1 % 未満で整合しており、今回の再現は元文書と矛盾していません。
+
+#### 22.3.3 aliasing / gap / noise の読み方
+
+今回の内部比較では、`SF(3) -> SF(6)` と smooth 側へ行くほど
+
+- support は大きくなる
+- broadening は大きくなる
+- point peak は落ちる
+- 見かけ上の gap artifact は目立ちにくくなる
+- 高周波 passband はかなり落ちる
+- center noise factor は下がる
+
+という傾向が確認されました。代表的な design point での summary は概ね次のとおりです。
+
+| kernel | pass at 0.5 Nyq / DC | alias/pass(1.2Nyq -> 0.5Nyq) | gap2 center artifact / peak | center noise factor |
+|---|---:|---:|---:|---:|
+| `SF(3)` | 0.0464 | 0.0847 | 0.0596 | 0.3193 |
+| `SF(4)` | 0.0291 | 0.1270 | 0.0752 | 0.2693 |
+| `SF(5)` | 0.00887 | 0.3807 | 0.0934 | 0.2154 |
+| `SF(6)` | 0.00146 | 2.1438 | 0.1088 | 0.1795 |
+
+ここで重要なのは、`SF(6)` が「何でも良くする」のではなく、**かなり強く平滑化することで結果的に目立ちにくくしている**側であることです。
+
+### 22.4 `sf_beam` の考え方と実装
+
+#### 22.4.1 数学的意味
+
+`sf_beam` は、現在の離散 `sf` をそのまま beam-aware 化したものではありません。意味としては
+
+- input beam に対して support を何 beam 分使うか
+- `cell_arcsec` を変えても kernel の物理幅を保ちたい
+
+という目的に対して、**連続 beam-aware spheroidal kernel** を定義したものです。
+
+記号を
+
+- $B$: 入力ビーム FWHM
+- $r$: 半径
+- $q = r/B$
+- $s$: support_beam
+
+とすると、概念的には
+
+$$
+K(q; s, c) = 
+\begin{cases}
+\Phi(q/s; c), & q \le s \\
+0, & q > s
+\end{cases}
+$$
+
+の形です。ここで $c$ は shape parameter です。
+
+#### 22.4.2 design point matching
+
+current implementation では、`cell = beam/3` を design point として、`sf_beam_match_convsupport = n` に応じて `SF(n)` に合わせています。
+
+matching は次です。
+
+| `sf_beam_match_convsupport` | `sf_beam_support_beam` | `sf_beam_shape_c` |
+|---|---:|---:|
+| 3 | 1.000000 | 10.685961961746216 |
+| 4 | 1.333333 | 13.737787961959839 |
+| 5 | 1.666667 | 13.719022989273071 |
+| 6 | 2.000000 | 13.703690290451050 |
+
+これにより design point では `sf` と `sf_beam` の nominal radial FWHM が揃います。
+
+#### 22.4.3 implementation 上の注意
+
+`SF(4)` と `SF(5)` では、途中で support を `float32` に落として `int(cut)` を取り直すと family selection が壊れやすいことが確認されました。したがって current implementation では、`convsupport` の family selection には**厳密な整数値**をそのまま使うように修正しています。
+
+また `sf` / `sf_beam` の beam diagnostic では、Gaussian core fit だけに頼ると肩の広がりを過小評価しやすいため、`bmaj_nominal_arcsec` / `bmaj_empirical_arcsec` は **radial FWHM 優先**にし、Gaussian-fit 値は補助 metadata として残しています。
+
+#### 22.4.4 entrypoint での一致確認
+
+`MapConfig -> grid_otf(...)` および `MapConfig -> grid_otf_family(...)` の入口からの比較で、`sf` と `sf_beam` は `SF(3)`, `SF(4)`, `SF(5)`, `SF(6)` すべてで良好に一致しました。代表値は概ね
+
+- point max abs diff: $4\times 10^{-4}$ から $6\times 10^{-4}$ 程度
+- gap case peak diff: $8\times 10^{-4}$ から $1.3\times 10^{-3}$ 程度
+- noise mean RMS diff: $3\times 10^{-4}$ 以下
+
+です。
+
+この違いは、連続 beam-aware kernel と離散 official `SF` の違いとしては十分小さいと解釈できます。
+
+### 22.5 `gjinc_beam` の考え方と実装
+
+#### 22.5.1 design point matching
+
+`gjinc_beam` は、design point `cell = beam/3` で `gjinc(mangum)` または `gjinc(casa)` に一致するように、default の pixel-based 幅を beam 単位へ写したものです。
+
+現在の default は
+
+$$
+jwidth_{beam} = 1.55 / 3 
+\approx 0.5166667
+$$
+
+$$
+gwidth_{beam} = 2.52 \sqrt{\ln 2} / 3 
+\approx 0.6993459
+$$
+
+です。
+
+support は preset に応じて
+
+- `mangum`: `gjinc_beam_support_beam = 1.0`
+- `casa`: first null 由来で `gjinc_beam_support_beam ≈ 0.9767523`
+
+です。
+
+#### 22.5.2 entrypoint での一致確認
+
+`gjinc` と `gjinc_beam` は design point で極めてよく一致しました。代表的には
+
+- point max abs diff: $6\times 10^{-8}$ から $2\times 10^{-7}$ 程度
+- gap max abs diff: $6\times 10^{-8}$ から $1.2\times 10^{-7}$ 程度
+- noise mean RMS diff: $10^{-9}$ 程度
+
+です。したがって `gjinc_beam` は design point 再現という意味ではほぼ完全です。
+
+### 22.6 `gauss` をどう扱うか
+
+#### 22.6.1 専用の `gauss_beam` が不要な理由
+
+`gauss` には専用の `gauss_beam` を追加していません。理由は、現在の public API でも
+
+- `gwidth_pix`, `gwidth_beam`
+- `support_radius_pix`, `support_radius_beam`
+- `truncate`
+
+を明示できるからです。つまり、Gaussian については別 kernel 名を増やさなくても、**explicit width / support 指定で実質的に beam-aware な Gaussian を使える**からです。
+
+#### 22.6.2 それでも `cell_arcsec` は残る
+
+ただし、ここで「`gauss` では beam-aware と pixel-based を考えなくてよい」と短絡してはいけません。
+
+- `gwidth_beam` と `support_radius_beam` を与えれば、kernel の物理幅は `cell_arcsec` から切り離せる
+- しかし output grid の Nyquist と sampling は依然として `cell_arcsec` に依存する
+
+したがって `gauss` では
+
+1. kernel 形状を explicit に決める
+2. `cell_arcsec` は output sampling として別に評価する
+
+という 2 段階で考えるのが正しいです。
+
+### 22.7 pixel-based と beam-aware の使い分け
+
+#### 22.7.1 pixel-based が自然な場合
+
+- `cell_arcsec ≈ beam/3` を素直に採る
+- 現行 default と同じ物理意味で map を作りたい
+- CASA / casacore の public semantics に近い説明を保ちたい
+- まず安全に全体像を作りたい
+
+#### 22.7.2 beam-aware が自然な場合
+
+- `cell_arcsec` を beam/3 以外へ動かしたい
+- しかし kernel の物理幅と support は変えたくない
+- map sampling と smoothing scale を分離したい
+- 同一データを複数の `cell_arcsec` で比較したい
+
+#### 22.7.3 実務的な短い結論
+
+- **まず安全に作る**: `sf + convsupport=3`
+- **少し smooth 側へ**: `SF(4)` 相当の `sf_beam` も候補
+- **かなり smooth 側へ**: `SF(5)` / `SF(6)` 相当。ただし broadening を強く許容する
+- **sharpness 重視**: `gjinc + mangum + signed`
+- **sharpness を保ったまま cell を動かしたい**: `gjinc_beam + mangum`
+- **単純な positive smoothing を明示したい**: `gauss` に explicit width / support を与える
+
+### 22.8 コマンド実行例
+
+#### 22.8.1 `sf` の基本
+
+```python
+cfg = MapConfig(
+    x0=..., y0=..., nx=..., ny=...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=B/3,
+    kernel='sf',
+    convsupport=3,
+)
+```
+
+#### 22.8.2 `sf_beam` を `SF(4)` に合わせる
+
+```python
+cfg = MapConfig(
+    x0=..., y0=..., nx=..., ny=...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=0.28 * B,
+    kernel='sf_beam',
+    sf_beam_match_convsupport=4,
+)
+```
+
+#### 22.8.3 `sf_beam` を explicit 指定する
+
+```python
+cfg = MapConfig(
+    x0=..., y0=..., nx=..., ny=...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=0.25 * B,
+    kernel='sf_beam',
+    sf_beam_support_beam=4.0/3.0,
+    sf_beam_shape_c=13.737787961959839,
+)
+```
+
+#### 22.8.4 `gjinc_beam` を Mangum preset で使う
+
+```python
+cfg = MapConfig(
+    x0=..., y0=..., nx=..., ny=...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=0.25 * B,
+    kernel='gjinc_beam',
+    kernel_preset='mangum',
+    kernel_sign='signed',
+)
+```
+
+#### 22.8.5 `gauss` を beam 単位で explicit に使う
+
+```python
+cfg = MapConfig(
+    x0=..., y0=..., nx=..., ny=...,
+    beam_fwhm_arcsec=B,
+    cell_arcsec=0.25 * B,
+    kernel='gauss',
+    gwidth_beam=0.28,
+    support_radius_beam=0.84,
+)
+```
+
+### 22.9 この増補を踏まえた最重要結論
+
+1. `sf` は current package でも **official / pixel-based** として維持するのが正しい。  
+2. `SF(4)` と `SF(5)` は単なる補間ではなく、official table 上も意味のある family である。  
+3. `sf_beam` は current `sf` を無理に beam-aware 化したものではなく、**数学的意味を持つ連続 beam-aware spheroidal kernel** として別名で導入するのが正しい。  
+4. `gjinc_beam` は design point で `gjinc(mangum/casa)` をほぼ完全に再現する。  
+5. `gauss` は専用の `gauss_beam` を持たなくても、explicit width / support 指定で実質的に beam-aware に使える。  
+6. ただし `gauss` でも `cell_arcsec` が output sampling と Nyquist に効くことは変わらない。  
+7. 実務上は、まず `sf + convsupport=3` で全体像を作り、その後 `gjinc + mangum + signed` や `beam-aware kernel` を必要に応じて使い分けるのが最も安全である。  

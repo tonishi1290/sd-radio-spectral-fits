@@ -18,7 +18,7 @@ class MapConfig:
 
     - ``cell_arcsec`` は明示指定を推奨する。
       ``cell_arcsec=None`` のときは ``beam_fwhm_arcsec / 3`` を自動採用する。
-    - ``kernel='gjinc'`` では ``kernel_preset='mangum'`` または
+    - ``kernel='gjinc'`` / ``kernel='gjinc_beam'`` では ``kernel_preset='mangum'`` または
       ``kernel_preset='casa'`` を使う。互換 alias として
       ``mangum2007 -> mangum``、``legacy -> casa`` を受け付ける。
     - ``kernel='sf'`` では support は ``convsupport`` だけで制御する。
@@ -36,13 +36,31 @@ class MapConfig:
     beam_fwhm_arcsec: Optional[float] = None  # 望遠鏡のビームサイズ [arcsec]
 
     # --- 2. グリッディング・カーネル設定 ---
-    kernel: Literal['sf', 'gjinc', 'gauss'] = 'sf'
+    kernel: Literal['sf', 'sf_beam', 'gjinc', 'gjinc_beam', 'gauss'] = 'sf'
     kernel_preset: Optional[str] = None
     kernel_sign: Literal['auto', 'signed', 'positive_only'] = 'auto'
     convsupport: int = 3
 
-    # kernel_sign は GJINC/GAUSS の負重みをどう扱うかを表す。
-    #   auto          : mangum -> signed, casa -> positive_only, sf/gauss -> positive_only
+    # sf_beam は連続 beam-aware spheroidal kernel の最小実装。
+    # 基本は ``sf_beam_match_convsupport`` により design point (cell=beam/3) で
+    # official ``SF(n)`` に合わせた preset を使う。
+    # 個別に指定したいときは ``sf_beam_support_beam`` と
+    # ``sf_beam_shape_c`` を明示する。
+    sf_beam_match_convsupport: Optional[int] = 3
+    sf_beam_support_beam: Optional[float] = None
+    sf_beam_shape_c: Optional[float] = None
+
+    # gjinc_beam は連続 beam-aware GJINC kernel。
+    # 基本は ``kernel_preset='mangum'`` または ``'casa'`` により
+    # design point (cell=beam/3) の public pixel-based gjinc default を
+    # beam 単位へ写した preset を使う。
+    # 必要なら beam 単位の幅・support を個別指定できる。
+    gjinc_beam_gwidth_beam: Optional[float] = None
+    gjinc_beam_jwidth_beam: Optional[float] = None
+    gjinc_beam_support_beam: Optional[float] = None
+
+    # kernel_sign は GJINC/GJINC_BEAM/GAUSS の負重みをどう扱うかを表す。
+    #   auto          : mangum -> signed, casa -> positive_only, sf/sf_beam/gauss -> positive_only
     #   signed        : 有限な符号付き重みをそのまま使う
     #   positive_only : 正の重みだけを使う
     # 明示指定がある場合は *_pix > *_beam > preset default の順で解決する
@@ -54,6 +72,7 @@ class MapConfig:
     # support は kernel をどの半径で打ち切るかを表す cutoff radius。
     # sf では support = convsupport * cell。
     # gjinc/gauss では pix / beam / truncate の順で解決する。
+    # gjinc_beam では dedicated な *_beam パラメータか preset を使う。
     # truncate=None のときは preset default を用いる。
     #   sf               : support = convsupport * cell
     #   mangum + gjinc   : support = 3 * cell

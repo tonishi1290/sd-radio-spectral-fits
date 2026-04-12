@@ -5,7 +5,7 @@ import builtins
 import warnings
 import numpy as np
 from scipy.spatial import cKDTree
-from scipy.special import j1
+from scipy.special import j1, pro_ang1
 from scipy.signal import fftconvolve
 
 from .config import MapConfig, GridInput, GridResult, normalize_row_flag_mask
@@ -37,6 +37,17 @@ DEFAULT_GJINC_JWIDTH_PIX = 1.55
 DEFAULT_GJINC_GWIDTH_PIX = 2.52 * SQRT_LN2
 DEFAULT_GAUSS_GWIDTH_PIX = SQRT_LN2
 DEFAULT_SF_CONVSUPPORT = 3
+DEFAULT_SF_BEAM_MATCH_CONVSUPPORT = 3
+SF_BEAM_MATCH_SHAPE_C = {
+    3: 10.685961961746216,
+    4: 13.737787961959839,
+    5: 13.719022989273071,
+    6: 13.70369029045105,
+}
+DEFAULT_GJINC_BEAM_JWIDTH_BEAM = DEFAULT_GJINC_JWIDTH_PIX / 3.0
+DEFAULT_GJINC_BEAM_GWIDTH_BEAM = DEFAULT_GJINC_GWIDTH_PIX / 3.0
+DEFAULT_GJINC_BEAM_SUPPORT_BEAM_MANGUM = 1.0
+DEFAULT_GJINC_BEAM_SUPPORT_BEAM_CASA = FIRST_JINC_NULL_OVER_PI * DEFAULT_GJINC_BEAM_JWIDTH_BEAM
 RECOMMENDED_MAX_CELL_OVER_BEAM = 1.0 / 3.0
 CELL_OVER_BEAM_TOL = 1.0e-12
 
@@ -153,8 +164,12 @@ def _normalize_backend_and_kernel(config: MapConfig) -> tuple[str, str]:
             raise ValueError("backend='numpy_gjinc' requires kernel='gjinc'")
     elif backend == "numpy_sf":
         backend = "numpy"
-        if kernel != "sf":
-            raise ValueError("backend='numpy_sf' requires kernel='sf'")
+        if kernel not in ("sf", "sf_beam"):
+            raise ValueError("backend='numpy_sf' requires kernel='sf' or 'sf_beam'")
+    elif backend == "numpy_gjinc_beam":
+        backend = "numpy"
+        if kernel != "gjinc_beam":
+            raise ValueError("backend='numpy_gjinc_beam' requires kernel='gjinc_beam'")
     elif backend == "numpy_gauss":
         backend = "numpy"
         if kernel != "gauss":
@@ -164,8 +179,8 @@ def _normalize_backend_and_kernel(config: MapConfig) -> tuple[str, str]:
         if kernel != "gauss":
             raise ValueError("backend='cygrid_gauss' requires kernel='gauss'")
 
-    if kernel not in ("sf", "gjinc", "gauss"):
-        raise ValueError(f"Unknown kernel: {config.kernel!r}. Use 'sf', 'gjinc', or 'gauss'.")
+    if kernel not in ("sf", "sf_beam", "gjinc", "gjinc_beam", "gauss"):
+        raise ValueError(f"Unknown kernel: {config.kernel!r}. Use 'sf', 'sf_beam', 'gjinc', 'gjinc_beam', or 'gauss'.")
 
     return backend, kernel
 
@@ -251,7 +266,7 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, object]:
 
     def _normalize_kernel_preset(value, *, kernel_name: str) -> str | None:
         raw = None if value is None else str(value).strip().lower()
-        if kernel_name == 'gjinc':
+        if kernel_name in ('gjinc', 'gjinc_beam'):
             if raw in (None, '', 'none'):
                 return 'mangum'
             if raw in ('mangum', 'mangum2007'):
@@ -259,7 +274,7 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, object]:
             if raw in ('casa', 'legacy'):
                 return 'casa'
             raise ValueError(
-                "kernel_preset for kernel='gjinc' must be one of: None, 'mangum', 'mangum2007', 'casa', 'legacy'"
+                "kernel_preset for kernel='gjinc'/'gjinc_beam' must be one of: None, 'mangum', 'mangum2007', 'casa', 'legacy'"
             )
         if raw not in (None, '', 'none', 'default'):
             warnings.warn(
@@ -275,25 +290,25 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, object]:
     if kernel_sign not in ('auto', 'signed', 'positive_only'):
         raise ValueError("kernel_sign must be 'auto', 'signed', or 'positive_only'")
     if kernel_sign == 'auto':
-        if kernel_name == 'gjinc' and kernel_preset == 'mangum':
+        if kernel_name in ('gjinc', 'gjinc_beam') and kernel_preset == 'mangum':
             kernel_sign = 'signed'
         else:
             kernel_sign = 'positive_only'
-    if kernel_name in ('sf', 'gauss') and kernel_sign != 'positive_only':
+    if kernel_name in ('sf', 'sf_beam', 'gauss') and kernel_sign != 'positive_only':
         warnings.warn(
             f"kernel={kernel_name!r} only supports positive weights; overriding kernel_sign={kernel_sign!r} -> 'positive_only'.",
             RuntimeWarning,
             stacklevel=2,
         )
         kernel_sign = 'positive_only'
-    if kernel_name == 'gjinc' and kernel_preset == 'mangum' and kernel_sign != 'signed':
+    if kernel_name in ('gjinc', 'gjinc_beam') and kernel_preset == 'mangum' and kernel_sign != 'signed':
         warnings.warn(
             "kernel_preset='mangum' is literature-oriented and is normally used with kernel_sign='signed'. "
             "You explicitly requested a non-standard combination.",
             RuntimeWarning,
             stacklevel=2,
         )
-    if kernel_name == 'gjinc' and kernel_preset == 'casa' and kernel_sign != 'positive_only':
+    if kernel_name in ('gjinc', 'gjinc_beam') and kernel_preset == 'casa' and kernel_sign != 'positive_only':
         warnings.warn(
             "kernel_preset='casa' is normally used with kernel_sign='positive_only'. "
             "You explicitly requested a non-standard combination.",
@@ -302,6 +317,12 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, object]:
         )
 
     convsupport = None
+    sf_beam_match_convsupport = None
+    sf_beam_support_beam = np.nan
+    sf_beam_shape_c = np.nan
+    gjinc_beam_support_beam = np.nan
+    gjinc_beam_gwidth_beam = np.nan
+    gjinc_beam_jwidth_beam = np.nan
     if kernel_name == 'sf':
         convsupport = _parse_exact_positive_int(getattr(config, 'convsupport', DEFAULT_SF_CONVSUPPORT), name='convsupport')
         if convsupport < 3:
@@ -353,6 +374,108 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, object]:
         jwidth_source = 'not_used'
         support_radius_pix = float(convsupport)
         support_source = 'convsupport'
+    elif kernel_name == 'sf_beam':
+        if any(getattr(config, name) is not None for name in ('support_radius_pix', 'support_radius_beam', 'truncate')):
+            raise ValueError(
+                "kernel='sf_beam' uses sf_beam_support_beam / sf_beam_shape_c (or sf_beam_match_convsupport). "
+                "Do not set support_radius_pix, support_radius_beam, or truncate."
+            )
+        if any(getattr(config, name) is not None for name in ('gwidth_pix', 'gwidth_beam', 'jwidth_pix', 'jwidth_beam')):
+            warnings.warn(
+                "kernel='sf_beam' ignores gwidth_*/jwidth_* parameters; they will be ignored.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if getattr(config, 'convsupport', DEFAULT_SF_CONVSUPPORT) != DEFAULT_SF_CONVSUPPORT:
+            warnings.warn(
+                "kernel='sf_beam' ignores convsupport directly. Use sf_beam_match_convsupport or explicit sf_beam_* parameters.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        raw_match = getattr(config, 'sf_beam_match_convsupport', DEFAULT_SF_BEAM_MATCH_CONVSUPPORT)
+        if raw_match is not None:
+            sf_beam_match_convsupport = _parse_exact_positive_int(raw_match, name='sf_beam_match_convsupport')
+            if sf_beam_match_convsupport not in SF_BEAM_MATCH_SHAPE_C:
+                raise ValueError("sf_beam_match_convsupport must be one of 3, 4, 5, 6")
+        raw_support_beam = getattr(config, 'sf_beam_support_beam', None)
+        if raw_support_beam is None:
+            if sf_beam_match_convsupport is None:
+                raise ValueError("kernel='sf_beam' requires sf_beam_support_beam or sf_beam_match_convsupport")
+            sf_beam_support_beam = float(sf_beam_match_convsupport) / 3.0
+            support_source = 'sf_beam_match_convsupport'
+        else:
+            sf_beam_support_beam = float(raw_support_beam)
+            support_source = 'sf_beam_support_beam'
+        if (not np.isfinite(sf_beam_support_beam)) or sf_beam_support_beam <= 0:
+            raise ValueError('sf_beam_support_beam must be positive')
+        raw_shape_c = getattr(config, 'sf_beam_shape_c', None)
+        if raw_shape_c is None:
+            if sf_beam_match_convsupport is None:
+                raise ValueError("kernel='sf_beam' requires sf_beam_shape_c or sf_beam_match_convsupport")
+            sf_beam_shape_c = float(SF_BEAM_MATCH_SHAPE_C[int(sf_beam_match_convsupport)])
+        else:
+            sf_beam_shape_c = float(raw_shape_c)
+        if (not np.isfinite(sf_beam_shape_c)) or sf_beam_shape_c <= 0:
+            raise ValueError('sf_beam_shape_c must be positive')
+        gwidth_pix = np.nan
+        gwidth_source = 'not_used'
+        jwidth_pix = np.nan
+        jwidth_source = 'not_used'
+        support_radius_pix = float(sf_beam_support_beam * beam_pix)
+    elif kernel_name == 'gjinc_beam':
+        if any(getattr(config, name) is not None for name in ('support_radius_pix', 'support_radius_beam', 'truncate')):
+            raise ValueError(
+                "kernel='gjinc_beam' uses gjinc_beam_* parameters and kernel_preset only. "
+                "Do not set support_radius_pix, support_radius_beam, or truncate."
+            )
+        if any(getattr(config, name) is not None for name in ('gwidth_pix', 'gwidth_beam', 'jwidth_pix', 'jwidth_beam')):
+            warnings.warn(
+                "kernel='gjinc_beam' ignores generic gwidth_*/jwidth_* parameters; use gjinc_beam_* parameters instead.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        if getattr(config, 'convsupport', DEFAULT_SF_CONVSUPPORT) != DEFAULT_SF_CONVSUPPORT:
+            warnings.warn(
+                "kernel='gjinc_beam' ignores convsupport directly. Use kernel_preset and/or gjinc_beam_* parameters.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        raw_jwidth_beam = getattr(config, 'gjinc_beam_jwidth_beam', None)
+        if raw_jwidth_beam is None:
+            gjinc_beam_jwidth_beam = float(DEFAULT_GJINC_BEAM_JWIDTH_BEAM)
+            jwidth_source = 'gjinc_beam_preset_default'
+        else:
+            gjinc_beam_jwidth_beam = float(raw_jwidth_beam)
+            jwidth_source = 'gjinc_beam_jwidth_beam'
+        if (not np.isfinite(gjinc_beam_jwidth_beam)) or gjinc_beam_jwidth_beam <= 0:
+            raise ValueError('gjinc_beam_jwidth_beam must be positive')
+        raw_gwidth_beam = getattr(config, 'gjinc_beam_gwidth_beam', None)
+        if raw_gwidth_beam is None:
+            gjinc_beam_gwidth_beam = float(DEFAULT_GJINC_BEAM_GWIDTH_BEAM)
+            gwidth_source = 'gjinc_beam_preset_default'
+        else:
+            gjinc_beam_gwidth_beam = float(raw_gwidth_beam)
+            gwidth_source = 'gjinc_beam_gwidth_beam'
+        if (not np.isfinite(gjinc_beam_gwidth_beam)) or gjinc_beam_gwidth_beam <= 0:
+            raise ValueError('gjinc_beam_gwidth_beam must be positive')
+        raw_support_beam = getattr(config, 'gjinc_beam_support_beam', None)
+        if raw_support_beam is None:
+            if kernel_preset == 'mangum':
+                gjinc_beam_support_beam = float(DEFAULT_GJINC_BEAM_SUPPORT_BEAM_MANGUM)
+                support_source = 'gjinc_beam_preset_mangum'
+            elif kernel_preset == 'casa':
+                gjinc_beam_support_beam = float(FIRST_JINC_NULL_OVER_PI * gjinc_beam_jwidth_beam)
+                support_source = 'gjinc_beam_preset_casa_first_null'
+            else:
+                raise ValueError(f"Unsupported kernel_preset={kernel_preset!r} for kernel='gjinc_beam'")
+        else:
+            gjinc_beam_support_beam = float(raw_support_beam)
+            support_source = 'gjinc_beam_support_beam'
+        if (not np.isfinite(gjinc_beam_support_beam)) or gjinc_beam_support_beam <= 0:
+            raise ValueError('gjinc_beam_support_beam must be positive')
+        jwidth_pix = float(gjinc_beam_jwidth_beam * beam_pix)
+        gwidth_pix = float(gjinc_beam_gwidth_beam * beam_pix)
+        support_radius_pix = float(gjinc_beam_support_beam * beam_pix)
     else:
         if kernel_name == 'gjinc':
             default_gwidth_pix = DEFAULT_GJINC_GWIDTH_PIX
@@ -422,6 +545,12 @@ def _validate_and_resolve_config(config: MapConfig) -> dict[str, object]:
         'gwidth_pix': float(gwidth_pix),
         'jwidth_pix': float(jwidth_pix),
         'support_radius_pix': float(support_radius_pix),
+        'sf_beam_match_convsupport': sf_beam_match_convsupport,
+        'sf_beam_support_beam': float(sf_beam_support_beam),
+        'sf_beam_shape_c': float(sf_beam_shape_c),
+        'gjinc_beam_support_beam': float(gjinc_beam_support_beam),
+        'gjinc_beam_gwidth_beam': float(gjinc_beam_gwidth_beam),
+        'gjinc_beam_jwidth_beam': float(gjinc_beam_jwidth_beam),
         'beam_pix': float(beam_pix),
         'cell_over_beam': float(cell_over_beam),
         'cell_is_coarse': bool(cell_is_coarse),
@@ -552,6 +681,12 @@ def _estimate_nominal_effective_beam(
     gwidth_arcsec: float,
     jwidth_arcsec: float,
     r_trunc_arcsec: float,
+    sf_beam_support_beam: float,
+    sf_beam_shape_c: float,
+    sf_convsupport_exact: float | None,
+    gjinc_beam_support_beam: float,
+    gjinc_beam_gwidth_beam: float,
+    gjinc_beam_jwidth_beam: float,
     eps_u0: float,
     cell_arcsec: float,
     eps_weight_sum: float,
@@ -578,8 +713,14 @@ def _estimate_nominal_effective_beam(
         kernel_name=kernel_name,
         gwidth_arcsec=gwidth_arcsec,
         jwidth_arcsec=jwidth_arcsec,
-        support_radius_pix=float(support / cell_arcsec),
+        support_radius_pix=(float(sf_convsupport_exact) if kernel_name == 'sf' and sf_convsupport_exact is not None and np.isfinite(float(sf_convsupport_exact)) else float(support / cell_arcsec)),
         cell_arcsec=float(cell_arcsec),
+        beam_fwhm_arcsec=float(beam),
+        sf_beam_support_beam=float(sf_beam_support_beam),
+        sf_beam_shape_c=float(sf_beam_shape_c),
+        gjinc_beam_support_beam=float(gjinc_beam_support_beam),
+        gjinc_beam_gwidth_beam=float(gjinc_beam_gwidth_beam),
+        gjinc_beam_jwidth_beam=float(gjinc_beam_jwidth_beam),
         eps_u0=eps_u0,
     )
     kern = np.where(rr <= support, kern, 0.0)
@@ -613,12 +754,20 @@ def _estimate_nominal_effective_beam(
     }
     if fit is not None:
         out.update({
-            'bmaj_nominal_arcsec': float(fit['bmaj_arcsec']),
-            'bmin_nominal_arcsec': float(fit['bmin_arcsec']),
-            'bpa_nominal_deg': float(fit['bpa_deg']),
+            'bmaj_nominal_gaussian_fit_arcsec': float(fit['bmaj_arcsec']),
+            'bmin_nominal_gaussian_fit_arcsec': float(fit['bmin_arcsec']),
+            'bpa_nominal_gaussian_fit_deg': float(fit['bpa_deg']),
             'beam_nominal_fit_threshold_frac': float(fit['fit_threshold_frac']),
         })
-    if radial is not None and ('bmaj_nominal_arcsec' not in out or not np.isfinite(out['bmaj_nominal_arcsec'])):
+    if radial is not None and kernel_name in ('sf', 'sf_beam'):
+        out['bmaj_nominal_arcsec'] = float(radial)
+        out['bmin_nominal_arcsec'] = float(radial)
+        out['bpa_nominal_deg'] = 0.0
+    elif fit is not None:
+        out['bmaj_nominal_arcsec'] = float(fit['bmaj_arcsec'])
+        out['bmin_nominal_arcsec'] = float(fit['bmin_arcsec'])
+        out['bpa_nominal_deg'] = float(fit['bpa_deg'])
+    elif radial is not None:
         out['bmaj_nominal_arcsec'] = float(radial)
         out['bmin_nominal_arcsec'] = float(radial)
         out['bpa_nominal_deg'] = 0.0
@@ -637,6 +786,12 @@ def _estimate_empirical_center_beam(
     gwidth_arcsec: float,
     jwidth_arcsec: float,
     r_trunc_arcsec: float,
+    sf_beam_support_beam: float,
+    sf_beam_shape_c: float,
+    sf_convsupport_exact: float | None,
+    gjinc_beam_support_beam: float,
+    gjinc_beam_gwidth_beam: float,
+    gjinc_beam_jwidth_beam: float,
     xg_1d: np.ndarray,
     yg_1d: np.ndarray,
 ) -> dict[str, float] | None:
@@ -680,8 +835,14 @@ def _estimate_empirical_center_beam(
             kernel_name=kernel_name,
             gwidth_arcsec=float(gwidth_arcsec),
             jwidth_arcsec=float(jwidth_arcsec),
-            support_radius_pix=float(r_trunc_arcsec / config.cell_arcsec),
+            support_radius_pix=(float(sf_convsupport_exact) if kernel_name == 'sf' and sf_convsupport_exact is not None and np.isfinite(float(sf_convsupport_exact)) else float(r_trunc_arcsec / config.cell_arcsec)),
             cell_arcsec=float(config.cell_arcsec),
+            beam_fwhm_arcsec=float(config.beam_fwhm_arcsec),
+            sf_beam_support_beam=float(sf_beam_support_beam),
+            sf_beam_shape_c=float(sf_beam_shape_c),
+            gjinc_beam_support_beam=float(gjinc_beam_support_beam),
+            gjinc_beam_gwidth_beam=float(gjinc_beam_gwidth_beam),
+            gjinc_beam_jwidth_beam=float(gjinc_beam_jwidth_beam),
             eps_u0=float(config.eps_u0),
         ).astype(float, copy=False)
         w = k * q[nbrs]
@@ -725,13 +886,21 @@ def _estimate_empirical_center_beam(
     }
     if fit is not None:
         out.update({
-            'bmaj_empirical_arcsec': float(fit['bmaj_arcsec']),
-            'bmin_empirical_arcsec': float(fit['bmin_arcsec']),
-            'bpa_empirical_deg': float(fit['bpa_deg']),
+            'bmaj_empirical_gaussian_fit_arcsec': float(fit['bmaj_arcsec']),
+            'bmin_empirical_gaussian_fit_arcsec': float(fit['bmin_arcsec']),
+            'bpa_empirical_gaussian_fit_deg': float(fit['bpa_deg']),
             'beam_empirical_peak_x_arcsec': float(fit['x_center_arcsec']),
             'beam_empirical_peak_y_arcsec': float(fit['y_center_arcsec']),
         })
-    if radial is not None and ('bmaj_empirical_arcsec' not in out or not np.isfinite(out['bmaj_empirical_arcsec'])):
+    if radial is not None and kernel_name in ('sf', 'sf_beam'):
+        out['bmaj_empirical_arcsec'] = float(radial)
+        out['bmin_empirical_arcsec'] = float(radial)
+        out['bpa_empirical_deg'] = 0.0
+    elif fit is not None:
+        out['bmaj_empirical_arcsec'] = float(fit['bmaj_arcsec'])
+        out['bmin_empirical_arcsec'] = float(fit['bmin_arcsec'])
+        out['bpa_empirical_deg'] = float(fit['bpa_deg'])
+    elif radial is not None:
         out['bmaj_empirical_arcsec'] = float(radial)
         out['bmin_empirical_arcsec'] = float(radial)
         out['bpa_empirical_deg'] = 0.0
@@ -980,15 +1149,90 @@ def _evaluate_kernel(
     jwidth_arcsec: float,
     support_radius_pix: float,
     cell_arcsec: float,
+    beam_fwhm_arcsec: float,
+    sf_beam_support_beam: float,
+    sf_beam_shape_c: float,
+    gjinc_beam_support_beam: float,
+    gjinc_beam_gwidth_beam: float,
+    gjinc_beam_jwidth_beam: float,
     eps_u0: float,
 ) -> np.ndarray:
     if kernel_name == 'gjinc':
         return _kernel_gjinc(r_arcsec, gwidth_arcsec, jwidth_arcsec, eps_u0)
+    if kernel_name == 'gjinc_beam':
+        return _kernel_gjinc_beam(
+            r_arcsec,
+            beam_fwhm_arcsec=beam_fwhm_arcsec,
+            gwidth_beam=gjinc_beam_gwidth_beam,
+            jwidth_beam=gjinc_beam_jwidth_beam,
+            eps_u0=eps_u0,
+        )
     if kernel_name == 'gauss':
         return _kernel_gauss(r_arcsec, gwidth_arcsec)
     if kernel_name == 'sf':
         return _kernel_sf(r_arcsec, cell_arcsec=cell_arcsec, support_radius_pix=support_radius_pix)
+    if kernel_name == 'sf_beam':
+        return _kernel_sf_beam(
+            r_arcsec,
+            beam_fwhm_arcsec=beam_fwhm_arcsec,
+            support_beam=sf_beam_support_beam,
+            shape_c=sf_beam_shape_c,
+        )
     raise ValueError(f"Unknown kernel_name={kernel_name!r}")
+
+
+def _kernel_sf_beam(
+    r_arcsec: np.ndarray,
+    *,
+    beam_fwhm_arcsec: float,
+    support_beam: float,
+    shape_c: float,
+) -> np.ndarray:
+    """Continuous beam-aware spheroidal proof-of-concept kernel."""
+    if not np.isfinite(beam_fwhm_arcsec) or beam_fwhm_arcsec <= 0:
+        raise ValueError("beam_fwhm_arcsec must be positive for kernel='sf_beam'")
+    if not np.isfinite(support_beam) or support_beam <= 0:
+        raise ValueError("support_beam must be positive for kernel='sf_beam'")
+    if not np.isfinite(shape_c) or shape_c <= 0:
+        raise ValueError("shape_c must be positive for kernel='sf_beam'")
+    support_arcsec = float(support_beam) * float(beam_fwhm_arcsec)
+    r = np.abs(np.asarray(r_arcsec, dtype=float))
+    out = np.zeros_like(r, dtype=float)
+    inside = r < support_arcsec
+    if not np.any(inside):
+        return out
+    x = np.clip(r[inside] / support_arcsec, 0.0, 1.0 - 1.0e-12)
+    v0 = float(pro_ang1(0, 0, float(shape_c), 0.0)[0])
+    if (not np.isfinite(v0)) or abs(v0) <= 0:
+        raise ValueError("pro_ang1 returned an invalid normalization for kernel='sf_beam'")
+    vx = np.asarray(pro_ang1(0, 0, float(shape_c), x)[0], dtype=float)
+    vals = vx / v0
+    vals = np.where(np.isfinite(vals) & (vals > 0.0), vals, 0.0)
+    out[inside] = vals
+    return out
+
+
+def _kernel_gjinc_beam(
+    r_arcsec: np.ndarray,
+    *,
+    beam_fwhm_arcsec: float,
+    gwidth_beam: float,
+    jwidth_beam: float,
+    eps_u0: float,
+) -> np.ndarray:
+    """Beam-aware GJINC kernel with widths expressed in beam-FWHM units."""
+    if not np.isfinite(beam_fwhm_arcsec) or beam_fwhm_arcsec <= 0:
+        raise ValueError("beam_fwhm_arcsec must be positive for kernel='gjinc_beam'")
+    if not np.isfinite(gwidth_beam) or gwidth_beam <= 0:
+        raise ValueError("gwidth_beam must be positive for kernel='gjinc_beam'")
+    if not np.isfinite(jwidth_beam) or jwidth_beam <= 0:
+        raise ValueError("jwidth_beam must be positive for kernel='gjinc_beam'")
+    return _kernel_gjinc(
+        np.asarray(r_arcsec, dtype=float),
+        float(gwidth_beam) * float(beam_fwhm_arcsec),
+        float(jwidth_beam) * float(beam_fwhm_arcsec),
+        eps_u0=float(eps_u0),
+    )
 
 
 def _kernel_gjinc(r_arcsec: np.ndarray, gwidth_arcsec: float, jwidth_arcsec: float, eps_u0: float) -> np.ndarray:
@@ -1115,8 +1359,13 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
     kernel_name = str(kernel_resolved["kernel_name"])
     kernel_sign = str(kernel_resolved.get("kernel_sign", "signed"))
     backend_impl = str(kernel_resolved["backend_impl"])
+    sf_beam_support_beam = dtype_np(float(kernel_resolved.get("sf_beam_support_beam", np.nan)))
+    sf_beam_shape_c = dtype_np(float(kernel_resolved.get("sf_beam_shape_c", np.nan)))
+    gjinc_beam_support_beam = dtype_np(float(kernel_resolved.get("gjinc_beam_support_beam", np.nan)))
+    gjinc_beam_gwidth_beam = dtype_np(float(kernel_resolved.get("gjinc_beam_gwidth_beam", np.nan)))
+    gjinc_beam_jwidth_beam = dtype_np(float(kernel_resolved.get("gjinc_beam_jwidth_beam", np.nan)))
     gwidth_arcsec = dtype_np(float(kernel_resolved["gwidth_pix"]) * config.cell_arcsec) if np.isfinite(float(kernel_resolved["gwidth_pix"])) else dtype_np(np.nan)
-    jwidth_arcsec = dtype_np(float(kernel_resolved["jwidth_pix"]) * config.cell_arcsec) if kernel_name == "gjinc" else dtype_np(np.nan)
+    jwidth_arcsec = dtype_np(float(kernel_resolved["jwidth_pix"]) * config.cell_arcsec) if kernel_name in ("gjinc", "gjinc_beam") else dtype_np(np.nan)
     r_trunc_arcsec = dtype_np(float(kernel_resolved["support_radius_pix"]) * config.cell_arcsec)
 
     # 出力グリッド座標 [arcsec] の生成
@@ -1188,8 +1437,14 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
             kernel_name=kernel_name,
             gwidth_arcsec=float(gwidth_arcsec),
             jwidth_arcsec=float(jwidth_arcsec),
-            support_radius_pix=float(r_trunc_arcsec / config.cell_arcsec),
+            support_radius_pix=(float(kernel_resolved['convsupport']) if kernel_name == 'sf' and kernel_resolved.get('convsupport') is not None else float(r_trunc_arcsec / config.cell_arcsec)),
             cell_arcsec=float(config.cell_arcsec),
+            beam_fwhm_arcsec=float(config.beam_fwhm_arcsec),
+            sf_beam_support_beam=float(sf_beam_support_beam),
+            sf_beam_shape_c=float(sf_beam_shape_c),
+            gjinc_beam_support_beam=float(gjinc_beam_support_beam),
+            gjinc_beam_gwidth_beam=float(gjinc_beam_gwidth_beam),
+            gjinc_beam_jwidth_beam=float(gjinc_beam_jwidth_beam),
             eps_u0=float(config.eps_u0),
         ).astype(dtype_np, copy=False)
 
@@ -1341,6 +1596,12 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
             gwidth_arcsec=float(gwidth_arcsec),
             jwidth_arcsec=float(jwidth_arcsec),
             r_trunc_arcsec=float(r_trunc_arcsec),
+            sf_beam_support_beam=float(sf_beam_support_beam),
+            sf_beam_shape_c=float(sf_beam_shape_c),
+            sf_convsupport_exact=(float(kernel_resolved['convsupport']) if kernel_resolved.get('convsupport') is not None else None),
+            gjinc_beam_support_beam=float(gjinc_beam_support_beam),
+            gjinc_beam_gwidth_beam=float(gjinc_beam_gwidth_beam),
+            gjinc_beam_jwidth_beam=float(gjinc_beam_jwidth_beam),
             eps_u0=float(config.eps_u0),
             cell_arcsec=float(config.cell_arcsec),
             eps_weight_sum=float(config.eps_weight_sum),
@@ -1359,6 +1620,12 @@ def _backend_numpy_avg(input_data: GridInput, config: MapConfig, kernel_resolved
             gwidth_arcsec=float(gwidth_arcsec),
             jwidth_arcsec=float(jwidth_arcsec),
             r_trunc_arcsec=float(r_trunc_arcsec),
+            sf_beam_support_beam=float(sf_beam_support_beam),
+            sf_beam_shape_c=float(sf_beam_shape_c),
+            sf_convsupport_exact=(float(kernel_resolved['convsupport']) if kernel_resolved.get('convsupport') is not None else None),
+            gjinc_beam_support_beam=float(gjinc_beam_support_beam),
+            gjinc_beam_gwidth_beam=float(gjinc_beam_gwidth_beam),
+            gjinc_beam_jwidth_beam=float(gjinc_beam_jwidth_beam),
             xg_1d=xg_1d,
             yg_1d=yg_1d,
         )
