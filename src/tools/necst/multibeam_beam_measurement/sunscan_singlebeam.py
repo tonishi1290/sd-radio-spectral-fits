@@ -1,15 +1,42 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 import math
 import sys
 
-from .config_io import load_spectrometer_config, resolve_stream_usage_policy, restfreq_hz_for_stream, stream_extras_by_name
-from .public_api import run_singlebeam, run_singlebeam_many
+from .config_io import discover_default_spectral_recording_snapshot, load_spectrometer_config, load_spectrometer_config_with_loader, resolve_stream_usage_policy, restfreq_hz_for_stream, stream_extras_by_name
 from .sunscan_config import SunScanAnalysisConfig
-from .sunscan_report import build_summary_lines
+
+
+def _load_singlebeam_runtime():
+    """Load runtime-heavy singlebeam analysis modules only after inspection mode."""
+
+    from .public_api import run_singlebeam, run_singlebeam_many  # type: ignore
+    from .sunscan_report import build_summary_lines  # type: ignore
+    return run_singlebeam, run_singlebeam_many, build_summary_lines
+
+
+def _args_have_spectrometer_context(args) -> bool:
+    return bool(getattr(args, "spectrometer_config", None) or getattr(args, "spectral_recording_snapshot", None))
+
+
+def inspect_rawdata_sidecars(rawdata_paths: Sequence[Path]) -> List[Dict[str, Any]]:
+    """Return dry-run sidecar discovery reports for one or more RawData directories."""
+
+    try:
+        from ..spectral_recording_snapshot import inspect_db_sidecars  # type: ignore
+    except Exception:
+        try:
+            from tools.necst.spectral_recording_snapshot import inspect_db_sidecars  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("Unable to import spectral-recording sidecar inspection helpers") from exc
+    return [
+        inspect_db_sidecars(Path(path).expanduser().resolve(), recursive=True)
+        for path in rawdata_paths
+    ]
 
 
 def _argv_has_option(argv: Optional[Sequence[str]], *opts: str) -> bool:
@@ -23,7 +50,7 @@ def _argv_has_option(argv: Optional[Sequence[str]], *opts: str) -> bool:
 
 def _choose_float_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: float = 0.0, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> float:
     key = stream_key or global_key
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, cli_opt):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -36,7 +63,7 @@ def _choose_float_setting(args: argparse.Namespace, argv: Optional[Sequence[str]
 
 def _choose_str_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: str, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> str:
     key = stream_key or global_key
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, cli_opt):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -49,7 +76,7 @@ def _choose_str_setting(args: argparse.Namespace, argv: Optional[Sequence[str]],
 
 def _choose_optional_str_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: Optional[str] = None, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> Optional[str]:
     key = stream_key or global_key
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, cli_opt):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -100,7 +127,7 @@ def _stream_override_dict(stream: Any) -> Dict[str, Any]:
 def _choose_bool_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: Any, attr: str, global_cfg: Dict[str, Any], global_key: str, default: bool = False, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> bool:
     key = stream_key or global_key
     cli_opts = tuple(cli_opt) if isinstance(cli_opt, (list, tuple)) else (str(cli_opt),)
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, *cli_opts):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, *cli_opts):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -113,7 +140,7 @@ def _choose_bool_setting(args: argparse.Namespace, argv: Optional[Sequence[str]]
 
 def _choose_int_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: int = 0, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> int:
     key = stream_key or global_key
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, cli_opt):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -126,7 +153,7 @@ def _choose_int_setting(args: argparse.Namespace, argv: Optional[Sequence[str]],
 
 def _choose_optional_float_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: Optional[float] = None, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> Optional[float]:
     key = stream_key or global_key
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, cli_opt):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -141,7 +168,7 @@ def _choose_optional_float_setting(args: argparse.Namespace, argv: Optional[Sequ
 
 def _choose_optional_int_setting(args: argparse.Namespace, argv: Optional[Sequence[str]], cli_opt: str, attr: str, global_cfg: Dict[str, Any], global_key: str, default: Optional[int] = None, *, stream_cfg: Optional[Dict[str, Any]] = None, stream_key: Optional[str] = None) -> Optional[int]:
     key = stream_key or global_key
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, cli_opt):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, cli_opt):
         value = getattr(args, attr, default)
     elif stream_cfg is not None and stream_cfg.get(key) is not None:
         value = stream_cfg.get(key)
@@ -226,8 +253,15 @@ def _select_stream_from_config(config_dict: Dict[str, Any], *, stream_name: Opti
 
 def add_singlebeam_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("rawdata", nargs="+", help="One or more RawData directories containing the NECST database")
+    ap.add_argument("--inspect-sidecars", action="store_true", help="Inspect DB-embedded spectral-recording sidecars for the supplied RawData directories and exit.")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--spectrometer-config", default=None, help="converter-compatible spectrometer config TOML")
+    ap.add_argument("--spectral-recording-snapshot", "--snapshot", default=None, help="Observation-time spectral_recording_snapshot.toml. Mutually exclusive with --spectrometer-config.")
+    ap.add_argument("--beam-model", default=None, help="Optional analysis-time beam_model.toml override for --spectral-recording-snapshot. Requires --allow-beam-model-override.")
+    ap.add_argument("--allow-beam-model-override", action="store_true", help="Permit --beam-model to override beam geometry embedded in the snapshot, and record this as analysis-time provenance.")
+    ap.add_argument("--config-loader", default="legacy", choices=["legacy", "adapter"], help="Loader used for --spectrometer-config. legacy preserves historical loading; adapter routes the same legacy TOML through the config-separation internal model.")
+    ap.add_argument("--sunscan-analysis-config", "--sunscan-analysis", default=None, help="Standalone sunscan_analysis TOML. It overrides sunscan-only analysis settings and per-stream overrides without redefining stream truth.")
+    ap.add_argument("--analysis-stream-selection", default=None, action="append", help="Standalone analysis_stream_selection TOML. May be repeated. Explicit --stream-name still has priority for this run.")
     ap.add_argument("--run-id", default=None, help="Merged output tag for multi-run mode; also used as output tag in single-run mode when explicitly set")
     ap.add_argument("--stream-name", default=None, help="Select one stream from --spectrometer-config")
     ap.add_argument("--db-namespace", default="necst", help="Database namespace/prefix used in NECST DB table names")
@@ -339,13 +373,33 @@ def add_singlebeam_arguments(ap: argparse.ArgumentParser) -> None:
 
 def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = None) -> SunScanAnalysisConfig:
     resolved_spectral_name = getattr(args, "spectral_name", None)
+    rawdata_values = list(args.rawdata) if isinstance(args.rawdata, (list, tuple)) else [args.rawdata]
+    first_rawdata = Path(rawdata_values[0]).expanduser().resolve()
 
     global_cfg: Dict[str, Any] = {}
     selected_stream = None
     stream_cfg: Dict[str, Any] = {}
-    if args.spectrometer_config:
-        config_path = Path(args.spectrometer_config).expanduser().resolve()
-        config_dict = load_spectrometer_config(config_path)
+    if args.spectrometer_config and getattr(args, "spectral_recording_snapshot", None):
+        raise ValueError("--spectrometer-config and --spectral-recording-snapshot are mutually exclusive")
+    if (
+        (not args.spectrometer_config)
+        and (not getattr(args, "spectral_recording_snapshot", None))
+        and len(rawdata_values) == 1
+    ):
+        auto_snapshot = discover_default_spectral_recording_snapshot(first_rawdata)
+        if auto_snapshot is not None:
+            args.spectral_recording_snapshot = str(auto_snapshot)
+    if args.spectrometer_config or getattr(args, "spectral_recording_snapshot", None):
+        config_path = Path(args.spectrometer_config).expanduser().resolve() if args.spectrometer_config else None
+        config_dict = load_spectrometer_config_with_loader(
+            config_path,
+            config_loader=getattr(args, "config_loader", "legacy"),
+            sunscan_analysis_config=Path(args.sunscan_analysis_config).expanduser().resolve() if getattr(args, "sunscan_analysis_config", None) else None,
+            analysis_stream_selection=[Path(p).expanduser().resolve() for p in list(getattr(args, "analysis_stream_selection", None) or [])],
+            spectral_recording_snapshot=Path(args.spectral_recording_snapshot).expanduser().resolve() if getattr(args, "spectral_recording_snapshot", None) else None,
+            beam_model_path=Path(args.beam_model).expanduser().resolve() if getattr(args, "beam_model", None) else None,
+            allow_beam_model_override=bool(getattr(args, "allow_beam_model_override", False)),
+        )
         global_cfg = _canonicalize_boresight_settings(dict(config_dict.get("global", {}) or {}))
         if (not _argv_has_option(argv, "--spectral-name")) and (global_cfg.get("spectral_name") is not None):
             gs = str(global_cfg.get("spectral_name")).strip()
@@ -355,15 +409,19 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
         stream_cfg = _stream_override_dict(selected_stream) if selected_stream is not None else {}
         explicit_stream_override = bool(getattr(args, "stream_name", None)) or _argv_has_option(argv, "--spectral-name") or (global_cfg.get("spectral_name") is not None)
         if (selected_stream is not None) and (not explicit_stream_override):
-            usage_policy = resolve_stream_usage_policy(stream_extras_by_name(config_path).get(str(getattr(selected_stream, "name", "")), {}))
+            usage_policy = resolve_stream_usage_policy({
+                "enabled": getattr(selected_stream, "enabled", True),
+                "use_for_convert": getattr(selected_stream, "use_for_convert", True),
+                "use_for_sunscan": getattr(selected_stream, "use_for_sunscan", True),
+                "use_for_fit": getattr(selected_stream, "use_for_fit", True),
+                "beam_fit_use": getattr(selected_stream, "beam_fit_use", None),
+            })
             if not bool(usage_policy.get("use_for_sunscan", True)):
                 raise ValueError(
                     f"selected stream {getattr(selected_stream, 'name', None)!r} is disabled for sunscan by enabled/use_for_sunscan in the spectrometer config. "
                     "Pass --stream-name explicitly if you intentionally want to override this for a one-off run."
                 )
 
-    rawdata_values = list(args.rawdata) if isinstance(args.rawdata, (list, tuple)) else [args.rawdata]
-    first_rawdata = Path(rawdata_values[0]).expanduser().resolve()
     cfg = SunScanAnalysisConfig.default(rawdata_path=first_rawdata, spectral_name=(resolved_spectral_name or args.spectral_name), outdir=Path(args.outdir).expanduser().resolve())
 
     cfg.input.db_namespace = _choose_str_setting(args, argv, "--db-namespace", "db_namespace", global_cfg, "db_namespace", "necst")
@@ -377,7 +435,7 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
         or (global_cfg.get("azel_source") is not None)
         or (global_cfg.get("boresight_source") is not None)
     )
-    if (not getattr(args, "spectrometer_config", None)) or _argv_has_option(argv, "--azel-source", "--boresight-source"):
+    if (not _args_have_spectrometer_context(args)) or _argv_has_option(argv, "--azel-source", "--boresight-source"):
         cfg.input.azel_source = str(getattr(args, "azel_source", "encoder"))
     elif stream_cfg.get("azel_source") is not None:
         cfg.input.azel_source = str(stream_cfg.get("azel_source"))
@@ -529,8 +587,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     ap = argparse.ArgumentParser(description="Run single-stream sun_scan-compatible analysis via the shared package API.")
     add_singlebeam_arguments(ap)
     args = ap.parse_args(argv)
-    cfg = config_from_args(args, argv=argv)
     rawdata_paths = [Path(p).expanduser().resolve() for p in args.rawdata]
+    if bool(getattr(args, "inspect_sidecars", False)):
+        print(json.dumps(inspect_rawdata_sidecars(rawdata_paths), ensure_ascii=False, indent=2))
+        return
+    cfg = config_from_args(args, argv=argv)
+    run_singlebeam, run_singlebeam_many, build_summary_lines = _load_singlebeam_runtime()
 
     if len(rawdata_paths) == 1:
         result = run_singlebeam(cfg)

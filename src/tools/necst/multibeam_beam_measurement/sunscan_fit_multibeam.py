@@ -8,7 +8,7 @@ import builtins
 import pandas as pd
 
 from .beam_geometry import beam_rows_to_dataframe, fit_beam_model
-from .config_io import filter_streams_for_purpose, load_spectrometer_config, write_beam_model_toml
+from .config_io import filter_streams_for_purpose, load_spectrometer_config, load_spectrometer_config_with_loader, write_beam_model_toml, write_standalone_beam_model_toml
 from .plot_beam_fit_residuals_xy import write_beam_fit_xy_png
 
 
@@ -80,12 +80,19 @@ def run_fit(
     clip_iters: int = 2,
     min_points_per_beam: int = 2,
     min_scans_per_beam: int = 2,
+    config_loader: Optional[str] = "legacy",
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+    write_legacy_beam_model: bool = False,
 ) -> Dict[str, Path]:
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
     summary_df = _load_summary_tables(summary_paths)
     summary_df = _usable_rows(summary_df)
-    cfg = load_spectrometer_config(spectrometer_config)
+    cfg = load_spectrometer_config_with_loader(
+        spectrometer_config,
+        config_loader=config_loader,
+        analysis_stream_selection=analysis_stream_selection,
+    )
     fit_streams = [str(s.name) for s in filter_streams_for_purpose(Path(spectrometer_config), cfg, "fit", explicit_stream_names=stream_names)]
     work = summary_df.loc[summary_df["stream_name"].astype(str).isin(fit_streams)].copy()
     if work.empty:
@@ -182,8 +189,12 @@ def run_fit(
         converter_export_enabled = _supports_converter_export(model_name)
         if converter_export_enabled:
             toml_path = outdir / f"beam_model_{model_name}.toml"
-            write_beam_model_toml(toml_path, Path(spectrometer_config), beam_df, model_name="pure_rotation_v1")
+            write_standalone_beam_model_toml(toml_path, beam_df, model_name="pure_rotation_v1")
             outputs[f"beam_toml_{model_name}"] = toml_path
+            if write_legacy_beam_model:
+                legacy_toml_path = outdir / f"legacy_spectrometer_config_with_beam_model_{model_name}.toml"
+                write_beam_model_toml(legacy_toml_path, Path(spectrometer_config), beam_df, model_name="pure_rotation_v1")
+                outputs[f"legacy_beam_toml_{model_name}"] = legacy_toml_path
         else:
             note_path = outdir / f"beam_model_{model_name}_NOT_FOR_CONVERTER.txt"
             note_lines = [
@@ -233,6 +244,8 @@ def run_fit(
 def add_fit_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("summary_csv", nargs="+", help="one or more all-stream summary CSV files")
     ap.add_argument("--spectrometer-config", required=True, help="converter-compatible spectrometer config TOML")
+    ap.add_argument("--config-loader", default="legacy", choices=["legacy", "adapter"], help="Loader used for --spectrometer-config. legacy preserves historical loading; adapter routes the same legacy TOML through the config-separation internal model.")
+    ap.add_argument("--analysis-stream-selection", default=None, action="append", help="Standalone analysis_stream_selection TOML. May be repeated. Explicit --fit-stream-name still has priority for this run.")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--center-beam-id", default=None, help="Center beam ID for center-beam model")
     ap.add_argument("--fit-stream-name", dest="stream_names", action="append", default=None, help="Select stream names for fitting (repeatable)")
@@ -242,6 +255,7 @@ def add_fit_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--clip-iters", type=int, default=2, help="Number of sigma-clipping iterations")
     ap.add_argument("--min-points-per-beam", type=int, default=2, help="Minimum retained points per beam")
     ap.add_argument("--min-scans-per-beam", type=int, default=2, help="Minimum retained scans per beam")
+    ap.add_argument("--write-legacy-beam-model", action="store_true", help="Also write the old all-in-one spectrometer_config-style beam-model TOML. The separated beam_model.toml is always written for converter-compatible center_beam fits.")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -260,6 +274,9 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         clip_iters=int(args.clip_iters),
         min_points_per_beam=int(args.min_points_per_beam),
         min_scans_per_beam=int(args.min_scans_per_beam),
+        config_loader=getattr(args, "config_loader", "legacy"),
+        analysis_stream_selection=[Path(p).expanduser().resolve() for p in list(getattr(args, "analysis_stream_selection", None) or [])],
+        write_legacy_beam_model=bool(getattr(args, "write_legacy_beam_model", False)),
     )
     for key, path in outputs.items():
         print(f"[done] {key}: {path}")

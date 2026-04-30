@@ -4,11 +4,33 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 import math
+import sys
 import tomllib
 
 import pandas as pd
 
 from .legacy_loaders import load_converter_module
+
+# Config separation Step 3 implementation.
+# These helpers are not used by the historical loader yet; they expose the new
+# internal model and legacy adapter while keeping existing behavior unchanged.
+from .config_separation_model import (
+    AnalysisStreamSelection,
+    ConverterAnalysisConfig,
+    DbTimeEnvironmentConfig,
+    ResolvedBeamModel,
+    ResolvedConfigBundle,
+    ResolvedStream,
+    StreamSelectionPolicy,
+    SunScanAnalysisConfigModel,
+    apply_analysis_stream_selection_config,
+    apply_sunscan_analysis_config,
+    bundle_to_summary_dict,
+    load_legacy_spectrometer_config_bundle,
+    load_spectral_recording_snapshot_config_bundle,
+    materialize_converter_config,
+    materialize_light_config,
+)
 
 
 ALLOWED_POLARIZA = {"RR", "LL", "RL", "LR", "XX", "YY", "XY", "YX"}
@@ -215,6 +237,24 @@ def filter_streams_for_purpose(raw_config_path: Path, stream_cfg: Dict[str, Any]
         if missing:
             raise ValueError(f"stream(s) not found in spectrometer config: {missing}")
         return selected
+
+    purpose_key = str(purpose).strip().lower()
+    attr_map = {
+        "convert": "use_for_convert",
+        "converter": "use_for_convert",
+        "sunscan": "use_for_sunscan",
+        "sunscan_extract": "use_for_sunscan",
+        "extract": "use_for_sunscan",
+        "fit": "use_for_fit",
+        "sunscan_fit": "use_for_fit",
+    }
+    attr = attr_map.get(purpose_key)
+    if attr is not None:
+        return [
+            stream for stream in streams
+            if bool(getattr(stream, "enabled", True)) and bool(getattr(stream, attr, True))
+        ]
+
     extras = stream_extras_by_name(raw_config_path)
     return [stream for stream in streams if stream_enabled_for_purpose(extras.get(str(getattr(stream, "name", "")), {}), purpose)]
 
@@ -288,6 +328,111 @@ def load_spectrometer_config(config_path: Path):
 
 
 
+def discover_default_spectral_recording_snapshot(
+    rawdata_path: Path,
+    *,
+    error_on_incomplete_new_db: bool = True,
+) -> Optional[Path]:
+    """Discover a DB-embedded spectral_recording_snapshot.toml sidecar.
+
+    This helper is used by converter/sunscan default paths when no explicit
+    snapshot/config was supplied.  A DB that contains new setup sidecars but lacks
+    the authoritative snapshot is treated as incomplete and should not silently
+    fall back to legacy configuration.
+    """
+
+    try:
+        from ..spectral_recording_snapshot import discover_db_sidecar_files
+    except Exception:
+        try:
+            from tools.necst.spectral_recording_snapshot import discover_db_sidecar_files  # type: ignore
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to import spectral-recording sidecar discovery helpers; "
+                "explicitly pass --spectral-recording-snapshot or --spectrometer-config"
+            ) from exc
+
+    sidecars = discover_db_sidecar_files(Path(rawdata_path), recursive=True, strict_duplicates=True)
+    if getattr(sidecars, "snapshot_path", None) is not None:
+        return Path(sidecars.snapshot_path).expanduser().resolve()
+    has_new_sidecars = bool(getattr(sidecars, "has_new_sidecars", lambda: False)())
+    if has_new_sidecars and error_on_incomplete_new_db:
+        raise ValueError(
+            "RawData contains new spectral-recording setup sidecars but no "
+            "spectral_recording_snapshot.toml. Refusing to use legacy configuration "
+            "implicitly; pass --spectral-recording-snapshot explicitly or use a "
+            "legacy --spectrometer-config."
+        )
+    return None
+
+
+
+def load_spectrometer_config_via_adapter(config_path: Path):
+    """Load a legacy all-in-one spectrometer config through the separated model.
+
+    This is an opt-in compatibility path for sunscan tools.  The default
+    ``load_spectrometer_config`` path remains unchanged, so historical behavior
+    is preserved unless a caller explicitly requests ``config_loader="adapter"``.
+    """
+
+    bundle = load_legacy_spectrometer_config_bundle(
+        Path(config_path),
+        strict_converter_identity=False,
+    )
+    cfg = materialize_light_config(bundle, sys.modules[__name__])
+    provenance = dict(cfg.get("provenance", {}) or {})
+    provenance.setdefault("config_loader", "adapter")
+    provenance.setdefault("config_source_format", getattr(bundle, "source_format", "legacy_spectrometer_config"))
+    provenance.setdefault("config_source_path", getattr(bundle, "source_path", str(config_path)))
+    cfg["provenance"] = provenance
+    return cfg
+
+
+def normalize_config_loader(config_loader: Optional[str]) -> str:
+    loader = str(config_loader or "legacy").strip().lower()
+    if loader not in {"legacy", "adapter"}:
+        raise ValueError(f"config_loader must be 'legacy' or 'adapter', got {config_loader!r}")
+    return loader
+
+
+def load_spectrometer_config_with_loader(
+    config_path: Optional[Path],
+    *,
+    config_loader: Optional[str] = "legacy",
+    sunscan_analysis_config: Optional[Path] = None,
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+    spectral_recording_snapshot: Optional[Path] = None,
+    beam_model_path: Optional[Path] = None,
+    allow_beam_model_override: bool = False,
+):
+    if spectral_recording_snapshot is not None:
+        bundle = load_spectral_recording_snapshot_config_bundle(
+            Path(spectral_recording_snapshot),
+            beam_model_path=beam_model_path,
+            allow_beam_model_override=allow_beam_model_override,
+        )
+        cfg = materialize_light_config(bundle, sys.modules[__name__])
+        provenance = dict(cfg.get("provenance", {}) or {})
+        provenance.setdefault("config_loader", "snapshot_adapter")
+        provenance.setdefault("config_source_format", getattr(bundle, "source_format", "spectral_recording_snapshot"))
+        provenance.setdefault("config_source_path", getattr(bundle, "source_path", str(spectral_recording_snapshot)))
+        cfg["provenance"] = provenance
+    else:
+        if config_path is None:
+            raise ValueError("config_path is required unless spectral_recording_snapshot is provided")
+        loader = normalize_config_loader(config_loader)
+        if loader == "adapter":
+            cfg = load_spectrometer_config_via_adapter(Path(config_path))
+        else:
+            cfg = load_spectrometer_config(Path(config_path))
+    if sunscan_analysis_config is not None:
+        cfg = apply_sunscan_analysis_config(cfg, Path(sunscan_analysis_config))
+    for selection_path in list(analysis_stream_selection or []):
+        cfg = apply_analysis_stream_selection_config(cfg, Path(selection_path))
+    return cfg
+
+
+
 def stream_extras_by_name(config_path: Path) -> Dict[str, Dict[str, Any]]:
     raw = load_raw_toml(config_path)
     extras: Dict[str, Dict[str, Any]] = {}
@@ -325,12 +470,17 @@ def restfreq_hz_for_stream(stream: Any) -> Optional[float]:
 
 
 
-def stream_table_from_config(config_path: Path, stream_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
-    cfg = stream_cfg if stream_cfg is not None else load_spectrometer_config(config_path)
-    extras = stream_extras_by_name(config_path)
+def stream_table_from_config(config_path: Optional[Path], stream_cfg: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
+    cfg = stream_cfg if stream_cfg is not None else load_spectrometer_config(Path(config_path))
     rows: List[Dict[str, Any]] = []
     for stream in list(cfg.get("streams", []) or []):
-        usage_policy = resolve_stream_usage_policy(extras.get(str(stream.name), {}))
+        usage_policy = resolve_stream_usage_policy({
+            "enabled": getattr(stream, "enabled", True),
+            "use_for_convert": getattr(stream, "use_for_convert", True),
+            "use_for_sunscan": getattr(stream, "use_for_sunscan", True),
+            "use_for_fit": getattr(stream, "use_for_fit", True),
+            "beam_fit_use": getattr(stream, "beam_fit_use", None),
+        })
         rows.append(
             {
                 "stream_name": str(stream.name),
@@ -384,8 +534,8 @@ def resolve_primary_stream_names(raw_config_path: Path, stream_cfg: Dict[str, An
 
 
 
-def validate_spectrometer_config(config_path: Path, *, explicit_stream_names: Optional[Sequence[str]] = None) -> SpectrometerValidationResult:
-    cfg = load_spectrometer_config(config_path)
+def validate_spectrometer_config(config_path: Path, *, explicit_stream_names: Optional[Sequence[str]] = None, stream_cfg: Optional[Dict[str, Any]] = None) -> SpectrometerValidationResult:
+    cfg = stream_cfg if stream_cfg is not None else load_spectrometer_config(config_path)
     table = stream_table_from_config(config_path, cfg)
     warnings: List[str] = []
     if table.empty:
@@ -466,6 +616,35 @@ def validate_spectrometer_config(config_path: Path, *, explicit_stream_names: Op
 
 
 
+def validate_spectrometer_config_with_loader(
+    config_path: Optional[Path],
+    *,
+    explicit_stream_names: Optional[Sequence[str]] = None,
+    config_loader: Optional[str] = "legacy",
+    sunscan_analysis_config: Optional[Path] = None,
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+    spectral_recording_snapshot: Optional[Path] = None,
+    beam_model_path: Optional[Path] = None,
+    allow_beam_model_override: bool = False,
+) -> SpectrometerValidationResult:
+    cfg = load_spectrometer_config_with_loader(
+        Path(config_path) if config_path is not None else None,
+        config_loader=config_loader,
+        sunscan_analysis_config=sunscan_analysis_config,
+        analysis_stream_selection=analysis_stream_selection,
+        spectral_recording_snapshot=spectral_recording_snapshot,
+        beam_model_path=beam_model_path,
+        allow_beam_model_override=allow_beam_model_override,
+    )
+    validation_path = Path(config_path) if config_path is not None else Path(spectral_recording_snapshot or "spectral_recording_snapshot.toml")
+    return validate_spectrometer_config(
+        validation_path,
+        explicit_stream_names=explicit_stream_names,
+        stream_cfg=cfg,
+    )
+
+
+
 def format_toml_value(value: Any) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -507,6 +686,62 @@ def _write_table_lines(lines: List[str], prefix: str, table: Dict[str, Any]) -> 
     for key, value in nested_items:
         _write_table_lines(lines, f"{prefix}.{key}" if prefix else key, value)
 
+
+
+
+def write_standalone_beam_model_toml(output_path: Path, beam_rows_df, model_name: str) -> Path:
+    """Write new separated ``beam_model.toml`` from multibeam fit rows.
+
+    This is the canonical output for the separated config stack.  The older
+    ``write_beam_model_toml`` function below remains as a legacy all-in-one
+    spectrometer-config updater.
+    """
+
+    lines: List[str] = []
+    version = f"sunscan_multibeam_{model_name}"
+    lines.append(f"beam_model_version = {format_toml_value(version)}")
+    lines.append("")
+    missing: List[str] = []
+    seen: set[str] = set()
+    for _, row in beam_rows_df.iterrows():
+        beam_id = str(row.get("beam_id", "")).strip()
+        if not beam_id:
+            missing.append("<empty>")
+            continue
+        if beam_id in seen:
+            continue
+        seen.add(beam_id)
+        lines.append(f"[beams.{beam_id}]")
+        has_pure = all(col in row.index for col in ["offset_x_el0_arcsec", "offset_y_el0_arcsec", "rotation_sign"])
+        if has_pure and pd.notna(row["offset_x_el0_arcsec"]) and pd.notna(row["offset_y_el0_arcsec"]):
+            lines.append(f"model = {format_toml_value(PURE_ROTATION_MODEL)}")
+            lines.append(f"beam_model_version = {format_toml_value(version)}")
+            lines.append(f"rotation_mode = {format_toml_value(PURE_ROTATION_MODEL)}")
+            lines.append(f"pure_rotation_offset_x_el0_arcsec = {format_toml_value(float(row['offset_x_el0_arcsec']))}")
+            lines.append(f"pure_rotation_offset_y_el0_arcsec = {format_toml_value(float(row['offset_y_el0_arcsec']))}")
+            lines.append(f"pure_rotation_sign = {format_toml_value(float(row['rotation_sign']))}")
+        else:
+            required = ["az_offset_arcsec", "el_offset_arcsec", "rotation_mode", "reference_angle_deg", "rotation_sign", "dewar_angle_deg"]
+            if any(col not in row.index or pd.isna(row[col]) for col in required):
+                missing.append(beam_id)
+                lines.append("")
+                continue
+            lines.append(f"model = {format_toml_value(str(row.get('model', 'legacy')))}")
+            lines.append(f"beam_model_version = {format_toml_value(version)}")
+            lines.append(f"az_offset_arcsec = {format_toml_value(float(row['az_offset_arcsec']))}")
+            lines.append(f"el_offset_arcsec = {format_toml_value(float(row['el_offset_arcsec']))}")
+            lines.append(f"rotation_mode = {format_toml_value(str(row['rotation_mode']))}")
+            lines.append(f"reference_angle_deg = {format_toml_value(float(row['reference_angle_deg']))}")
+            lines.append(f"rotation_sign = {format_toml_value(float(row['rotation_sign']))}")
+            if "rotation_slope_deg_per_deg" in row.index and pd.notna(row["rotation_slope_deg_per_deg"]):
+                lines.append(f"rotation_slope_deg_per_deg = {format_toml_value(float(row['rotation_slope_deg_per_deg']))}")
+            lines.append(f"dewar_angle_deg = {format_toml_value(float(row['dewar_angle_deg']))}")
+        lines.append("")
+    if missing:
+        raise ValueError("cannot write standalone beam_model.toml because fit results are incomplete for beam(s): " + ", ".join(sorted(set(missing))))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return output_path
 
 
 def write_beam_model_toml(output_path: Path, raw_config_path: Path, beam_rows_df, model_name: str) -> Path:

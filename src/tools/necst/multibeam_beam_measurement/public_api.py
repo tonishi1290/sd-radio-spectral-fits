@@ -8,7 +8,7 @@ import re
 
 import pandas as pd
 
-from .config_io import validate_spectrometer_config
+from .config_io import validate_spectrometer_config, validate_spectrometer_config_with_loader
 from .sunscan_config import SunScanAnalysisConfig
 from .sunscan_core import analyze_single_stream
 from .sunscan_report import write_singlebeam_outputs
@@ -171,12 +171,54 @@ def run_singlebeam_many(rawdata_paths: Sequence[Path], base_config: SunScanAnaly
 
 
 
-def run_multibeam_extract(rawdata_path: Path, spectrometer_config: Path, base_config: SunScanAnalysisConfig, *, outdir: Path, run_id: Optional[str] = None, stream_names: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    return run_extract(rawdata_path=rawdata_path, spectrometer_config=spectrometer_config, base_config=base_config, outdir=outdir, run_id=run_id, stream_names=stream_names)
+def run_multibeam_extract(
+    rawdata_path: Path,
+    spectrometer_config: Optional[Path],
+    base_config: SunScanAnalysisConfig,
+    *,
+    outdir: Path,
+    run_id: Optional[str] = None,
+    stream_names: Optional[Sequence[str]] = None,
+    config_loader: Optional[str] = "legacy",
+    sunscan_analysis_config: Optional[Path] = None,
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+    spectral_recording_snapshot: Optional[Path] = None,
+    beam_model_path: Optional[Path] = None,
+    allow_beam_model_override: bool = False,
+) -> Dict[str, Any]:
+    return run_extract(
+        rawdata_path=rawdata_path,
+        spectrometer_config=spectrometer_config,
+        base_config=base_config,
+        outdir=outdir,
+        run_id=run_id,
+        stream_names=stream_names,
+        config_loader=config_loader,
+        sunscan_analysis_config=sunscan_analysis_config,
+        analysis_stream_selection=analysis_stream_selection,
+        spectral_recording_snapshot=spectral_recording_snapshot,
+        beam_model_path=beam_model_path,
+        allow_beam_model_override=bool(allow_beam_model_override),
+    )
 
 
 
-def run_multibeam_extract_many(rawdata_paths: Sequence[Path], spectrometer_config: Path, base_config: SunScanAnalysisConfig, *, outdir: Path, run_ids: Optional[Sequence[Optional[str]]] = None, stream_names: Optional[Sequence[str]] = None, merged_tag: Optional[str] = None) -> Dict[str, Any]:
+def run_multibeam_extract_many(
+    rawdata_paths: Sequence[Path],
+    spectrometer_config: Optional[Path],
+    base_config: SunScanAnalysisConfig,
+    *,
+    outdir: Path,
+    run_ids: Optional[Sequence[Optional[str]]] = None,
+    stream_names: Optional[Sequence[str]] = None,
+    merged_tag: Optional[str] = None,
+    config_loader: Optional[str] = "legacy",
+    sunscan_analysis_config: Optional[Path] = None,
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+    spectral_recording_snapshot: Optional[Path] = None,
+    beam_model_path: Optional[Path] = None,
+    allow_beam_model_override: bool = False,
+) -> Dict[str, Any]:
     return run_extract_many(
         rawdata_paths=rawdata_paths,
         spectrometer_config=spectrometer_config,
@@ -185,11 +227,32 @@ def run_multibeam_extract_many(rawdata_paths: Sequence[Path], spectrometer_confi
         run_ids=run_ids,
         stream_names=stream_names,
         merged_tag=merged_tag,
+        config_loader=config_loader,
+        sunscan_analysis_config=sunscan_analysis_config,
+        analysis_stream_selection=analysis_stream_selection,
+        spectral_recording_snapshot=spectral_recording_snapshot,
+        beam_model_path=beam_model_path,
+        allow_beam_model_override=bool(allow_beam_model_override),
     )
 
 
 
-def run_multibeam_fit(summary_paths: Sequence[Path], spectrometer_config: Path, *, outdir: Path, center_beam_id: Optional[str] = None, stream_names: Optional[Sequence[str]] = None, model: str = "both", reference_angle_deg: Optional[float] = None, sigma_clip: Optional[float] = 4.5, clip_iters: int = 2, min_points_per_beam: int = 2, min_scans_per_beam: int = 2) -> Dict[str, Path]:
+def run_multibeam_fit(
+    summary_paths: Sequence[Path],
+    spectrometer_config: Path,
+    *,
+    outdir: Path,
+    center_beam_id: Optional[str] = None,
+    stream_names: Optional[Sequence[str]] = None,
+    model: str = "both",
+    reference_angle_deg: Optional[float] = None,
+    sigma_clip: Optional[float] = 4.5,
+    clip_iters: int = 2,
+    min_points_per_beam: int = 2,
+    min_scans_per_beam: int = 2,
+    config_loader: Optional[str] = "legacy",
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+) -> Dict[str, Path]:
     return run_fit(
         summary_paths=summary_paths,
         spectrometer_config=spectrometer_config,
@@ -202,11 +265,25 @@ def run_multibeam_fit(summary_paths: Sequence[Path], spectrometer_config: Path, 
         clip_iters=clip_iters,
         min_points_per_beam=min_points_per_beam,
         min_scans_per_beam=min_scans_per_beam,
+        config_loader=config_loader,
+        analysis_stream_selection=analysis_stream_selection,
     )
 
 
 
-def run_pseudo_multibeam(singlebeam_summary_paths: Sequence[Path], spectrometer_config: Path, *, outdir: Path, stream_names: Optional[Sequence[str]] = None, noise_arcsec: float = 0.0, seed: int = 0, tag: Optional[str] = None, rep_el_degs: Optional[Sequence[float]] = None) -> Dict[str, Path]:
+def run_pseudo_multibeam(
+    singlebeam_summary_paths: Sequence[Path],
+    spectrometer_config: Path,
+    *,
+    outdir: Path,
+    stream_names: Optional[Sequence[str]] = None,
+    noise_arcsec: float = 0.0,
+    seed: int = 0,
+    tag: Optional[str] = None,
+    rep_el_degs: Optional[Sequence[float]] = None,
+    config_loader: Optional[str] = "legacy",
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+) -> Dict[str, Path]:
     return make_pseudo_multibeam(
         singlebeam_summary_paths=singlebeam_summary_paths,
         spectrometer_config=spectrometer_config,
@@ -216,9 +293,24 @@ def run_pseudo_multibeam(singlebeam_summary_paths: Sequence[Path], spectrometer_
         seed=seed,
         tag=tag,
         rep_el_degs=rep_el_degs,
+        config_loader=config_loader,
+        analysis_stream_selection=analysis_stream_selection,
     )
 
 
 
-def check_spectrometer_config(spectrometer_config: Path, *, stream_names: Optional[Sequence[str]] = None):
-    return validate_spectrometer_config(spectrometer_config, explicit_stream_names=stream_names)
+def check_spectrometer_config(
+    spectrometer_config: Path,
+    *,
+    stream_names: Optional[Sequence[str]] = None,
+    config_loader: Optional[str] = "legacy",
+    sunscan_analysis_config: Optional[Path] = None,
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
+):
+    return validate_spectrometer_config_with_loader(
+        spectrometer_config,
+        explicit_stream_names=stream_names,
+        config_loader=config_loader,
+        sunscan_analysis_config=sunscan_analysis_config,
+        analysis_stream_selection=analysis_stream_selection,
+    )

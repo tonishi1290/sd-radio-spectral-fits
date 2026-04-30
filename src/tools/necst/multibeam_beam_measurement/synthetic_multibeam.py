@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from .beam_rotation_shared import apply_beam_offset_arcsec
-from .config_io import load_spectrometer_config, restfreq_hz_for_stream, stream_table_from_config
+from .config_io import load_spectrometer_config, load_spectrometer_config_with_loader, restfreq_hz_for_stream, stream_table_from_config
 
 
 
@@ -89,8 +89,14 @@ def make_pseudo_multibeam(
     seed: int = 0,
     tag: Optional[str] = None,
     rep_el_degs: Optional[Sequence[float]] = None,
+    config_loader: Optional[str] = "legacy",
+    analysis_stream_selection: Optional[Sequence[Path]] = None,
 ) -> Dict[str, Path]:
-    cfg = load_spectrometer_config(spectrometer_config)
+    cfg = load_spectrometer_config_with_loader(
+        spectrometer_config,
+        config_loader=config_loader,
+        analysis_stream_selection=analysis_stream_selection,
+    )
     streams = list(cfg.get("streams", []) or [])
     if stream_names:
         wanted = {str(s) for s in stream_names}
@@ -175,6 +181,8 @@ def make_pseudo_multibeam(
 def add_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("singlebeam_summary_csv", nargs="+", help="One or more single-beam sun_scan summary CSV files")
     ap.add_argument("--spectrometer-config", required=True, help="converter-compatible spectrometer config TOML")
+    ap.add_argument("--config-loader", default="legacy", choices=["legacy", "adapter"], help="Loader used for --spectrometer-config. legacy preserves historical loading; adapter routes the same legacy TOML through the config-separation internal model.")
+    ap.add_argument("--analysis-stream-selection", default=None, action="append", help="Standalone analysis_stream_selection TOML. May be repeated.")
     ap.add_argument("--outdir", default=".", help="Output directory")
     ap.add_argument("--stream-name", dest="stream_names", action="append", default=None, help="Select a specific stream name (repeatable)")
     ap.add_argument("--noise-arcsec", type=float, default=0.0, help="Optional Gaussian jitter for dry-run testing")
@@ -197,6 +205,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         seed=int(args.seed),
         tag=args.tag,
         rep_el_degs=args.rep_el_degs,
+        config_loader=getattr(args, "config_loader", "legacy"),
+        analysis_stream_selection=[Path(p).expanduser().resolve() for p in list(getattr(args, "analysis_stream_selection", None) or [])],
     )
     for key, path in outputs.items():
         print(f"[done] {key}: {path}")

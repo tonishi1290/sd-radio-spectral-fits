@@ -37,6 +37,7 @@ v1_40:
 """
 
 import argparse
+import json
 from dataclasses import dataclass, field, replace
 import pathlib
 import sys
@@ -158,6 +159,66 @@ def _load_pure_rotation_helpers():
 
 
 rotate_el0_offset, offset_xy_to_beam_azel = _load_pure_rotation_helpers()
+
+
+_CONFIG_SEPARATION_MODEL_CACHE = None
+
+
+def _load_config_separation_model_for_converter():
+    """Load config_separation_model without making converter startup depend on package __init__ files."""
+    global _CONFIG_SEPARATION_MODEL_CACHE
+    if _CONFIG_SEPARATION_MODEL_CACHE is not None:
+        return _CONFIG_SEPARATION_MODEL_CACHE
+
+    errors = []
+    try:
+        from tools.necst.multibeam_beam_measurement import config_separation_model as model  # type: ignore
+        _CONFIG_SEPARATION_MODEL_CACHE = model
+        return model
+    except Exception as exc:
+        errors.append("package import: {}".format(exc))
+
+    path = pathlib.Path(__file__).resolve().parent / "multibeam_beam_measurement" / "config_separation_model.py"
+    module_name = "_necst_config_separation_model_for_converter"
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, str(path))
+        if spec is None or spec.loader is None:
+            raise RuntimeError("failed to build import spec for {}".format(path))
+        module = importlib.util.module_from_spec(spec)
+        # dataclasses need the module to be present in sys.modules while class decorators run.
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        _CONFIG_SEPARATION_MODEL_CACHE = module
+        return module
+    except Exception as exc:
+        errors.append("direct file import: {}".format(exc))
+
+    raise RuntimeError(
+        "failed to load config_separation_model.py; cannot use --config-loader=adapter. "
+        + " | ".join(errors)
+    )
+
+
+def load_spectrometer_config_via_adapter(path):
+    """Load legacy all-in-one spectrometer_config through the new separation adapter.
+
+    This is an opt-in converter integration path.  The default converter path still uses
+    load_spectrometer_config() directly, so historical behavior is unchanged unless the
+    user explicitly passes --config-loader adapter.
+    """
+    model = _load_config_separation_model_for_converter()
+    bundle = model.load_legacy_spectrometer_config_bundle(
+        path,
+        strict_converter_identity=True,
+    )
+    config_dict = model.materialize_converter_config(bundle, sys.modules[__name__])
+    provenance = dict(config_dict.get("provenance", {}) or {})
+    provenance.setdefault("config_loader", "adapter")
+    provenance.setdefault("config_source_format", getattr(bundle, "source_format", "legacy_spectrometer_config"))
+    provenance.setdefault("config_source_path", getattr(bundle, "source_path", str(path)))
+    config_dict["provenance"] = provenance
+    return config_dict
+
 
 from sd_radio_spectral_fits import (
     SDRadioSpectralSDFITSWriter,
@@ -1267,17 +1328,93 @@ def _resolve_convert_usage(enabled_raw, use_for_convert_raw):
     return bool(enabled), bool(use_for_convert)
 
 
-def _select_streams_for_convert(streams, explicit_stream_names=None):
+def _stream_source_id(stream):
+    override = getattr(stream, "override", {}) or {}
+    return str(override.get("source_stream_id") or getattr(stream, "name", ""))
+
+
+def _stream_window_id(stream):
+    override = getattr(stream, "override", {}) or {}
+    value = override.get("window_id")
+    return None if value is None else str(value)
+
+
+def _select_streams_for_convert(
+    streams,
+    explicit_stream_names=None,
+    explicit_window_ids=None,
+    explicit_recorded_stream_ids=None,
+):
     streams = list(streams or [])
-    if explicit_stream_names:
-        wanted = [str(s) for s in explicit_stream_names]
+    if explicit_recorded_stream_ids:
+        wanted = [str(s) for s in explicit_recorded_stream_ids]
         wanted_set = set(wanted)
         selected = [stream for stream in streams if str(getattr(stream, "name", "")) in wanted_set]
         found = {str(getattr(stream, "name", "")) for stream in selected}
         missing = [name for name in wanted if name not in found]
         if missing:
+            raise ValueError("recorded stream(s) not found in spectrometer config: {}".format(missing))
+        return selected
+
+    stream_names = [str(s) for s in explicit_stream_names] if explicit_stream_names else []
+    window_ids = [str(w) for w in explicit_window_ids] if explicit_window_ids else []
+
+    if window_ids and not stream_names:
+        wanted_windows = set(window_ids)
+        selected = [stream for stream in streams if _stream_window_id(stream) in wanted_windows]
+        found_windows = {str(_stream_window_id(stream)) for stream in selected}
+        missing_windows = [w for w in window_ids if w not in found_windows]
+        if missing_windows:
+            raise ValueError("window_id(s) not found in snapshot recorded products: {}".format(missing_windows))
+        return selected
+
+    if stream_names and window_ids:
+        wanted_sources = set(stream_names)
+        wanted_windows = set(window_ids)
+        selected = [
+            stream
+            for stream in streams
+            if (_stream_source_id(stream) in wanted_sources or str(getattr(stream, "name", "")) in wanted_sources)
+            and (_stream_window_id(stream) in wanted_windows)
+        ]
+        found_pairs = {(_stream_source_id(stream), _stream_window_id(stream)) for stream in selected}
+        missing = []
+        for src in stream_names:
+            for win in window_ids:
+                if (src, win) not in found_pairs:
+                    missing.append(f"{src}::{win}")
+        if missing:
+            raise ValueError("source stream/window pair(s) not found in snapshot recorded products: {}".format(missing))
+        return selected
+
+    if stream_names:
+        wanted = list(stream_names)
+        selected = []
+        missing = []
+        ambiguous = {}
+        for name in wanted:
+            exact = [stream for stream in streams if str(getattr(stream, "name", "")) == name]
+            source_products = [stream for stream in streams if _stream_source_id(stream) == name]
+            # If exact exists and it is not just a multi-window product alias, keep exact.
+            if exact:
+                selected.extend(exact)
+                continue
+            if len(source_products) == 1:
+                selected.extend(source_products)
+            elif len(source_products) > 1:
+                ambiguous[name] = [str(getattr(s, "name", "")) for s in source_products]
+            else:
+                missing.append(name)
+        if ambiguous:
+            details = "; ".join(f"{k}: {v}" for k, v in sorted(ambiguous.items()))
+            raise ValueError(
+                "source stream_id selects multiple recorded products; specify --window-id or --recorded-stream-id: "
+                + details
+            )
+        if missing:
             raise ValueError("stream(s) not found in spectrometer config: {}".format(missing))
         return selected
+
     return [stream for stream in streams if bool(getattr(stream, "use_for_convert", True))]
 
 
@@ -3370,8 +3507,17 @@ def parse_args(argv):
         description="Convert NECST v4 RawData spectral DB to SDFITS (multi-stream capable).",
     )
     p.add_argument("rawdata", help="RawData folder path (necstdb + nercst)")
+    p.add_argument("--inspect-sidecars", action="store_true", help="Inspect DB-embedded spectral-recording sidecars and exit without converting.")
     p.add_argument("--spectrometer-config", default=None, help="TOML file describing spectrometers / beams / LO / WCS")
-    p.add_argument("--stream-name", "--convert-stream-name", dest="stream_names", action="append", default=None, help="Convert only the named stream(s). When omitted, enabled/use_for_convert in the spectrometer config select the streams.")
+    p.add_argument("--spectral-recording-snapshot", "--snapshot", default=None, help="Observation-time spectral_recording_snapshot.toml. When given, it supplies stream truth through the snapshot adapter and is mutually exclusive with --spectrometer-config.")
+    p.add_argument("--beam-model", default=None, help="Optional analysis-time beam_model.toml override for --spectral-recording-snapshot. Requires --allow-beam-model-override.")
+    p.add_argument("--allow-beam-model-override", action="store_true", help="Permit --beam-model to override beam geometry embedded in the snapshot, and record this as analysis-time provenance.")
+    p.add_argument("--config-loader", default="legacy", choices=["legacy", "adapter"], help="Loader used for --spectrometer-config. legacy preserves the historical direct loader; adapter routes the same legacy TOML through the config-separation internal model.")
+    p.add_argument("--converter-analysis-config", "--converter-analysis", default=None, help="Standalone converter_analysis TOML. It overrides converter-only analysis settings such as DB/time/weather defaults and export slices without redefining stream truth.")
+    p.add_argument("--analysis-stream-selection", default=None, action="append", help="Standalone analysis_stream_selection TOML. May be repeated. Explicit --stream-name still has priority for this run.")
+    p.add_argument("--stream-name", "--convert-stream-name", "--stream-id", dest="stream_names", action="append", default=None, help="Convert only the named source stream_id(s). In snapshot multi-window mode this is ambiguous unless --window-id is also supplied.")
+    p.add_argument("--window-id", dest="window_ids", action="append", default=None, help="Snapshot multi-window mode: select recorded product(s) by window_id together with --stream-id, e.g. --stream-id 2LL --window-id 13CO_J1_0.")
+    p.add_argument("--recorded-stream-id", dest="recorded_stream_ids", action="append", default=None, help="Snapshot multi-window mode: select recorded product stream_id directly, e.g. 2LL__13CO_J1_0.")
     p.add_argument("--strict-config", action="store_true", help="Treat stream mismatches as errors.")
     p.add_argument("--spectral", default="xffts-board1", help="Legacy single-stream spectral name")
     p.add_argument("--telescope", default="OMU1P85M", help="Telescope name used in table names")
@@ -3475,7 +3621,7 @@ def parse_args(argv):
 def _default_outfile(rawbase, config_dict, args):
     if args.out:
         return args.out
-    if args.spectrometer_config:
+    if args.spectrometer_config or getattr(args, "spectral_recording_snapshot", None):
         cfg_name = config_dict.get("config_name")
         if cfg_name:
             return "{}_{}_sdfits.fits".format(rawbase, _sanitize_for_filename(cfg_name))
@@ -3502,7 +3648,7 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     telescope = telescope_cfg if telescope_cfg is not None else str(args.telescope)
     # Prefer explicit CLI telescope over TOML.  We detect whether the option was
     # present in argv so that even `--telescope OMU1P85M` overrides a TOML value.
-    if (not args.spectrometer_config) or _argv_has_option(argv, "--telescope") or (telescope_cfg is None):
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--telescope") or (telescope_cfg is None):
         telescope = str(args.telescope)
 
     encoder_table = _nonempty_str(getattr(args, "encoder_table", None), default=None)
@@ -3510,7 +3656,7 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
         encoder_table = _nonempty_str(global_cfg.get("encoder_table"), default=None)
     encoder_table_suffix = _nonempty_str(getattr(args, "encoder_table_suffix", None), default=_nonempty_str(global_cfg.get("encoder_table_suffix"), default="ctrl-antenna-encoder"))
     encoder_time_col_cfg = _nonempty_str(global_cfg.get("encoder_time_col"), default=None)
-    if (not args.spectrometer_config) or _argv_has_option(argv, "--encoder-time-col") or (encoder_time_col_cfg is None):
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--encoder-time-col") or (encoder_time_col_cfg is None):
         encoder_time_col = str(getattr(args, "encoder_time_col", "time"))
     else:
         encoder_time_col = str(encoder_time_col_cfg)
@@ -3519,7 +3665,7 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
         altaz_table = _nonempty_str(global_cfg.get("altaz_table"), default=None)
     altaz_table_suffix = _nonempty_str(getattr(args, "altaz_table_suffix", None), default=_nonempty_str(global_cfg.get("altaz_table_suffix"), default="ctrl-antenna-altaz"))
     altaz_time_col_cfg = _nonempty_str(global_cfg.get("altaz_time_col"), default=None)
-    if (not args.spectrometer_config) or _argv_has_option(argv, "--altaz-time-col") or (altaz_time_col_cfg is None):
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--altaz-time-col") or (altaz_time_col_cfg is None):
         altaz_time_col = str(getattr(args, "altaz_time_col", "time"))
     else:
         altaz_time_col = str(altaz_time_col_cfg)
@@ -3588,7 +3734,7 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     tamb_max_k = _choose_float_runtime_multi(["tamb_max_k"], ["tamb_max_k"], outside_temperature_max_c + 273.15)
 
     encoder_shift_sec_cfg = global_cfg.get("encoder_shift_sec", None)
-    if (not args.spectrometer_config) or _argv_has_option(argv, "--encoder-shift-sec") or (encoder_shift_sec_cfg is None):
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--encoder-shift-sec") or (encoder_shift_sec_cfg is None):
         encoder_shift_sec = float(getattr(args, "encoder_shift_sec", 0.0))
     else:
         encoder_shift_sec = float(encoder_shift_sec_cfg)
@@ -3633,6 +3779,125 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     }
 
 
+
+
+def _args_have_spectral_config(args) -> bool:
+    return bool(getattr(args, "spectrometer_config", None) or getattr(args, "spectral_recording_snapshot", None))
+
+
+
+def _discover_default_spectral_recording_snapshot(rawdata_path: pathlib.Path) -> Optional[pathlib.Path]:
+    """Return the DB sidecar snapshot path when a RawData directory contains one.
+
+    This is intentionally used only when neither --spectral-recording-snapshot nor
+    --spectrometer-config was provided.  If new setup sidecars exist without a
+    snapshot, we raise instead of silently falling back to the legacy single-stream
+    path; that state means the DB is incomplete for the new recording scheme.
+    """
+
+    try:
+        from .spectral_recording_snapshot import (  # type: ignore
+            SpectralRecordingSnapshotError,
+            discover_db_sidecar_files,
+        )
+    except Exception:
+        try:
+            from tools.necst.spectral_recording_snapshot import (  # type: ignore
+                SpectralRecordingSnapshotError,
+                discover_db_sidecar_files,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to import spectral-recording sidecar discovery helpers; "
+                "explicitly pass --spectral-recording-snapshot or --spectrometer-config"
+            ) from exc
+
+    try:
+        sidecars = discover_db_sidecar_files(rawdata_path, recursive=True, strict_duplicates=True)
+    except SpectralRecordingSnapshotError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(f"failed to inspect RawData sidecars under {rawdata_path}: {exc}") from exc
+
+    snapshot_path = getattr(sidecars, "snapshot_path", None)
+    if snapshot_path is not None:
+        return pathlib.Path(snapshot_path).expanduser().resolve()
+    has_new_sidecars = bool(getattr(sidecars, "has_new_sidecars", lambda: False)())
+    if has_new_sidecars:
+        raise RuntimeError(
+            "RawData contains new spectral-recording setup sidecars but no "
+            "spectral_recording_snapshot.toml. Refusing to fall back to legacy "
+            "single-stream conversion; pass --spectral-recording-snapshot explicitly "
+            "or use a legacy --spectrometer-config."
+        )
+    return None
+
+
+
+def _inspect_sidecars_json(rawdata_path: pathlib.Path) -> Dict[str, Any]:
+    """Return DB sidecar discovery dry-run report for --inspect-sidecars."""
+
+    try:
+        from .spectral_recording_snapshot import inspect_db_sidecars  # type: ignore
+    except Exception:
+        try:
+            from tools.necst.spectral_recording_snapshot import inspect_db_sidecars  # type: ignore
+        except Exception as exc:
+            raise RuntimeError("Unable to import spectral-recording sidecar inspection helpers") from exc
+    return inspect_db_sidecars(rawdata_path, recursive=True)
+
+
+def _config_source_manifest(
+    *,
+    rawdata_path: pathlib.Path,
+    config_dict: Dict[str, Any],
+    args: argparse.Namespace,
+    explicit_spectrometer_config: bool,
+    explicit_snapshot: bool,
+    auto_detected_snapshot: bool,
+) -> Dict[str, Any]:
+    provenance = dict(config_dict.get("provenance", {}) or {})
+    if getattr(args, "spectral_recording_snapshot", None):
+        source_kind = "spectral_recording_snapshot"
+        source_path = str(pathlib.Path(args.spectral_recording_snapshot).expanduser().resolve())
+        loader = "snapshot_adapter"
+    elif getattr(args, "spectrometer_config", None):
+        source_kind = "spectrometer_config"
+        source_path = str(pathlib.Path(args.spectrometer_config).expanduser().resolve())
+        loader = str(getattr(args, "config_loader", "legacy"))
+    else:
+        source_kind = "legacy_single_stream"
+        source_path = None
+        loader = "legacy_single_stream"
+    return {
+        "rawdata_path": str(pathlib.Path(rawdata_path).expanduser().resolve()),
+        "config_source_kind": source_kind,
+        "config_source_path": source_path,
+        "config_loader": loader,
+        "explicit": bool(explicit_spectrometer_config or explicit_snapshot),
+        "explicit_spectrometer_config": bool(explicit_spectrometer_config),
+        "explicit_spectral_recording_snapshot": bool(explicit_snapshot),
+        "auto_detected": bool(auto_detected_snapshot),
+        "beam_model_path": (
+            str(pathlib.Path(args.beam_model).expanduser().resolve())
+            if getattr(args, "beam_model", None)
+            else None
+        ),
+        "allow_beam_model_override": bool(getattr(args, "allow_beam_model_override", False)),
+        "converter_analysis_config": (
+            str(pathlib.Path(args.converter_analysis_config).expanduser().resolve())
+            if getattr(args, "converter_analysis_config", None)
+            else None
+        ),
+        "analysis_stream_selection": [
+            str(pathlib.Path(p).expanduser().resolve())
+            for p in list(getattr(args, "analysis_stream_selection", None) or [])
+        ],
+        "config_name": config_dict.get("config_name"),
+        "provenance": provenance,
+    }
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -3654,12 +3919,82 @@ def main(argv=None):
     rawbase = rawdata_path.name
     object_name = args.object if args.object else rawbase
 
+    if bool(getattr(args, "inspect_sidecars", False)):
+        print(json.dumps(_inspect_sidecars_json(rawdata_path), ensure_ascii=False, indent=2))
+        return
+
     site_info = _resolve_site_from_cli_or_rawdata(args, rawdata_path)
 
-    if args.spectrometer_config:
-        config_dict = load_spectrometer_config(args.spectrometer_config)
+    explicit_spectrometer_config = bool(args.spectrometer_config)
+    explicit_snapshot = bool(getattr(args, "spectral_recording_snapshot", None))
+    auto_detected_snapshot = False
+
+    if args.spectrometer_config and getattr(args, "spectral_recording_snapshot", None):
+        raise ValueError("--spectrometer-config and --spectral-recording-snapshot are mutually exclusive")
+
+    if (not _args_have_spectral_config(args)) and (not getattr(args, "spectral_recording_snapshot", None)):
+        auto_snapshot = _discover_default_spectral_recording_snapshot(rawdata_path)
+        if auto_snapshot is not None:
+            args.spectral_recording_snapshot = str(auto_snapshot)
+            auto_detected_snapshot = True
+            print(f"[info] using spectral_recording_snapshot sidecar: {auto_snapshot}")
+
+    if getattr(args, "beam_model", None) and not getattr(args, "spectral_recording_snapshot", None):
+        raise ValueError("--beam-model is only valid with --spectral-recording-snapshot")
+
+    if getattr(args, "spectral_recording_snapshot", None):
+        model = _load_config_separation_model_for_converter()
+        bundle = model.load_spectral_recording_snapshot_config_bundle(
+            pathlib.Path(args.spectral_recording_snapshot).expanduser().resolve(),
+            beam_model_path=(pathlib.Path(args.beam_model).expanduser().resolve() if getattr(args, "beam_model", None) else None),
+            allow_beam_model_override=bool(getattr(args, "allow_beam_model_override", False)),
+        )
+        config_dict = model.materialize_converter_config(bundle, sys.modules[__name__])
+        provenance = dict(config_dict.get("provenance", {}) or {})
+        provenance.setdefault("config_loader", "snapshot_adapter")
+        provenance.setdefault("config_source_format", getattr(bundle, "source_format", "spectral_recording_snapshot"))
+        provenance.setdefault("config_source_path", getattr(bundle, "source_path", str(args.spectral_recording_snapshot)))
+        config_dict["provenance"] = provenance
+    elif args.spectrometer_config:
+        if str(getattr(args, "config_loader", "legacy")).strip().lower() == "adapter":
+            config_dict = load_spectrometer_config_via_adapter(args.spectrometer_config)
+        else:
+            config_dict = load_spectrometer_config(args.spectrometer_config)
     else:
         config_dict = build_legacy_single_stream_config(args)
+
+    if getattr(args, "converter_analysis_config", None) is not None:
+        model = _load_config_separation_model_for_converter()
+        config_dict = model.apply_converter_analysis_config(
+            config_dict,
+            pathlib.Path(args.converter_analysis_config).expanduser().resolve(),
+        )
+    for selection_path in list(getattr(args, "analysis_stream_selection", None) or []):
+        model = _load_config_separation_model_for_converter()
+        config_dict = model.apply_analysis_stream_selection_config(
+            config_dict,
+            pathlib.Path(selection_path).expanduser().resolve(),
+        )
+
+    config_source_manifest = _config_source_manifest(
+        rawdata_path=rawdata_path,
+        config_dict=config_dict,
+        args=args,
+        explicit_spectrometer_config=explicit_spectrometer_config,
+        explicit_snapshot=explicit_snapshot,
+        auto_detected_snapshot=auto_detected_snapshot,
+    )
+    provenance = dict(config_dict.get("provenance", {}) or {})
+    provenance.update(
+        {
+            "config_source_kind": config_source_manifest["config_source_kind"],
+            "config_source_path": config_source_manifest["config_source_path"],
+            "config_source_auto_detected": config_source_manifest["auto_detected"],
+            "config_source_explicit": config_source_manifest["explicit"],
+            "config_loader": config_source_manifest["config_loader"],
+        }
+    )
+    config_dict["provenance"] = provenance
 
     global_cfg = _canonicalize_global_coordinate_settings(dict(config_dict.get("global", {}) or {}))
     config_dict["global"] = global_cfg
@@ -3723,10 +4058,15 @@ def main(argv=None):
     if layout in ("merged", "merged_time") and not _as_bool(global_cfg.get("time_sort", True), True):
         raise RuntimeError("merged/merged_time output_layout requires global.time_sort=true in v1_40")
     all_streams = list(config_dict["streams"])
-    streams = _select_streams_for_convert(all_streams, explicit_stream_names=getattr(args, "stream_names", None))
+    streams = _select_streams_for_convert(
+        all_streams,
+        explicit_stream_names=getattr(args, "stream_names", None),
+        explicit_window_ids=getattr(args, "window_ids", None),
+        explicit_recorded_stream_ids=getattr(args, "recorded_stream_ids", None),
+    )
     config_channel_slice_sources = _config_channel_slice_sources(streams, global_cfg)
     if not streams:
-        if getattr(args, "stream_names", None):
+        if getattr(args, "stream_names", None) or getattr(args, "recorded_stream_ids", None) or getattr(args, "window_ids", None):
             raise ValueError("no streams selected for conversion after applying --stream-name")
         raise ValueError("no streams selected for conversion; check enabled/use_for_convert flags or --stream-name")
     if (getattr(args, "vlsrk_kms_slice", None) is not None) and config_channel_slice_sources:
@@ -3738,11 +4078,18 @@ def main(argv=None):
     apply_restfreq_ghz_override(streams, getattr(args, "restfreq_ghz", None))
     apply_channel_slice_config(streams, global_cfg, cli_channel_slice=getattr(args, "channel_slice", None))
     skipped_stream_names = [str(stream.name) for stream in all_streams if str(stream.name) not in {str(s.name) for s in streams}]
-    if getattr(args, "stream_names", None):
-        print("[info] selected {} stream(s) by --stream-name: {}".format(len(streams), [str(s.name) for s in streams]))
+    if getattr(args, "stream_names", None) or getattr(args, "recorded_stream_ids", None) or getattr(args, "window_ids", None):
+        print("[info] selected {} stream(s) by explicit stream/window selector: {}".format(len(streams), [str(s.name) for s in streams]))
     elif skipped_stream_names:
         print("[info] selected {} stream(s) for conversion via enabled/use_for_convert flags; skipped {}".format(len(streams), skipped_stream_names))
     out_fits = _default_outfile(rawbase, config_dict, args)
+    if isinstance(out_fits, str):
+        out_fits = pathlib.Path(out_fits).expanduser().resolve()
+    else:
+        out_fits = pathlib.Path(out_fits).expanduser().resolve()
+    config_manifest_path = pathlib.Path(str(out_fits) + ".config_manifest.json")
+    config_source_manifest["output_fits"] = str(out_fits)
+    config_source_manifest["manifest_path"] = str(config_manifest_path)
 
     w_table_arg = str(getattr(args, "weather_table", "auto")).strip()
     encoder_table_resolved = _resolve_prefixed_table_name(db_namespace, telescope_name, runtime_naming.get("encoder_table"), runtime_naming.get("encoder_table_suffix"), "ctrl-antenna-encoder")
@@ -3854,8 +4201,14 @@ def main(argv=None):
     writer.add_history("note_detail", "Converted from NECST v4 RawData (multi-stream, beam-center Az/El, command/encoder separated)")
     writer.add_history("config_name", config_dict.get("config_name", ""))
     writer.add_history("backend_full", ",".join(sorted(set(str(s.backend).strip() for s in streams if _is_meaningful_str(s.backend)))))
+    writer.add_history("config_source_kind", str(config_source_manifest.get("config_source_kind")))
+    writer.add_history("config_source_path", str(config_source_manifest.get("config_source_path") or ""))
+    writer.add_history("config_source_auto", str(bool(config_source_manifest.get("auto_detected"))))
+    writer.add_history("config_source_explicit", str(bool(config_source_manifest.get("explicit"))))
+    writer.add_history("config_manifest", str(config_manifest_path))
     if args.spectrometer_config:
         writer.add_history("config_path", str(pathlib.Path(args.spectrometer_config).expanduser().resolve()))
+        writer.add_history("config_loader", str(getattr(args, "config_loader", "legacy")))
         if global_cfg.get("telescope") is not None:
             writer.add_history("config_global_telescope", str(global_cfg.get("telescope")))
         if global_cfg.get("db_namespace") is not None:
@@ -4077,8 +4430,13 @@ def main(argv=None):
             _pe_stats_update(pe_stats, row)
 
         writer.write(str(out_fits), overwrite=True)
+        config_manifest_path.write_text(
+            json.dumps(config_source_manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
         _print_pe_stats(pe_stats)
     print("Saved: {}".format(out_fits))
+    print("Saved config manifest: {}".format(config_manifest_path))
     if spectral_time_summaries:
         print("[info] spectral time basis summary:")
         for ent in spectral_time_summaries:
