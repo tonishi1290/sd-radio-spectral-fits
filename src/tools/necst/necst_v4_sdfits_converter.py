@@ -254,6 +254,20 @@ def _decode_timestamp_text(v):
     return s.strip().strip("\x00")
 
 
+_KNOWN_TIMESTAMP_SUFFIXES = ("UTC", "GPS", "TAI", "PC")
+
+
+def _split_timestamp_text_suffix(text):
+    s = _decode_timestamp_text(text)
+    if (not s) or (s.lower() == "nan"):
+        return s, None
+    s_up = s.upper()
+    for suf in _KNOWN_TIMESTAMP_SUFFIXES:
+        if s_up.endswith(suf):
+            return s[:-len(suf)], suf
+    return s, None
+
+
 def _find_first_nonempty_timestamp_text(values):
     arr = np.asarray(values, dtype=object)
     for v in arr:
@@ -264,52 +278,106 @@ def _find_first_nonempty_timestamp_text(values):
 
 
 def _extract_timestamp_suffix(text):
-    s = _decode_timestamp_text(text)
-    if (not s) or (s.lower() == "nan"):
-        return None
-    s_up = s.upper()
-    if s_up.endswith("UTC"):
-        return "UTC"
-    if s_up.endswith("GPS"):
-        return "GPS"
-    if s_up.endswith("TAI"):
-        return "TAI"
-    if s_up.endswith("PC"):
-        return "PC"
-    return None
+    _body, suffix = _split_timestamp_text_suffix(text)
+    return suffix
 
 
-def _gps_timestamp_texts_to_unix(values):
-    arr = np.asarray(values, dtype=object)
+def _gps_timestamp_bodies_to_unix(bodies):
     epoch = datetime(1980, 1, 6, 0, 0, 0)
     gps_seconds = []
-    for v in arr:
-        s = _decode_timestamp_text(v)
-        if (not s) or (s.lower() == "nan") or (len(s) < 3):
-            raise ValueError(f"invalid GPS timestamp: {v!r}")
-        body = s[:-3]
-        dt = datetime.strptime(body, "%Y-%m-%dT%H:%M:%S.%f")
+    for body in bodies:
+        if (not body) or str(body).lower() == "nan":
+            raise ValueError(f"invalid GPS timestamp body: {body!r}")
+        dt = datetime.strptime(str(body), "%Y-%m-%dT%H:%M:%S.%f")
         gps_seconds.append((dt - epoch).total_seconds())
     return np.asarray(Time(np.asarray(gps_seconds, dtype=float), format="gps").utc.unix, dtype=float)
 
 
-def _timestamp_texts_to_unix(values, suffix):
+def _gps_timestamp_texts_to_unix(values):
     arr = np.asarray(values, dtype=object)
-    suf = str(suffix).strip().upper()
-    texts = [_decode_timestamp_text(v) for v in arr]
-    if suf == "UTC":
-        bodies = [s[:-3] for s in texts]
+    bodies = []
+    for v in arr:
+        body, _suffix = _split_timestamp_text_suffix(v)
+        if (not body) or str(body).lower() == "nan":
+            raise ValueError(f"invalid GPS timestamp: {v!r}")
+        bodies.append(body)
+    return _gps_timestamp_bodies_to_unix(bodies)
+
+
+def _timestamp_texts_to_unix(values, suffix):
+    """
+    Convert XFFTS timestamp text to Unix UTC seconds.
+
+    `suffix` is the interpretation scale applied to the timestamp body, not
+    necessarily the literal suffix written by XFFTS.  This is important for
+    IRIG-B commissioning: the payload may be UTC even if the XFFTS string suffix
+    says GPS.
+    """
+    arr = np.asarray(values, dtype=object)
+    scale = str(suffix).strip().upper()
+    if scale not in ("UTC", "GPS", "TAI"):
+        raise ValueError(f"unsupported timestamp scale: {suffix!r}")
+    bodies = []
+    for v in arr:
+        body, _literal_suffix = _split_timestamp_text_suffix(v)
+        if (not body) or str(body).lower() == "nan":
+            raise ValueError(f"invalid timestamp: {v!r}")
+        bodies.append(body)
+    if scale == "UTC":
         return np.asarray(Time(bodies, format="isot", scale="utc").unix, dtype=float)
-    if suf == "TAI":
-        bodies = [s[:-3] for s in texts]
+    if scale == "TAI":
         return np.asarray(Time(bodies, format="isot", scale="tai").utc.unix, dtype=float)
-    if suf == "GPS":
-        return _gps_timestamp_texts_to_unix(texts)
-    raise ValueError(f"unsupported timestamp suffix: {suffix!r}")
+    if scale == "GPS":
+        return _gps_timestamp_bodies_to_unix(bodies)
+    raise ValueError(f"unsupported timestamp scale: {suffix!r}")
 
 
-def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("time", "t", "unix_time", "unixtime")):
+def _normalize_spectral_time_source(value):
+    s = str(value if value is not None else "auto").strip().lower().replace("_", "-")
+    aliases = {
+        "auto": "auto",
+        "host": "host-time",
+        "host-time": "host-time",
+        "hosttime": "host-time",
+        "numeric": "host-time",
+        "numeric-time": "host-time",
+        "time": "host-time",
+        "xffts": "xffts-timestamp",
+        "xffts-timestamp": "xffts-timestamp",
+        "timestamp": "xffts-timestamp",
+        "spectrometer": "xffts-timestamp",
+        "spectrometer-timestamp": "xffts-timestamp",
+    }
+    if s not in aliases:
+        raise ValueError("unsupported spectral time source {!r}; choose auto, host-time, or xffts-timestamp".format(value))
+    return aliases[s]
+
+
+def _normalize_xffts_timestamp_scale(value):
+    s = str(value if value is not None else "auto").strip().lower().replace("_", "-")
+    aliases = {
+        "auto": "auto",
+        "suffix": "auto",
+        "from-suffix": "auto",
+        "utc": "UTC",
+        "gps": "GPS",
+        "tai": "TAI",
+    }
+    if s not in aliases:
+        raise ValueError("unsupported XFFTS timestamp scale {!r}; choose auto, utc, gps, or tai".format(value))
+    return aliases[s]
+
+
+def _select_spectral_time_from_structured(
+    arr,
+    *,
+    numeric_fallback_candidates=("time", "t", "unix_time", "unixtime"),
+    spectral_time_source="auto",
+    xffts_timestamp_scale="auto",
+):
     names = list(arr.dtype.names or [])
+    source = _normalize_spectral_time_source(spectral_time_source)
+    scale_request = _normalize_xffts_timestamp_scale(xffts_timestamp_scale)
     timestamp_field = _pick_field_name(names, None, ["timestamp", "time_spectrometer"])
     fallback_field = _pick_field_name(names, None, list(numeric_fallback_candidates))
 
@@ -320,35 +388,75 @@ def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("
         "suffix": None,
         "first_timestamp_text": None,
         "reason": None,
+        "spectral_time_source": source,
+        "xffts_timestamp_scale_request": scale_request,
+        "timestamp_scale_used": None,
+        "timestamp_scale_forced": False,
     }
 
+    if source == "host-time":
+        if fallback_field is None:
+            raise RuntimeError(
+                "spectral_time_source=host-time requested but no usable numeric fallback field is available; "
+                f"available={names}"
+            )
+        t_spec = np.asarray(arr[fallback_field], dtype=float)
+        time_meta["applied"] = fallback_field
+        time_meta["reason"] = "spectral_time_source=host-time requested; using numeric host receive time"
+        return t_spec, time_meta
+
+    timestamp_error = None
     if timestamp_field is not None:
         first_text = _find_first_nonempty_timestamp_text(arr[timestamp_field])
         time_meta["first_timestamp_text"] = first_text
-        suffix = _extract_timestamp_suffix(first_text)
-        time_meta["suffix"] = suffix
-        if suffix in ("UTC", "GPS", "TAI"):
-            try:
-                t_spec = _timestamp_texts_to_unix(arr[timestamp_field], suffix)
-                if np.all(np.isfinite(t_spec)):
-                    time_meta["applied"] = f"{timestamp_field}:{suffix}->unix"
-                    time_meta["reason"] = "timestamp suffix accepted"
-                    return np.asarray(t_spec, dtype=float), time_meta
-                time_meta["reason"] = f"non-finite values after {suffix} conversion"
-            except Exception as e:
-                time_meta["reason"] = f"{suffix} conversion failed: {e}"
-        elif suffix == "PC":
-            time_meta["reason"] = "timestamp suffix is PC; falling back to numeric time"
-        elif first_text is None:
-            time_meta["reason"] = "timestamp field is empty/NaN; falling back to numeric time"
+        literal_suffix = _extract_timestamp_suffix(first_text)
+        time_meta["suffix"] = literal_suffix
+
+        if scale_request in ("UTC", "GPS", "TAI"):
+            scale_to_use = scale_request
+            time_meta["timestamp_scale_forced"] = True
+        elif literal_suffix in ("UTC", "GPS", "TAI"):
+            scale_to_use = literal_suffix
         else:
-            time_meta["reason"] = f"unknown timestamp suffix in {first_text!r}; falling back to numeric time"
+            scale_to_use = None
+
+        if scale_to_use in ("UTC", "GPS", "TAI"):
+            try:
+                t_spec = _timestamp_texts_to_unix(arr[timestamp_field], scale_to_use)
+                if np.all(np.isfinite(t_spec)):
+                    time_meta["applied"] = f"{timestamp_field}:{scale_to_use}->unix"
+                    time_meta["timestamp_scale_used"] = scale_to_use
+                    if time_meta["timestamp_scale_forced"]:
+                        time_meta["reason"] = (
+                            "timestamp scale forced by --xffts-timestamp-scale; "
+                            f"literal_suffix={literal_suffix!r}"
+                        )
+                    else:
+                        time_meta["reason"] = "timestamp suffix accepted"
+                    return np.asarray(t_spec, dtype=float), time_meta
+                timestamp_error = f"non-finite values after {scale_to_use} conversion"
+            except Exception as e:
+                timestamp_error = f"{scale_to_use} conversion failed: {e}"
+        elif literal_suffix == "PC":
+            timestamp_error = "timestamp suffix is PC"
+        elif first_text is None:
+            timestamp_error = "timestamp field is empty/NaN"
+        else:
+            timestamp_error = f"unknown timestamp suffix in {first_text!r}"
+        time_meta["reason"] = timestamp_error + "; falling back to numeric time"
+
+    if source == "xffts-timestamp":
+        raise RuntimeError(
+            "spectral_time_source=xffts-timestamp requested but XFFTS timestamp could not be used; "
+            f"timestamp_field={timestamp_field} literal_suffix={time_meta['suffix']} "
+            f"scale_request={scale_request} reason={timestamp_error} available={names}"
+        )
 
     if fallback_field is not None:
         t_spec = np.asarray(arr[fallback_field], dtype=float)
         time_meta["applied"] = fallback_field
         if time_meta["reason"] is None:
-            time_meta["reason"] = "timestamp field unavailable; using numeric time"
+            time_meta["reason"] = "timestamp field unavailable; using numeric host receive time"
         return t_spec, time_meta
 
     if timestamp_field is not None:
@@ -358,6 +466,124 @@ def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("
         )
 
     raise RuntimeError("no usable spectral time field. available={}".format(names))
+
+
+def _finite_summary(values):
+    arr = np.asarray(values, dtype=float)
+    m = np.isfinite(arr)
+    if int(np.count_nonzero(m)) == 0:
+        return {
+            "count": int(arr.size),
+            "finite": 0,
+            "median": None,
+            "min": None,
+            "max": None,
+            "p16": None,
+            "p84": None,
+        }
+    vv = arr[m]
+    return {
+        "count": int(arr.size),
+        "finite": int(vv.size),
+        "median": float(np.nanmedian(vv)),
+        "min": float(np.nanmin(vv)),
+        "max": float(np.nanmax(vv)),
+        "p16": float(np.nanpercentile(vv, 16.0)),
+        "p84": float(np.nanpercentile(vv, 84.0)),
+    }
+
+
+def _spectral_time_diagnostics_from_structured(
+    arr,
+    *,
+    max_rows=1000,
+    spectral_time_source="auto",
+    xffts_timestamp_scale="auto",
+):
+    names = list(arr.dtype.names or [])
+    timestamp_field = _pick_field_name(names, None, ["timestamp", "time_spectrometer"])
+    host_field = _pick_field_name(names, None, ["time", "t", "unix_time", "unixtime"])
+    recorded_field = _pick_field_name(names, None, ["recorded_time", "record_time", "write_time"])
+
+    nrow_total = int(len(arr))
+    nrow = int(max(0, min(int(max_rows), nrow_total)))
+    arr0 = arr[:nrow]
+
+    out = {
+        "nrow_total": nrow_total,
+        "nrow_sampled": nrow,
+        "fields": {
+            "timestamp": timestamp_field,
+            "host_time": host_field,
+            "recorded_time": recorded_field,
+        },
+        "timestamp": {
+            "first_values": [],
+            "first_suffix": None,
+        },
+        "selected": {},
+        "comparisons": {},
+        "warnings": [],
+    }
+
+    if timestamp_field is not None and nrow > 0:
+        vals = [_decode_timestamp_text(v) for v in np.asarray(arr0[timestamp_field], dtype=object)[:5]]
+        out["timestamp"]["first_values"] = vals
+        out["timestamp"]["first_suffix"] = _extract_timestamp_suffix(vals[0] if vals else None)
+
+    host = None
+    if host_field is not None and nrow > 0:
+        try:
+            host = np.asarray(arr0[host_field], dtype=float)
+            out["comparisons"]["host_time"] = _finite_summary(host)
+        except Exception as e:
+            out["warnings"].append(f"cannot read host time field {host_field!r}: {e}")
+            host = None
+    else:
+        out["warnings"].append("no numeric host receive time field found")
+
+    recorded = None
+    if recorded_field is not None and nrow > 0:
+        try:
+            recorded = np.asarray(arr0[recorded_field], dtype=float)
+            out["comparisons"]["recorded_time"] = _finite_summary(recorded)
+            if host is not None:
+                out["comparisons"]["recorded_minus_host_sec"] = _finite_summary(recorded - host)
+        except Exception as e:
+            out["warnings"].append(f"cannot read recorded_time field {recorded_field!r}: {e}")
+            recorded = None
+
+    if timestamp_field is not None and nrow > 0:
+        for scale in ("UTC", "GPS", "TAI"):
+            key = f"timestamp_as_{scale.lower()}"
+            try:
+                tt = _timestamp_texts_to_unix(arr0[timestamp_field], scale)
+                out["comparisons"][key] = _finite_summary(tt)
+                if host is not None:
+                    out["comparisons"][f"{key}_minus_host_sec"] = _finite_summary(tt - host)
+                if recorded is not None:
+                    out["comparisons"][f"recorded_minus_{key}_sec"] = _finite_summary(recorded - tt)
+            except Exception as e:
+                out["comparisons"][key] = {"error": str(e)}
+    else:
+        out["warnings"].append("no XFFTS timestamp/time_spectrometer field found")
+
+    try:
+        selected, meta = _select_spectral_time_from_structured(
+            arr0,
+            spectral_time_source=spectral_time_source,
+            xffts_timestamp_scale=xffts_timestamp_scale,
+        )
+        out["selected"]["meta"] = meta
+        out["selected"]["time_summary"] = _finite_summary(selected)
+        if host is not None:
+            out["selected"]["selected_minus_host_sec"] = _finite_summary(selected - host)
+        if recorded is not None:
+            out["selected"]["recorded_minus_selected_sec"] = _finite_summary(recorded - selected)
+    except Exception as e:
+        out["selected"]["error"] = str(e)
+
+    return out
 
 
 def _sanitize_for_filename(s, maxlen=80):
@@ -529,7 +755,14 @@ def _structured_to_dataframe(arr):
         d = {name: arr[name] for name in (arr.dtype.names or [])}
         return pd.DataFrame(d)
 
-def _extract_spectral_from_structured(arr, nchan, channel_slice_bounds=None):
+def _extract_spectral_from_structured(
+    arr,
+    nchan,
+    channel_slice_bounds=None,
+    *,
+    spectral_time_source="auto",
+    xffts_timestamp_scale="auto",
+):
     """
     spectral structured array から t_spec と spec2d を取り出す。
     - time basis is decided once from the first spectral timestamp row
@@ -544,7 +777,11 @@ def _extract_spectral_from_structured(arr, nchan, channel_slice_bounds=None):
     if s_field is None:
         raise RuntimeError("no spectrum-like field in spectral table. available={}".format(names))
 
-    t_spec, time_meta = _select_spectral_time_from_structured(arr)
+    t_spec, time_meta = _select_spectral_time_from_structured(
+        arr,
+        spectral_time_source=spectral_time_source,
+        xffts_timestamp_scale=xffts_timestamp_scale,
+    )
 
     slice_bounds = None
     if channel_slice_bounds is not None:
@@ -1201,6 +1438,8 @@ class CommonInputs:
     weather_inside_time_col: str
     weather_outside_table: str
     weather_outside_time_col: str
+    spectral_time_source: str = "auto"
+    xffts_timestamp_scale: str = "auto"
 
 
 @dataclass
@@ -2365,7 +2604,9 @@ def build_legacy_single_stream_config(args):
 def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
                           weather_inside_table, weather_inside_time_col,
                           weather_outside_table, weather_outside_time_col,
-                          encoder_table=None, altaz_table=None):
+                          encoder_table=None, altaz_table=None,
+                          spectral_time_source="auto",
+                          xffts_timestamp_scale="auto"):
     db = necstdb.opendb(str(rawdata_path))
     enc_table = _nonempty_str(encoder_table, default=_table_name(db_namespace, telescope, "ctrl", "antenna", "encoder"))
     alt_table = _nonempty_str(altaz_table, default=_table_name(db_namespace, telescope, "ctrl", "antenna", "altaz"))
@@ -2381,6 +2622,8 @@ def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
         weather_inside_time_col=str(weather_inside_time_col),
         weather_outside_table=str(weather_outside_table),
         weather_outside_time_col=str(weather_outside_time_col),
+        spectral_time_source=_normalize_spectral_time_source(spectral_time_source),
+        xffts_timestamp_scale=_normalize_xffts_timestamp_scale(xffts_timestamp_scale),
     )
 
 
@@ -2409,7 +2652,11 @@ def _extract_pos_labels_from_structured(arr_spec, nrow):
 def _compute_stream_vlsrk_channel_slice(common, site, db_namespace, telescope, stream, vlsrk_kms_slice_spec, interp_extrap, encoder_time_col, altaz_time_col, encoder_shift_sec, azel_correction_apply):
     spec_table_name = _resolve_spec_table_name(db_namespace, telescope, stream)
     arr_spec = _read_structured_array_tolerant(common.db, spec_table_name)
-    t_spec_unsorted, time_meta = _select_spectral_time_from_structured(arr_spec)
+    t_spec_unsorted, time_meta = _select_spectral_time_from_structured(
+        arr_spec,
+        spectral_time_source=getattr(common, "spectral_time_source", "auto"),
+        xffts_timestamp_scale=getattr(common, "xffts_timestamp_scale", "auto"),
+    )
     pos_str_unsorted, _ = _extract_pos_labels_from_structured(arr_spec, len(t_spec_unsorted))
     order = np.argsort(t_spec_unsorted)
     t_spec = np.asarray(t_spec_unsorted[order], dtype=float)
@@ -2493,7 +2740,11 @@ def extract_spectral_stream(common, db_namespace, telescope, stream, arr_spec=No
         arr_spec = _read_structured_array_tolerant(common.db, spec_table_name)
     raw_nchan = int(stream.wcs_full.nchan if stream.wcs_full is not None else stream.wcs.nchan)
     t_spec, spec2d, time_meta, s_field = _extract_spectral_from_structured(
-        arr_spec, nchan=raw_nchan, channel_slice_bounds=stream.channel_slice_bounds
+        arr_spec,
+        nchan=raw_nchan,
+        channel_slice_bounds=stream.channel_slice_bounds,
+        spectral_time_source=getattr(common, "spectral_time_source", "auto"),
+        xffts_timestamp_scale=getattr(common, "xffts_timestamp_scale", "auto"),
     )
     if int(spec2d.shape[1]) != int(stream.wcs.nchan):
         raise RuntimeError(
@@ -3498,6 +3749,46 @@ def _global_pe_summary(rows):
         print("  {:>3s}: N={}  PE_RMS0={:.2f} arcsec  PE_MAX0={:.2f} arcsec".format(mode, len(rr), rms0, max0))
 
 
+
+def _inspect_spectral_time_json(
+    common,
+    db_namespace,
+    telescope,
+    streams,
+    *,
+    max_rows=1000,
+    spectral_time_source="auto",
+    xffts_timestamp_scale="auto",
+):
+    result = {
+        "mode": "inspect_spectral_time",
+        "spectral_time_source": _normalize_spectral_time_source(spectral_time_source),
+        "xffts_timestamp_scale": _normalize_xffts_timestamp_scale(xffts_timestamp_scale),
+        "max_rows": int(max_rows),
+        "streams": [],
+    }
+    for stream in streams:
+        table_name = _resolve_spec_table_name(db_namespace, telescope, stream)
+        entry = {
+            "stream": str(stream.name),
+            "table": str(table_name),
+        }
+        try:
+            arr_spec = _read_structured_array_tolerant(common.db, table_name)
+            entry.update(
+                _spectral_time_diagnostics_from_structured(
+                    arr_spec,
+                    max_rows=int(max_rows),
+                    spectral_time_source=spectral_time_source,
+                    xffts_timestamp_scale=xffts_timestamp_scale,
+                )
+            )
+        except Exception as e:
+            entry["error"] = str(e)
+        result["streams"].append(entry)
+    return result
+
+
 # -----------------------------------------------------------------------------
 # 6) CLI / main
 # -----------------------------------------------------------------------------
@@ -3508,6 +3799,10 @@ def parse_args(argv):
     )
     p.add_argument("rawdata", help="RawData folder path (necstdb + nercst)")
     p.add_argument("--inspect-sidecars", action="store_true", help="Inspect DB-embedded spectral-recording sidecars and exit without converting.")
+    p.add_argument("--inspect-spectral-time", action="store_true", help="Inspect spectral time fields (time_spectrometer/timestamp, host time, recorded_time) and exit without converting.")
+    p.add_argument("--inspect-spectral-time-max-rows", type=int, default=1000, help="Maximum rows per stream sampled by --inspect-spectral-time.")
+    p.add_argument("--spectral-time-source", default="auto", choices=["auto", "host-time", "xffts-timestamp"], help="Time basis for spectral rows. auto uses UTC/GPS/TAI XFFTS timestamps when usable and falls back to host time for PC/unknown; host-time always uses numeric time; xffts-timestamp requires a usable timestamp.")
+    p.add_argument("--xffts-timestamp-scale", default="auto", choices=["auto", "utc", "gps", "tai"], help="Interpretation scale for XFFTS timestamp bodies. auto trusts the timestamp suffix; utc/gps/tai force that scale even if the literal suffix differs.")
     p.add_argument("--spectrometer-config", default=None, help="TOML file describing spectrometers / beams / LO / WCS")
     p.add_argument("--spectral-recording-snapshot", "--snapshot", default=None, help="Observation-time spectral_recording_snapshot.toml. When given, it supplies stream truth through the snapshot adapter and is mutually exclusive with --spectrometer-config.")
     p.add_argument("--beam-model", default=None, help="Optional analysis-time beam_model.toml override for --spectral-recording-snapshot. Requires --allow-beam-model-override.")
@@ -3902,6 +4197,8 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     args = parse_args(argv)
+    args.spectral_time_source = _normalize_spectral_time_source(getattr(args, "spectral_time_source", "auto"))
+    args.xffts_timestamp_scale = _normalize_xffts_timestamp_scale(getattr(args, "xffts_timestamp_scale", "auto"))
 
     for attr in ("encoder_time_col", "altaz_time_col", "weather_time_col", "weather_inside_time_col", "weather_outside_time_col"):
         cur = getattr(args, attr, None)
@@ -4090,6 +4387,8 @@ def main(argv=None):
     config_manifest_path = pathlib.Path(str(out_fits) + ".config_manifest.json")
     config_source_manifest["output_fits"] = str(out_fits)
     config_source_manifest["manifest_path"] = str(config_manifest_path)
+    config_source_manifest["spectral_time_source"] = str(getattr(args, "spectral_time_source", "auto"))
+    config_source_manifest["xffts_timestamp_scale"] = str(getattr(args, "xffts_timestamp_scale", "auto"))
 
     w_table_arg = str(getattr(args, "weather_table", "auto")).strip()
     encoder_table_resolved = _resolve_prefixed_table_name(db_namespace, telescope_name, runtime_naming.get("encoder_table"), runtime_naming.get("encoder_table_suffix"), "ctrl-antenna-encoder")
@@ -4150,7 +4449,27 @@ def main(argv=None):
         weather_outside_time_col=str(weather_outside_time_col),
         encoder_table=encoder_table_resolved,
         altaz_table=altaz_table_resolved,
+        spectral_time_source=str(getattr(args, "spectral_time_source", "auto")),
+        xffts_timestamp_scale=str(getattr(args, "xffts_timestamp_scale", "auto")),
     )
+
+    if bool(getattr(args, "inspect_spectral_time", False)):
+        print(
+            json.dumps(
+                _inspect_spectral_time_json(
+                    common=common,
+                    db_namespace=str(db_namespace),
+                    telescope=str(telescope_name),
+                    streams=streams,
+                    max_rows=int(getattr(args, "inspect_spectral_time_max_rows", 1000)),
+                    spectral_time_source=str(getattr(args, "spectral_time_source", "auto")),
+                    xffts_timestamp_scale=str(getattr(args, "xffts_timestamp_scale", "auto")),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
 
     site = Site(lat_deg=float(args.site_lat), lon_deg=float(args.site_lon), elev_m=float(args.site_elev))
 
@@ -4206,6 +4525,8 @@ def main(argv=None):
     writer.add_history("config_source_auto", str(bool(config_source_manifest.get("auto_detected"))))
     writer.add_history("config_source_explicit", str(bool(config_source_manifest.get("explicit"))))
     writer.add_history("config_manifest", str(config_manifest_path))
+    writer.add_history("spectral_time_source", str(getattr(args, "spectral_time_source", "auto")))
+    writer.add_history("xffts_timestamp_scale", str(getattr(args, "xffts_timestamp_scale", "auto")))
     if args.spectrometer_config:
         writer.add_history("config_path", str(pathlib.Path(args.spectrometer_config).expanduser().resolve()))
         writer.add_history("config_loader", str(getattr(args, "config_loader", "legacy")))
