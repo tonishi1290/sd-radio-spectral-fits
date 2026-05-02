@@ -679,6 +679,9 @@ def run_extract(
             ("altaz_table_suffix", "input", "altaz_table_suffix", str),
             ("encoder_time_col", "input", "encoder_time_col", str),
             ("altaz_time_col", "input", "altaz_time_col", str),
+            ("spectral_time_source", "input", "spectral_time_source", str),
+            ("xffts_timestamp_scale", "input", "xffts_timestamp_scale", str),
+            ("xffts_gps_suffix_means", "input", "xffts_gps_suffix_means", str),
             ("spectrometer_time_offset_sec", "input", "spectrometer_time_offset_sec", float),
             ("encoder_shift_sec", "input", "encoder_shift_sec", float),
             ("encoder_az_time_offset_sec", "input", "encoder_az_time_offset_sec", float),
@@ -1008,6 +1011,9 @@ def add_extract_arguments(ap: argparse.ArgumentParser) -> None:
     ap.add_argument("--azel-source", "--boresight-source", dest="azel_source", choices=["encoder", "altaz"], default="encoder", help="Raw Az/El source used to construct boresight before sunscan fitting")
     ap.add_argument("--azel-correction-apply", "--boresight-correction-apply", dest="azel_correction_apply", choices=["none", "subtract", "add"], default=None, help="How to combine raw boresight Az/El with dlon/dlat when constructing corrected boresight")
     ap.add_argument("--altaz-apply", choices=["none", "minus", "plus"], default=None, help="Legacy alias for --azel-correction-apply")
+    ap.add_argument("--spectral-time-source", default="auto", choices=["auto", "host-time", "xffts-timestamp"], help="Time basis for spectral rows. Same meaning as converter.")
+    ap.add_argument("--xffts-timestamp-scale", default="auto", choices=["auto", "utc", "gps", "tai"], help="Interpretation scale for XFFTS timestamp bodies.")
+    ap.add_argument("--xffts-gps-suffix-means", default="utc", choices=["utc", "gps"], help="When scale=auto and literal suffix is GPS, interpret the body as this scale. OMU IRIG-B default is utc.")
     ap.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0)
     ap.add_argument("--encoder-shift-sec", type=float, default=0.0)
     ap.add_argument("--encoder-az-time-offset-sec", type=float, default=0.0)
@@ -1155,6 +1161,9 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
     cfg.input.altaz_table_suffix = _choose_optional_str_setting(args, argv, "--altaz-table-suffix", "altaz_table_suffix", global_cfg, "altaz_table_suffix", "ctrl-antenna-altaz") or "ctrl-antenna-altaz"
     cfg.input.encoder_time_col = _choose_str_setting(args, argv, "--encoder-time-col", "encoder_time_col", global_cfg, "encoder_time_col", "time")
     cfg.input.altaz_time_col = _choose_str_setting(args, argv, "--altaz-time-col", "altaz_time_col", global_cfg, "altaz_time_col", "time")
+    cfg.input.spectral_time_source = _choose_str_setting(args, argv, "--spectral-time-source", "spectral_time_source", global_cfg, "spectral_time_source", "auto")
+    cfg.input.xffts_timestamp_scale = _choose_str_setting(args, argv, "--xffts-timestamp-scale", "xffts_timestamp_scale", global_cfg, "xffts_timestamp_scale", "auto")
+    cfg.input.xffts_gps_suffix_means = _choose_str_setting(args, argv, "--xffts-gps-suffix-means", "xffts_gps_suffix_means", global_cfg, "xffts_gps_suffix_means", "utc")
     cfg.input.spectrometer_time_offset_sec = _choose_float_setting(args, argv, "--spectrometer-time-offset-sec", "spectrometer_time_offset_sec", global_cfg, "spectrometer_time_offset_sec", 0.0)
     cfg.input.encoder_shift_sec = _choose_float_setting(args, argv, "--encoder-shift-sec", "encoder_shift_sec", global_cfg, "encoder_shift_sec", 0.0)
     cfg.input.encoder_az_time_offset_sec = _choose_float_setting(args, argv, "--encoder-az-time-offset-sec", "encoder_az_time_offset_sec", global_cfg, "encoder_az_time_offset_sec", 0.0)

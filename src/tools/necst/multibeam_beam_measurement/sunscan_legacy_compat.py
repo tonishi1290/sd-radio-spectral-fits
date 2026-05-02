@@ -116,37 +116,115 @@ def _extract_timestamp_suffix(text):
     return None
 
 
-def _gps_timestamp_texts_to_unix(values):
-    arr = np.asarray(values, dtype=object)
+def _split_timestamp_text_suffix(text):
+    s = _decode_timestamp_text(text)
+    if (not s) or (s.lower() == "nan"):
+        return s, None
+    s_up = s.upper()
+    for suf in ("UTC", "GPS", "TAI", "PC"):
+        if s_up.endswith(suf):
+            return s[:-len(suf)], suf
+    return s, None
+
+
+def _gps_timestamp_bodies_to_unix(bodies):
     epoch = datetime(1980, 1, 6, 0, 0, 0)
     gps_seconds = []
-    for v in arr:
-        s = _decode_timestamp_text(v)
-        if (not s) or (s.lower() == "nan") or (len(s) < 3):
-            raise ValueError(f"invalid GPS timestamp: {v!r}")
-        body = s[:-3]
-        dt = datetime.strptime(body, "%Y-%m-%dT%H:%M:%S.%f")
+    for body in bodies:
+        if (not body) or str(body).lower() == "nan":
+            raise ValueError(f"invalid GPS timestamp body: {body!r}")
+        dt = datetime.strptime(str(body), "%Y-%m-%dT%H:%M:%S.%f")
         gps_seconds.append((dt - epoch).total_seconds())
     return np.asarray(Time(np.asarray(gps_seconds, dtype=float), format="gps").utc.unix, dtype=float)
 
 
+def _gps_timestamp_texts_to_unix(values):
+    arr = np.asarray(values, dtype=object)
+    bodies = []
+    for v in arr:
+        body, _suffix = _split_timestamp_text_suffix(v)
+        if (not body) or str(body).lower() == "nan":
+            raise ValueError(f"invalid GPS timestamp: {v!r}")
+        bodies.append(body)
+    return _gps_timestamp_bodies_to_unix(bodies)
+
+
 def _timestamp_texts_to_unix(values, suffix):
     arr = np.asarray(values, dtype=object)
-    suf = str(suffix).strip().upper()
-    texts = [_decode_timestamp_text(v) for v in arr]
-    if suf == "UTC":
-        bodies = [s[:-3] for s in texts]
+    scale = str(suffix).strip().upper()
+    bodies = []
+    for v in arr:
+        body, _literal_suffix = _split_timestamp_text_suffix(v)
+        if (not body) or str(body).lower() == "nan":
+            raise ValueError(f"invalid timestamp: {v!r}")
+        bodies.append(body)
+    if scale == "UTC":
         return np.asarray(Time(bodies, format="isot", scale="utc").unix, dtype=float)
-    if suf == "TAI":
-        bodies = [s[:-3] for s in texts]
+    if scale == "TAI":
         return np.asarray(Time(bodies, format="isot", scale="tai").utc.unix, dtype=float)
-    if suf == "GPS":
-        return _gps_timestamp_texts_to_unix(texts)
-    raise ValueError(f"unsupported timestamp suffix: {suffix!r}")
+    if scale == "GPS":
+        return _gps_timestamp_bodies_to_unix(bodies)
+    raise ValueError(f"unsupported timestamp scale: {suffix!r}")
 
 
-def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("time", "t", "unix_time", "unixtime")):
+def _normalize_spectral_time_source(value):
+    s = str(value if value is not None else "auto").strip().lower().replace("_", "-")
+    aliases = {
+        "auto": "auto",
+        "host": "host-time",
+        "host-time": "host-time",
+        "hosttime": "host-time",
+        "numeric": "host-time",
+        "numeric-time": "host-time",
+        "time": "host-time",
+        "xffts": "xffts-timestamp",
+        "xffts-timestamp": "xffts-timestamp",
+        "timestamp": "xffts-timestamp",
+        "spectrometer": "xffts-timestamp",
+        "spectrometer-timestamp": "xffts-timestamp",
+    }
+    if s not in aliases:
+        raise ValueError(f"unsupported spectral time source {value!r}; choose auto, host-time, or xffts-timestamp")
+    return aliases[s]
+
+
+def _normalize_xffts_timestamp_scale(value):
+    s = str(value if value is not None else "auto").strip().lower().replace("_", "-")
+    aliases = {
+        "auto": "auto",
+        "suffix": "auto",
+        "from-suffix": "auto",
+        "utc": "UTC",
+        "gps": "GPS",
+        "tai": "TAI",
+    }
+    if s not in aliases:
+        raise ValueError(f"unsupported XFFTS timestamp scale {value!r}; choose auto, utc, gps, or tai")
+    return aliases[s]
+
+
+def _normalize_xffts_gps_suffix_means(value):
+    s = str(value if value is not None else "utc").strip().lower().replace("_", "-")
+    aliases = {"utc": "UTC", "gps": "GPS"}
+    if s not in aliases:
+        raise ValueError(f"unsupported XFFTS GPS-suffix policy {value!r}; choose utc or gps")
+    return aliases[s]
+
+
+def _select_spectral_time_from_structured(
+    arr,
+    *,
+    numeric_fallback_candidates=("time", "t", "unix_time", "unixtime"),
+    spectral_time_source="auto",
+    xffts_timestamp_scale="auto",
+    xffts_gps_suffix_means="utc",
+    spectrometer_time_offset_sec=0.0,
+):
     names = list(arr.dtype.names or [])
+    source = _normalize_spectral_time_source(spectral_time_source)
+    scale_request = _normalize_xffts_timestamp_scale(xffts_timestamp_scale)
+    gps_suffix_means = _normalize_xffts_gps_suffix_means(xffts_gps_suffix_means)
+    spec_offset = float(spectrometer_time_offset_sec or 0.0)
     timestamp_field = None
     for k in ("timestamp", "time_spectrometer"):
         if k in names:
@@ -164,35 +242,88 @@ def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("
         "timestamp_field": timestamp_field,
         "fallback_field": fallback_field,
         "suffix": None,
+        "literal_suffix": None,
         "first_timestamp_text": None,
         "reason": None,
+        "spectral_time_source": source,
+        "xffts_timestamp_scale_request": scale_request,
+        "xffts_gps_suffix_means": gps_suffix_means,
+        "timestamp_scale_used": None,
+        "timestamp_scale_forced": False,
+        "timestamp_reference": "center",
+        "spectrometer_time_offset_sec": spec_offset,
+        "spectrometer_time_offset_applied": False,
+        "selected_time_source": None,
     }
 
+    if source == "host-time":
+        if fallback_field is None:
+            raise RuntimeError(f"spectral_time_source=host-time requested but no usable numeric fallback field is available; available={names}")
+        t_spec = np.asarray(arr[fallback_field], dtype=float)
+        if spec_offset != 0.0:
+            t_spec = t_spec + spec_offset
+            time_meta["spectrometer_time_offset_applied"] = True
+        time_meta["applied"] = fallback_field
+        time_meta["selected_time_source"] = "host-time"
+        time_meta["reason"] = "spectral_time_source=host-time requested; using numeric host receive time"
+        return t_spec, time_meta
+
+    timestamp_error = None
     if timestamp_field is not None:
         first_text = _find_first_nonempty_timestamp_text(arr[timestamp_field])
         time_meta["first_timestamp_text"] = first_text
-        suffix = _extract_timestamp_suffix(first_text)
-        time_meta["suffix"] = suffix
-        if suffix in ("UTC", "GPS", "TAI"):
-            try:
-                t_spec = _timestamp_texts_to_unix(arr[timestamp_field], suffix)
-                if np.all(np.isfinite(t_spec)):
-                    time_meta["applied"] = f"{timestamp_field}:{suffix}->unix"
-                    time_meta["reason"] = "timestamp suffix accepted"
-                    return np.asarray(t_spec, dtype=float), time_meta
-                time_meta["reason"] = f"non-finite values after {suffix} conversion"
-            except Exception as e:
-                time_meta["reason"] = f"{suffix} conversion failed: {e}"
-        elif suffix == "PC":
-            time_meta["reason"] = "timestamp suffix is PC; falling back to numeric time"
-        elif first_text is None:
-            time_meta["reason"] = "timestamp field is empty/NaN; falling back to numeric time"
+        literal_suffix = _extract_timestamp_suffix(first_text)
+        time_meta["suffix"] = literal_suffix
+        time_meta["literal_suffix"] = literal_suffix
+        if scale_request in ("UTC", "GPS", "TAI"):
+            scale_to_use = scale_request
+            time_meta["timestamp_scale_forced"] = True
+        elif literal_suffix == "GPS":
+            scale_to_use = gps_suffix_means
+        elif literal_suffix in ("UTC", "TAI"):
+            scale_to_use = literal_suffix
         else:
-            time_meta["reason"] = f"unknown timestamp suffix in {first_text!r}; falling back to numeric time"
+            scale_to_use = None
+
+        if scale_to_use in ("UTC", "GPS", "TAI"):
+            try:
+                t_spec = _timestamp_texts_to_unix(arr[timestamp_field], scale_to_use)
+                if np.all(np.isfinite(t_spec)):
+                    time_meta["applied"] = f"{timestamp_field}:{scale_to_use}->unix"
+                    time_meta["timestamp_scale_used"] = scale_to_use
+                    time_meta["selected_time_source"] = "xffts-timestamp"
+                    if time_meta["timestamp_scale_forced"]:
+                        time_meta["reason"] = f"timestamp scale forced; literal_suffix={literal_suffix!r}"
+                    elif literal_suffix == "GPS" and scale_to_use != "GPS":
+                        time_meta["reason"] = f"GPS literal suffix interpreted as {scale_to_use} by xffts_gps_suffix_means={gps_suffix_means}"
+                    else:
+                        time_meta["reason"] = "timestamp suffix accepted"
+                    return np.asarray(t_spec, dtype=float), time_meta
+                timestamp_error = f"non-finite values after {scale_to_use} conversion"
+            except Exception as e:
+                timestamp_error = f"{scale_to_use} conversion failed: {e}"
+        elif literal_suffix == "PC":
+            timestamp_error = "timestamp suffix is PC"
+        elif first_text is None:
+            timestamp_error = "timestamp field is empty/NaN"
+        else:
+            timestamp_error = f"unknown timestamp suffix in {first_text!r}"
+        time_meta["reason"] = timestamp_error + "; falling back to numeric time"
+
+    if source == "xffts-timestamp":
+        raise RuntimeError(
+            "spectral_time_source=xffts-timestamp requested but XFFTS timestamp could not be used; "
+            f"timestamp_field={timestamp_field} literal_suffix={time_meta['suffix']} "
+            f"scale_request={scale_request} reason={timestamp_error} available={names}"
+        )
 
     if fallback_field is not None:
         t_spec = np.asarray(arr[fallback_field], dtype=float)
+        if spec_offset != 0.0:
+            t_spec = t_spec + spec_offset
+            time_meta["spectrometer_time_offset_applied"] = True
         time_meta["applied"] = fallback_field
+        time_meta["selected_time_source"] = "host-time"
         if time_meta["reason"] is None:
             time_meta["reason"] = "timestamp field unavailable; using numeric time"
         return t_spec, time_meta
@@ -203,8 +334,7 @@ def _select_spectral_time_from_structured(arr, *, numeric_fallback_candidates=("
             f"timestamp_field={timestamp_field} available={names} reason={time_meta['reason']}"
         )
 
-    raise RuntimeError("no usable spectral time field. available={}".format(names))
-
+    raise RuntimeError(f"no usable spectral time field. available={names}")
 
 TELESCOPE = "OMU1P85M"
 TEL_LOADDATA = "OMU1p85m"
@@ -475,7 +605,14 @@ def _read_structured_array_tolerant(db, table_name: str):
             raise RuntimeError(f"tolerant frombuffer failed for table {table_name}: {e2} (orig: {msg})")
 
 
-def _extract_spectral_from_structured(arr):
+def _extract_spectral_from_structured(
+    arr,
+    *,
+    spectral_time_source: str = "auto",
+    xffts_timestamp_scale: str = "auto",
+    xffts_gps_suffix_means: str = "utc",
+    spectrometer_time_offset_sec: float = 0.0,
+):
     names = list(arr.dtype.names or [])
     s_field = None
     for k in ("data", "spectrum", "spec"):
@@ -485,7 +622,13 @@ def _extract_spectral_from_structured(arr):
     if s_field is None:
         raise RuntimeError(f"no spectrum-like field in spectral table. available={names}")
 
-    t_spec, time_meta = _select_spectral_time_from_structured(arr)
+    t_spec, time_meta = _select_spectral_time_from_structured(
+        arr,
+        spectral_time_source=spectral_time_source,
+        xffts_timestamp_scale=xffts_timestamp_scale,
+        xffts_gps_suffix_means=xffts_gps_suffix_means,
+        spectrometer_time_offset_sec=spectrometer_time_offset_sec,
+    )
     spec = np.asarray(arr[s_field])
     if spec.ndim == 1 and spec.dtype == object:
         spec2d = np.stack(spec, axis=0).astype(np.float32, copy=False)
@@ -1756,10 +1899,20 @@ def load_spectral(
     *,
     telescope: str = TELESCOPE,
     db_namespace: str = DEFAULT_DB_NAMESPACE,
+    spectral_time_source: str = "auto",
+    xffts_timestamp_scale: str = "auto",
+    xffts_gps_suffix_means: str = "utc",
+    spectrometer_time_offset_sec: float = 0.0,
 ):
     spec_table_name = f"{str(db_namespace)}-{str(telescope)}-data-spectral-{spectral_name}"
     arr_spec = _read_structured_array_tolerant(db, spec_table_name)
-    t_spec, spec2d, time_meta, _s_field = _extract_spectral_from_structured(arr_spec)
+    t_spec, spec2d, time_meta, _s_field = _extract_spectral_from_structured(
+        arr_spec,
+        spectral_time_source=spectral_time_source,
+        xffts_timestamp_scale=xffts_timestamp_scale,
+        xffts_gps_suffix_means=xffts_gps_suffix_means,
+        spectrometer_time_offset_sec=spectrometer_time_offset_sec,
+    )
     tp1 = integ_all_channels(spec2d)
     o = np.argsort(t_spec)
     return arr_spec, t_spec[o], tp1[o], o, time_meta
@@ -3007,6 +3160,9 @@ def build_dataframe(
     encoder_time_col: str = "time",
     altaz_time_col: str = "time",
     spectrometer_time_offset_sec: float = 0.0,
+    spectral_time_source: str = "auto",
+    xffts_timestamp_scale: str = "auto",
+    xffts_gps_suffix_means: str = "utc",
     encoder_shift_sec: float = 0.0,
     encoder_az_time_offset_sec: float = 0.0,
     encoder_el_time_offset_sec: float = 0.0,
@@ -3042,8 +3198,12 @@ def build_dataframe(
         spectral_name,
         telescope=telescope,
         db_namespace=db_namespace,
+        spectral_time_source=spectral_time_source,
+        xffts_timestamp_scale=xffts_timestamp_scale,
+        xffts_gps_suffix_means=xffts_gps_suffix_means,
+        spectrometer_time_offset_sec=spectrometer_time_offset_sec,
     )
-    t_spec = np.asarray(t_spec, dtype=float) + float(spectrometer_time_offset_sec)
+    t_spec = np.asarray(t_spec, dtype=float)
 
     names_spec = list(arr_spec.dtype.names or [])
     id_valid = False

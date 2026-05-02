@@ -368,16 +368,31 @@ def _normalize_xffts_timestamp_scale(value):
     return aliases[s]
 
 
+def _normalize_xffts_gps_suffix_means(value):
+    s = str(value if value is not None else "utc").strip().lower().replace("_", "-")
+    aliases = {
+        "utc": "UTC",
+        "gps": "GPS",
+    }
+    if s not in aliases:
+        raise ValueError("unsupported XFFTS GPS-suffix policy {!r}; choose utc or gps".format(value))
+    return aliases[s]
+
+
 def _select_spectral_time_from_structured(
     arr,
     *,
     numeric_fallback_candidates=("time", "t", "unix_time", "unixtime"),
     spectral_time_source="auto",
     xffts_timestamp_scale="auto",
+    xffts_gps_suffix_means="utc",
+    spectrometer_time_offset_sec=0.0,
 ):
     names = list(arr.dtype.names or [])
     source = _normalize_spectral_time_source(spectral_time_source)
     scale_request = _normalize_xffts_timestamp_scale(xffts_timestamp_scale)
+    gps_suffix_means = _normalize_xffts_gps_suffix_means(xffts_gps_suffix_means)
+    spec_offset = float(spectrometer_time_offset_sec or 0.0)
     timestamp_field = _pick_field_name(names, None, ["timestamp", "time_spectrometer"])
     fallback_field = _pick_field_name(names, None, list(numeric_fallback_candidates))
 
@@ -386,12 +401,18 @@ def _select_spectral_time_from_structured(
         "timestamp_field": timestamp_field,
         "fallback_field": fallback_field,
         "suffix": None,
+        "literal_suffix": None,
         "first_timestamp_text": None,
         "reason": None,
         "spectral_time_source": source,
         "xffts_timestamp_scale_request": scale_request,
+        "xffts_gps_suffix_means": gps_suffix_means,
         "timestamp_scale_used": None,
         "timestamp_scale_forced": False,
+        "timestamp_reference": "center",
+        "spectrometer_time_offset_sec": spec_offset,
+        "spectrometer_time_offset_applied": False,
+        "selected_time_source": None,
     }
 
     if source == "host-time":
@@ -401,7 +422,11 @@ def _select_spectral_time_from_structured(
                 f"available={names}"
             )
         t_spec = np.asarray(arr[fallback_field], dtype=float)
+        if spec_offset != 0.0:
+            t_spec = t_spec + spec_offset
+            time_meta["spectrometer_time_offset_applied"] = True
         time_meta["applied"] = fallback_field
+        time_meta["selected_time_source"] = "host-time"
         time_meta["reason"] = "spectral_time_source=host-time requested; using numeric host receive time"
         return t_spec, time_meta
 
@@ -411,11 +436,14 @@ def _select_spectral_time_from_structured(
         time_meta["first_timestamp_text"] = first_text
         literal_suffix = _extract_timestamp_suffix(first_text)
         time_meta["suffix"] = literal_suffix
+        time_meta["literal_suffix"] = literal_suffix
 
         if scale_request in ("UTC", "GPS", "TAI"):
             scale_to_use = scale_request
             time_meta["timestamp_scale_forced"] = True
-        elif literal_suffix in ("UTC", "GPS", "TAI"):
+        elif literal_suffix == "GPS":
+            scale_to_use = gps_suffix_means
+        elif literal_suffix in ("UTC", "TAI"):
             scale_to_use = literal_suffix
         else:
             scale_to_use = None
@@ -426,10 +454,16 @@ def _select_spectral_time_from_structured(
                 if np.all(np.isfinite(t_spec)):
                     time_meta["applied"] = f"{timestamp_field}:{scale_to_use}->unix"
                     time_meta["timestamp_scale_used"] = scale_to_use
+                    time_meta["selected_time_source"] = "xffts-timestamp"
                     if time_meta["timestamp_scale_forced"]:
                         time_meta["reason"] = (
                             "timestamp scale forced by --xffts-timestamp-scale; "
                             f"literal_suffix={literal_suffix!r}"
+                        )
+                    elif literal_suffix == "GPS" and scale_to_use != "GPS":
+                        time_meta["reason"] = (
+                            "GPS literal suffix interpreted as {} by xffts_gps_suffix_means={}"
+                            .format(scale_to_use, gps_suffix_means)
                         )
                     else:
                         time_meta["reason"] = "timestamp suffix accepted"
@@ -454,7 +488,11 @@ def _select_spectral_time_from_structured(
 
     if fallback_field is not None:
         t_spec = np.asarray(arr[fallback_field], dtype=float)
+        if spec_offset != 0.0:
+            t_spec = t_spec + spec_offset
+            time_meta["spectrometer_time_offset_applied"] = True
         time_meta["applied"] = fallback_field
+        time_meta["selected_time_source"] = "host-time"
         if time_meta["reason"] is None:
             time_meta["reason"] = "timestamp field unavailable; using numeric host receive time"
         return t_spec, time_meta
@@ -499,6 +537,8 @@ def _spectral_time_diagnostics_from_structured(
     max_rows=1000,
     spectral_time_source="auto",
     xffts_timestamp_scale="auto",
+    xffts_gps_suffix_means="utc",
+    spectrometer_time_offset_sec=0.0,
 ):
     names = list(arr.dtype.names or [])
     timestamp_field = _pick_field_name(names, None, ["timestamp", "time_spectrometer"])
@@ -573,6 +613,8 @@ def _spectral_time_diagnostics_from_structured(
             arr0,
             spectral_time_source=spectral_time_source,
             xffts_timestamp_scale=xffts_timestamp_scale,
+            xffts_gps_suffix_means=xffts_gps_suffix_means,
+            spectrometer_time_offset_sec=spectrometer_time_offset_sec,
         )
         out["selected"]["meta"] = meta
         out["selected"]["time_summary"] = _finite_summary(selected)
@@ -762,6 +804,8 @@ def _extract_spectral_from_structured(
     *,
     spectral_time_source="auto",
     xffts_timestamp_scale="auto",
+    xffts_gps_suffix_means="utc",
+    spectrometer_time_offset_sec=0.0,
 ):
     """
     spectral structured array から t_spec と spec2d を取り出す。
@@ -781,6 +825,8 @@ def _extract_spectral_from_structured(
         arr,
         spectral_time_source=spectral_time_source,
         xffts_timestamp_scale=xffts_timestamp_scale,
+        xffts_gps_suffix_means=xffts_gps_suffix_means,
+        spectrometer_time_offset_sec=spectrometer_time_offset_sec,
     )
 
     slice_bounds = None
@@ -1440,6 +1486,10 @@ class CommonInputs:
     weather_outside_time_col: str
     spectral_time_source: str = "auto"
     xffts_timestamp_scale: str = "auto"
+    xffts_gps_suffix_means: str = "utc"
+    spectrometer_time_offset_sec: float = 0.0
+    encoder_az_time_offset_sec: float = 0.0
+    encoder_el_time_offset_sec: float = 0.0
 
 
 @dataclass
@@ -2606,7 +2656,11 @@ def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
                           weather_outside_table, weather_outside_time_col,
                           encoder_table=None, altaz_table=None,
                           spectral_time_source="auto",
-                          xffts_timestamp_scale="auto"):
+                          xffts_timestamp_scale="auto",
+                          xffts_gps_suffix_means="utc",
+                          spectrometer_time_offset_sec=0.0,
+                          encoder_az_time_offset_sec=0.0,
+                          encoder_el_time_offset_sec=0.0):
     db = necstdb.opendb(str(rawdata_path))
     enc_table = _nonempty_str(encoder_table, default=_table_name(db_namespace, telescope, "ctrl", "antenna", "encoder"))
     alt_table = _nonempty_str(altaz_table, default=_table_name(db_namespace, telescope, "ctrl", "antenna", "altaz"))
@@ -2624,6 +2678,10 @@ def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
         weather_outside_time_col=str(weather_outside_time_col),
         spectral_time_source=_normalize_spectral_time_source(spectral_time_source),
         xffts_timestamp_scale=_normalize_xffts_timestamp_scale(xffts_timestamp_scale),
+        xffts_gps_suffix_means=_normalize_xffts_gps_suffix_means(xffts_gps_suffix_means),
+        spectrometer_time_offset_sec=float(spectrometer_time_offset_sec or 0.0),
+        encoder_az_time_offset_sec=float(encoder_az_time_offset_sec or 0.0),
+        encoder_el_time_offset_sec=float(encoder_el_time_offset_sec or 0.0),
     )
 
 
@@ -2656,6 +2714,8 @@ def _compute_stream_vlsrk_channel_slice(common, site, db_namespace, telescope, s
         arr_spec,
         spectral_time_source=getattr(common, "spectral_time_source", "auto"),
         xffts_timestamp_scale=getattr(common, "xffts_timestamp_scale", "auto"),
+        xffts_gps_suffix_means=getattr(common, "xffts_gps_suffix_means", "utc"),
+        spectrometer_time_offset_sec=getattr(common, "spectrometer_time_offset_sec", 0.0),
     )
     pos_str_unsorted, _ = _extract_pos_labels_from_structured(arr_spec, len(t_spec_unsorted))
     order = np.argsort(t_spec_unsorted)
@@ -2689,6 +2749,8 @@ def _compute_stream_vlsrk_channel_slice(common, site, db_namespace, telescope, s
         str(altaz_time_col),
         str(interp_extrap),
         float(encoder_shift_sec),
+        float(getattr(common, "encoder_az_time_offset_sec", 0.0)),
+        float(getattr(common, "encoder_el_time_offset_sec", 0.0)),
         str(azel_correction_apply),
     )
     beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)
@@ -2745,6 +2807,8 @@ def extract_spectral_stream(common, db_namespace, telescope, stream, arr_spec=No
         channel_slice_bounds=stream.channel_slice_bounds,
         spectral_time_source=getattr(common, "spectral_time_source", "auto"),
         xffts_timestamp_scale=getattr(common, "xffts_timestamp_scale", "auto"),
+        xffts_gps_suffix_means=getattr(common, "xffts_gps_suffix_means", "utc"),
+        spectrometer_time_offset_sec=getattr(common, "spectrometer_time_offset_sec", 0.0),
     )
     if int(spec2d.shape[1]) != int(stream.wcs.nchan):
         raise RuntimeError(
@@ -2869,7 +2933,7 @@ def resolve_stream_meteorology(common, stream_data, met_source, interp_extrap):
 # -----------------------------------------------------------------------------
 # 3) Normalize
 # -----------------------------------------------------------------------------
-def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_col, extrap, encoder_shift_sec=0.0, azel_correction_apply="subtract"):
+def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_col, extrap, encoder_shift_sec=0.0, encoder_az_time_offset_sec=0.0, encoder_el_time_offset_sec=0.0, azel_correction_apply="subtract"):
     enc_names = list(arr_enc.dtype.names or [])
     alt_names = list(arr_alt.dtype.names or [])
 
@@ -2912,8 +2976,8 @@ def normalize_pointing(t_spec, arr_enc, arr_alt, encoder_time_col, altaz_time_co
     if s_alt != 1.0:
         print("[info] altaz   time scaled by {} to match unix seconds".format(s_alt))
 
-    az_enc_t = _interp_az_deg(t_enc, az_enc, t_spec, extrap=extrap)
-    el_enc_t = _interp_lin(t_enc, el_enc, t_spec, extrap=extrap)
+    az_enc_t = _interp_az_deg(t_enc + float(encoder_az_time_offset_sec), az_enc, t_spec, extrap=extrap)
+    el_enc_t = _interp_lin(t_enc + float(encoder_el_time_offset_sec), el_enc, t_spec, extrap=extrap)
 
     dlon_t = _interp_lin(t_alt, dlon, t_spec, extrap=extrap)
     dlat_t = _interp_lin(t_alt, dlat, t_spec, extrap=extrap)
@@ -3750,6 +3814,212 @@ def _global_pe_summary(rows):
 
 
 
+
+def _table_header_keys_for_time_inspection(db, table_name):
+    """Return NECSTDB table field names without reading data rows."""
+    tbl = db.open_table(str(table_name))
+    try:
+        header = getattr(tbl, "header", {}) or {}
+        fields = header.get("data", []) or []
+        keys = []
+        for field in fields:
+            if isinstance(field, dict) and field.get("key") is not None:
+                keys.append(str(field.get("key")))
+        return keys
+    finally:
+        try:
+            tbl.close()
+        except Exception:
+            pass
+
+
+def _looks_like_spectral_time_table(table_name, keys):
+    """Heuristic for config-free --inspect-spectral-time table discovery."""
+    low_keys = {str(k).strip().lower() for k in (keys or [])}
+    low_name = str(table_name).strip().lower()
+    has_xffts_time = bool({"time_spectrometer", "timestamp"} & low_keys)
+    has_host_time = bool({"time", "t", "unix_time", "unixtime"} & low_keys)
+    has_data = "data" in low_keys
+    name_hint = (
+        "spectral" in low_name
+        or "xffts" in low_name
+        or "ac240" in low_name
+        or "spec" in low_name
+    )
+    # Require a spectrometer timestamp and either a spectral payload or a spectral-looking
+    # table name. This keeps the diagnostic independent of snapshot/config files while
+    # avoiding ordinary housekeeping/status tables.
+    return bool(has_xffts_time and has_host_time and (has_data or name_hint))
+
+
+def _discover_spectral_time_tables_for_inspection(db):
+    """List candidate spectral data tables for config-free time inspection."""
+    try:
+        table_names = list(db.list_tables())
+    except Exception as e:
+        raise RuntimeError(f"cannot list NECSTDB tables for time inspection: {e}") from e
+    candidates = []
+    inspected = []
+    for table_name in sorted(str(t) for t in table_names):
+        try:
+            keys = _table_header_keys_for_time_inspection(db, table_name)
+            entry = {
+                "table": table_name,
+                "keys": keys,
+                "is_candidate": _looks_like_spectral_time_table(table_name, keys),
+            }
+        except Exception as e:
+            entry = {"table": table_name, "error": str(e), "is_candidate": False}
+        inspected.append(entry)
+        if bool(entry.get("is_candidate", False)):
+            candidates.append({"table": table_name, "keys": list(entry.get("keys", []))})
+    return candidates, inspected
+
+
+def _match_inspect_spectral_time_tables(candidates, *, explicit_tables=None, selectors=None, all_streams=False):
+    """Resolve config-free --inspect-spectral-time table selection."""
+    explicit_tables = [str(x).strip() for x in (explicit_tables or []) if str(x).strip()]
+    selectors = [str(x).strip() for x in (selectors or []) if str(x).strip()]
+    candidate_names = [str(c["table"]) for c in candidates]
+    by_name = {name: c for name, c in zip(candidate_names, candidates)}
+
+    if explicit_tables:
+        selected = []
+        missing = []
+        for table in explicit_tables:
+            if table in by_name:
+                selected.append(by_name[table])
+                continue
+            # Also allow suffix match so users can pass only the terminal stream/table token.
+            matches = [c for c in candidates if str(c["table"]).endswith(table)]
+            if len(matches) == 1:
+                selected.append(matches[0])
+            elif len(matches) > 1:
+                missing.append(f"{table} (ambiguous: {[m['table'] for m in matches]})")
+            else:
+                missing.append(table)
+        return selected, {
+            "selection_mode": "explicit_table",
+            "requested_tables": explicit_tables,
+            "missing_or_ambiguous": missing,
+        }
+
+    if selectors:
+        selected = []
+        unmatched = []
+        for token in selectors:
+            matches = [
+                c for c in candidates
+                if str(c["table"]) == token
+                or str(c["table"]).endswith(token)
+                or token in str(c["table"])
+            ]
+            if len(matches) == 1:
+                selected.append(matches[0])
+            elif len(matches) > 1:
+                # Keep deterministic behavior: do not guess when a selector matches multiple
+                # DB tables. The user can pass --inspect-spectral-time-table with the full name.
+                unmatched.append(f"{token} (ambiguous: {[m['table'] for m in matches]})")
+            else:
+                unmatched.append(token)
+        return selected, {
+            "selection_mode": "selector",
+            "selectors": selectors,
+            "missing_or_ambiguous": unmatched,
+        }
+
+    if all_streams:
+        return list(candidates), {"selection_mode": "all_candidates"}
+
+    first = candidates[:1]
+    return first, {
+        "selection_mode": "first_candidate",
+        "note": "No snapshot/config/table selector was given; inspecting the first spectral time candidate only.",
+    }
+
+
+def _inspect_spectral_time_json_configless(
+    rawdata_path,
+    *,
+    max_rows=1000,
+    spectral_time_source="auto",
+    xffts_timestamp_scale="auto",
+    xffts_gps_suffix_means="utc",
+    spectrometer_time_offset_sec=0.0,
+    explicit_tables=None,
+    selectors=None,
+    all_streams=False,
+):
+    """Inspect spectral time fields without requiring snapshot/config/encoder tables."""
+    rawdata_path = pathlib.Path(rawdata_path).expanduser().resolve()
+    result = {
+        "mode": "inspect_spectral_time",
+        "config_required": False,
+        "rawdata_path": str(rawdata_path),
+        "spectral_time_source": _normalize_spectral_time_source(spectral_time_source),
+        "xffts_timestamp_scale": _normalize_xffts_timestamp_scale(xffts_timestamp_scale),
+        "xffts_gps_suffix_means": _normalize_xffts_gps_suffix_means(xffts_gps_suffix_means),
+        "spectrometer_time_offset_sec": float(spectrometer_time_offset_sec or 0.0),
+        "max_rows": int(max_rows),
+        "candidate_tables": [],
+        "selection": {},
+        "streams": [],
+        "warnings": [],
+    }
+
+    db = necstdb.opendb(str(rawdata_path))
+    candidates, inspected = _discover_spectral_time_tables_for_inspection(db)
+    result["candidate_tables"] = [
+        {"table": str(c["table"]), "keys": list(c.get("keys", []))}
+        for c in candidates
+    ]
+    if not candidates:
+        result["warnings"].append(
+            "No spectral time table candidates were found. A candidate needs time_spectrometer/timestamp, host time, and data or a spectral-looking table name."
+        )
+        result["inspected_tables"] = inspected
+        return result
+
+    selected, selection_meta = _match_inspect_spectral_time_tables(
+        candidates,
+        explicit_tables=explicit_tables,
+        selectors=selectors,
+        all_streams=all_streams,
+    )
+    result["selection"] = selection_meta
+    if not selected:
+        result["warnings"].append(
+            "No spectral time table was selected. Use --inspect-spectral-time-table with a full table name from candidate_tables."
+        )
+        return result
+
+    for cand in selected:
+        table_name = str(cand["table"])
+        entry = {
+            "stream": table_name,
+            "table": table_name,
+            "keys": list(cand.get("keys", [])),
+        }
+        try:
+            arr_spec = _read_structured_array_tolerant(db, table_name)
+            entry.update(
+                _spectral_time_diagnostics_from_structured(
+                    arr_spec,
+                    max_rows=int(max_rows),
+                    spectral_time_source=spectral_time_source,
+                    xffts_timestamp_scale=xffts_timestamp_scale,
+                    xffts_gps_suffix_means=xffts_gps_suffix_means,
+                    spectrometer_time_offset_sec=spectrometer_time_offset_sec,
+                )
+            )
+        except Exception as e:
+            entry["error"] = str(e)
+        result["streams"].append(entry)
+    return result
+
+
+
+
 def _inspect_spectral_time_json(
     common,
     db_namespace,
@@ -3759,11 +4029,15 @@ def _inspect_spectral_time_json(
     max_rows=1000,
     spectral_time_source="auto",
     xffts_timestamp_scale="auto",
+    xffts_gps_suffix_means="utc",
+    spectrometer_time_offset_sec=0.0,
 ):
     result = {
         "mode": "inspect_spectral_time",
         "spectral_time_source": _normalize_spectral_time_source(spectral_time_source),
         "xffts_timestamp_scale": _normalize_xffts_timestamp_scale(xffts_timestamp_scale),
+        "xffts_gps_suffix_means": _normalize_xffts_gps_suffix_means(xffts_gps_suffix_means),
+        "spectrometer_time_offset_sec": float(spectrometer_time_offset_sec or 0.0),
         "max_rows": int(max_rows),
         "streams": [],
     }
@@ -3781,6 +4055,8 @@ def _inspect_spectral_time_json(
                     max_rows=int(max_rows),
                     spectral_time_source=spectral_time_source,
                     xffts_timestamp_scale=xffts_timestamp_scale,
+                    xffts_gps_suffix_means=xffts_gps_suffix_means,
+                    spectrometer_time_offset_sec=spectrometer_time_offset_sec,
                 )
             )
         except Exception as e:
@@ -3799,10 +4075,14 @@ def parse_args(argv):
     )
     p.add_argument("rawdata", help="RawData folder path (necstdb + nercst)")
     p.add_argument("--inspect-sidecars", action="store_true", help="Inspect DB-embedded spectral-recording sidecars and exit without converting.")
-    p.add_argument("--inspect-spectral-time", action="store_true", help="Inspect spectral time fields (time_spectrometer/timestamp, host time, recorded_time) and exit without converting.")
+    p.add_argument("--inspect-spectral-time", action="store_true", help="Inspect spectral time fields (time_spectrometer/timestamp, host time, recorded_time) and exit without converting. This diagnostic does not require snapshot/config files.")
     p.add_argument("--inspect-spectral-time-max-rows", type=int, default=1000, help="Maximum rows per stream sampled by --inspect-spectral-time.")
-    p.add_argument("--spectral-time-source", default="auto", choices=["auto", "host-time", "xffts-timestamp"], help="Time basis for spectral rows. auto uses UTC/GPS/TAI XFFTS timestamps when usable and falls back to host time for PC/unknown; host-time always uses numeric time; xffts-timestamp requires a usable timestamp.")
-    p.add_argument("--xffts-timestamp-scale", default="auto", choices=["auto", "utc", "gps", "tai"], help="Interpretation scale for XFFTS timestamp bodies. auto trusts the timestamp suffix; utc/gps/tai force that scale even if the literal suffix differs.")
+    p.add_argument("--inspect-spectral-time-table", action="append", default=None, help="Config-free --inspect-spectral-time: inspect the given NECSTDB spectral table name. May be repeated.")
+    p.add_argument("--inspect-spectral-time-all-streams", action="store_true", help="Config-free --inspect-spectral-time: inspect all detected spectral time candidate tables instead of the first one.")
+    p.add_argument("--spectral-time-source", default="auto", choices=["auto", "host-time", "xffts-timestamp"], help="Time basis for spectral rows. auto uses XFFTS UTC/TAI timestamps when usable, treats GPS suffix according to --xffts-gps-suffix-means, and falls back to host time for PC/unknown; host-time always uses numeric time; xffts-timestamp requires a usable timestamp.")
+    p.add_argument("--xffts-timestamp-scale", default="auto", choices=["auto", "utc", "gps", "tai"], help="Interpretation scale for XFFTS timestamp bodies. auto uses suffix/policy; utc/gps/tai force that scale even if the literal suffix differs.")
+    p.add_argument("--xffts-gps-suffix-means", default="utc", choices=["utc", "gps"], help="When --xffts-timestamp-scale=auto and the literal XFFTS suffix is GPS, interpret the timestamp body as this scale. OMU IRIG-B default is utc.")
+    p.add_argument("--spectrometer-time-offset-sec", type=float, default=0.0, help="Offset added only when spectral time falls back to host-time. It is not applied when an XFFTS timestamp is used.")
     p.add_argument("--spectrometer-config", default=None, help="TOML file describing spectrometers / beams / LO / WCS")
     p.add_argument("--spectral-recording-snapshot", "--snapshot", default=None, help="Observation-time spectral_recording_snapshot.toml. When given, it supplies stream truth through the snapshot adapter and is mutually exclusive with --spectrometer-config.")
     p.add_argument("--beam-model", default=None, help="Optional analysis-time beam_model.toml override for --spectral-recording-snapshot. Requires --allow-beam-model-override.")
@@ -3839,6 +4119,8 @@ def parse_args(argv):
 
     p.add_argument("--encoder-time-col", default="time", help="encoder time column (recommended: time)")
     p.add_argument("--encoder-shift-sec", type=float, default=0.0, help="Shift applied to encoder timestamps before interpolation to spectral time: t_enc <- t_enc + shift [s]. Use the same sign convention as sunscan --encoder-shift-sec.")
+    p.add_argument("--encoder-az-time-offset-sec", type=float, default=0.0, help="Additional offset applied only to Az encoder timestamps before interpolation [s].")
+    p.add_argument("--encoder-el-time-offset-sec", type=float, default=0.0, help="Additional offset applied only to El encoder timestamps before interpolation [s].")
     p.add_argument("--altaz-time-col", default="time", help="altaz time column (recommended: time)")
     p.add_argument("--interp-extrap", default="hold", choices=["nan", "hold"], help="Extrapolation policy for interpolation")
     p.add_argument("--use-modes", default="ON,HOT,OFF", help="Comma-separated OBSMODE list to include")
@@ -4034,6 +4316,42 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
     else:
         encoder_shift_sec = float(encoder_shift_sec_cfg)
 
+    encoder_az_time_offset_sec_cfg = global_cfg.get("encoder_az_time_offset_sec", None)
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--encoder-az-time-offset-sec") or (encoder_az_time_offset_sec_cfg is None):
+        encoder_az_time_offset_sec = float(getattr(args, "encoder_az_time_offset_sec", 0.0))
+    else:
+        encoder_az_time_offset_sec = float(encoder_az_time_offset_sec_cfg)
+
+    encoder_el_time_offset_sec_cfg = global_cfg.get("encoder_el_time_offset_sec", None)
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--encoder-el-time-offset-sec") or (encoder_el_time_offset_sec_cfg is None):
+        encoder_el_time_offset_sec = float(getattr(args, "encoder_el_time_offset_sec", 0.0))
+    else:
+        encoder_el_time_offset_sec = float(encoder_el_time_offset_sec_cfg)
+
+    spectral_time_source_cfg = global_cfg.get("spectral_time_source", None)
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--spectral-time-source") or (spectral_time_source_cfg is None):
+        spectral_time_source = _normalize_spectral_time_source(getattr(args, "spectral_time_source", "auto"))
+    else:
+        spectral_time_source = _normalize_spectral_time_source(spectral_time_source_cfg)
+
+    xffts_timestamp_scale_cfg = global_cfg.get("xffts_timestamp_scale", None)
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--xffts-timestamp-scale") or (xffts_timestamp_scale_cfg is None):
+        xffts_timestamp_scale = _normalize_xffts_timestamp_scale(getattr(args, "xffts_timestamp_scale", "auto"))
+    else:
+        xffts_timestamp_scale = _normalize_xffts_timestamp_scale(xffts_timestamp_scale_cfg)
+
+    xffts_gps_suffix_means_cfg = global_cfg.get("xffts_gps_suffix_means", None)
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--xffts-gps-suffix-means") or (xffts_gps_suffix_means_cfg is None):
+        xffts_gps_suffix_means = _normalize_xffts_gps_suffix_means(getattr(args, "xffts_gps_suffix_means", "utc"))
+    else:
+        xffts_gps_suffix_means = _normalize_xffts_gps_suffix_means(xffts_gps_suffix_means_cfg)
+
+    spectrometer_time_offset_sec_cfg = global_cfg.get("spectrometer_time_offset_sec", None)
+    if (not _args_have_spectral_config(args)) or _argv_has_option(argv, "--spectrometer-time-offset-sec") or (spectrometer_time_offset_sec_cfg is None):
+        spectrometer_time_offset_sec = float(getattr(args, "spectrometer_time_offset_sec", 0.0))
+    else:
+        spectrometer_time_offset_sec = float(spectrometer_time_offset_sec_cfg)
+
     return {
         "db_namespace": db_namespace,
         "telescope": telescope,
@@ -4071,6 +4389,12 @@ def _resolve_runtime_naming(args, config_dict, argv=None):
         "tamb_min_k": tamb_min_k,
         "tamb_max_k": tamb_max_k,
         "encoder_shift_sec": encoder_shift_sec,
+        "encoder_az_time_offset_sec": encoder_az_time_offset_sec,
+        "encoder_el_time_offset_sec": encoder_el_time_offset_sec,
+        "spectral_time_source": spectral_time_source,
+        "xffts_timestamp_scale": xffts_timestamp_scale,
+        "xffts_gps_suffix_means": xffts_gps_suffix_means,
+        "spectrometer_time_offset_sec": spectrometer_time_offset_sec,
     }
 
 
@@ -4199,6 +4523,8 @@ def main(argv=None):
     args = parse_args(argv)
     args.spectral_time_source = _normalize_spectral_time_source(getattr(args, "spectral_time_source", "auto"))
     args.xffts_timestamp_scale = _normalize_xffts_timestamp_scale(getattr(args, "xffts_timestamp_scale", "auto"))
+    args.xffts_gps_suffix_means = _normalize_xffts_gps_suffix_means(getattr(args, "xffts_gps_suffix_means", "utc"))
+    args.spectrometer_time_offset_sec = float(getattr(args, "spectrometer_time_offset_sec", 0.0) or 0.0)
 
     for attr in ("encoder_time_col", "altaz_time_col", "weather_time_col", "weather_inside_time_col", "weather_outside_time_col"):
         cur = getattr(args, attr, None)
@@ -4218,6 +4544,30 @@ def main(argv=None):
 
     if bool(getattr(args, "inspect_sidecars", False)):
         print(json.dumps(_inspect_sidecars_json(rawdata_path), ensure_ascii=False, indent=2))
+        return
+
+    if bool(getattr(args, "inspect_spectral_time", False)):
+        selector_tokens = []
+        selector_tokens.extend(list(getattr(args, "stream_names", None) or []))
+        selector_tokens.extend(list(getattr(args, "recorded_stream_ids", None) or []))
+        selector_tokens.extend(list(getattr(args, "window_ids", None) or []))
+        print(
+            json.dumps(
+                _inspect_spectral_time_json_configless(
+                    rawdata_path,
+                    max_rows=int(getattr(args, "inspect_spectral_time_max_rows", 1000)),
+                    spectral_time_source=str(getattr(args, "spectral_time_source", "auto")),
+                    xffts_timestamp_scale=str(getattr(args, "xffts_timestamp_scale", "auto")),
+                    xffts_gps_suffix_means=str(getattr(args, "xffts_gps_suffix_means", "utc")),
+                    spectrometer_time_offset_sec=float(getattr(args, "spectrometer_time_offset_sec", 0.0) or 0.0),
+                    explicit_tables=list(getattr(args, "inspect_spectral_time_table", None) or []),
+                    selectors=selector_tokens,
+                    all_streams=bool(getattr(args, "inspect_spectral_time_all_streams", False)),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
 
     site_info = _resolve_site_from_cli_or_rawdata(args, rawdata_path)
@@ -4323,6 +4673,12 @@ def main(argv=None):
     db_namespace = runtime_naming["db_namespace"]
     telescope_name = runtime_naming["telescope"]
     args.encoder_shift_sec = float(runtime_naming.get("encoder_shift_sec", getattr(args, "encoder_shift_sec", 0.0)))
+    args.encoder_az_time_offset_sec = float(runtime_naming.get("encoder_az_time_offset_sec", getattr(args, "encoder_az_time_offset_sec", 0.0)))
+    args.encoder_el_time_offset_sec = float(runtime_naming.get("encoder_el_time_offset_sec", getattr(args, "encoder_el_time_offset_sec", 0.0)))
+    args.spectral_time_source = runtime_naming.get("spectral_time_source", getattr(args, "spectral_time_source", "auto"))
+    args.xffts_timestamp_scale = runtime_naming.get("xffts_timestamp_scale", getattr(args, "xffts_timestamp_scale", "auto"))
+    args.xffts_gps_suffix_means = runtime_naming.get("xffts_gps_suffix_means", getattr(args, "xffts_gps_suffix_means", "utc"))
+    args.spectrometer_time_offset_sec = float(runtime_naming.get("spectrometer_time_offset_sec", getattr(args, "spectrometer_time_offset_sec", 0.0)))
     args.encoder_time_col = str(runtime_naming.get("encoder_time_col", getattr(args, "encoder_time_col", "time")))
     args.altaz_time_col = str(runtime_naming.get("altaz_time_col", getattr(args, "altaz_time_col", "time")))
     for attr in ("encoder_time_col", "altaz_time_col", "weather_inside_time_col", "weather_outside_time_col"):
@@ -4451,6 +4807,10 @@ def main(argv=None):
         altaz_table=altaz_table_resolved,
         spectral_time_source=str(getattr(args, "spectral_time_source", "auto")),
         xffts_timestamp_scale=str(getattr(args, "xffts_timestamp_scale", "auto")),
+        xffts_gps_suffix_means=str(getattr(args, "xffts_gps_suffix_means", "utc")),
+        spectrometer_time_offset_sec=float(getattr(args, "spectrometer_time_offset_sec", 0.0) or 0.0),
+        encoder_az_time_offset_sec=float(getattr(args, "encoder_az_time_offset_sec", 0.0) or 0.0),
+        encoder_el_time_offset_sec=float(getattr(args, "encoder_el_time_offset_sec", 0.0) or 0.0),
     )
 
     if bool(getattr(args, "inspect_spectral_time", False)):
@@ -4464,6 +4824,8 @@ def main(argv=None):
                     max_rows=int(getattr(args, "inspect_spectral_time_max_rows", 1000)),
                     spectral_time_source=str(getattr(args, "spectral_time_source", "auto")),
                     xffts_timestamp_scale=str(getattr(args, "xffts_timestamp_scale", "auto")),
+                    xffts_gps_suffix_means=str(getattr(args, "xffts_gps_suffix_means", "utc")),
+                    spectrometer_time_offset_sec=float(getattr(args, "spectrometer_time_offset_sec", 0.0) or 0.0),
                 ),
                 ensure_ascii=False,
                 indent=2,
@@ -4611,6 +4973,8 @@ def main(argv=None):
                 str(args.altaz_time_col),
                 str(args.interp_extrap),
                 float(args.encoder_shift_sec),
+                float(getattr(args, "encoder_az_time_offset_sec", 0.0)),
+                float(getattr(args, "encoder_el_time_offset_sec", 0.0)),
                 str(args.azel_correction_apply),
             )
             beam_applied = apply_beam_offset(pointing["boresight_az"], pointing["boresight_el"], stream.beam)

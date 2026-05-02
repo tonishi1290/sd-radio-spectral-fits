@@ -851,6 +851,31 @@ def _extract_export_slices(raw: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+_SHARED_TIMING_SECTION_NAMES = ("spectral_time", "encoder_time")
+_SHARED_TIMING_KEYS = {
+    "spectral_time_source",
+    "xffts_timestamp_scale",
+    "xffts_gps_suffix_means",
+    "spectrometer_time_offset_sec",
+    "encoder_shift_sec",
+    "encoder_az_time_offset_sec",
+    "encoder_el_time_offset_sec",
+    "encoder_vavg_sec",
+}
+_ANALYSIS_BASE_SKIP_KEYS = {
+    "channel_slice",
+    "export_slice",
+    "export_slices",
+    "export_slices_by_stream_id",
+    "channel_slices",
+    "channel_slices_by_stream_id",
+    "per_stream_overrides",
+    "stream_overrides",
+    "streams",
+    "analysis_selection",
+}
+
+
 def _extract_analysis_values(raw: Mapping[str, Any], section_name: str) -> Dict[str, Any]:
     """Return scalar analysis values from [global] and [section_name].
 
@@ -864,6 +889,15 @@ def _extract_analysis_values(raw: Mapping[str, Any], section_name: str) -> Dict[
     if isinstance(global_section, Mapping):
         values.update(copy.deepcopy(dict(global_section)))
 
+    # Shared timing sections accepted by both converter_analysis.toml and
+    # sunscan_analysis.toml.  They are flattened into config_dict["global"] so
+    # older converter/sunscan code paths can resolve them exactly like legacy
+    # scalar analysis values.
+    for shared_section_name in _SHARED_TIMING_SECTION_NAMES:
+        shared_section = raw.get(shared_section_name)
+        if isinstance(shared_section, Mapping):
+            values.update(copy.deepcopy(dict(shared_section)))
+
     section = raw.get(section_name)
     if isinstance(section, Mapping):
         for key, value in dict(section).items():
@@ -873,11 +907,53 @@ def _extract_analysis_values(raw: Mapping[str, Any], section_name: str) -> Dict[
                 "channel_slices",
                 "channel_slices_by_stream_id",
                 "per_stream_overrides",
+                "stream_overrides",
                 "streams",
                 "analysis_selection",
             }:
                 continue
             values[str(key)] = copy.deepcopy(value)
+    return values
+
+
+def _resolve_analysis_base_path(raw: Mapping[str, Any], analysis_path: Path | str) -> Optional[Path]:
+    base = raw.get("analysis_base")
+    if not isinstance(base, Mapping):
+        return None
+    value = base.get("path") or base.get("converter_analysis_config") or base.get("converter_analysis")
+    if value is None or str(value).strip() == "":
+        return None
+    base_path = Path(str(value)).expanduser()
+    if not base_path.is_absolute():
+        base_path = Path(analysis_path).expanduser().resolve().parent / base_path
+    return base_path.resolve()
+
+
+def _analysis_base_allows_timing_override(raw: Mapping[str, Any]) -> bool:
+    for section_name in ("analysis_base", "override_policy"):
+        section = raw.get(section_name)
+        if isinstance(section, Mapping) and section.get("allow_timing_override") is not None:
+            return bool(section.get("allow_timing_override"))
+    return False
+
+
+def _sunscan_timing_override_locations(raw: Mapping[str, Any]) -> List[str]:
+    locations: List[str] = []
+    for section_name in _SHARED_TIMING_SECTION_NAMES:
+        if isinstance(raw.get(section_name), Mapping):
+            locations.append(f"[{section_name}]")
+    section = raw.get("sunscan_analysis")
+    if isinstance(section, Mapping):
+        for key in sorted(_SHARED_TIMING_KEYS):
+            if key in section:
+                locations.append(f"[sunscan_analysis].{key}")
+    return locations
+
+
+def _extract_sunscan_base_values(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    values = _extract_analysis_values(raw, "converter_analysis")
+    for key in _ANALYSIS_BASE_SKIP_KEYS:
+        values.pop(key, None)
     return values
 
 
@@ -1030,9 +1106,36 @@ def apply_sunscan_analysis_config(
     config_dict: Dict[str, Any],
     analysis_path: Path | str,
 ) -> Dict[str, Any]:
-    """Overlay a standalone sunscan-analysis TOML onto materialized config."""
+    """Overlay a standalone sunscan-analysis TOML onto materialized config.
+
+    A sunscan TOML may include::
+
+        [analysis_base]
+        path = "converter_analysis_...toml"
+
+    In that mode, common scalar settings are inherited from the converter
+    analysis file before sunscan-specific values are applied.  Converter-only
+    stream export slices are deliberately not inherited.
+    """
 
     raw = _load_analysis_toml(analysis_path, expected_kind="sunscan_analysis")
+    base_path = _resolve_analysis_base_path(raw, analysis_path)
+    if base_path is not None:
+        base_raw = _load_analysis_toml(base_path, expected_kind="converter_analysis")
+        _merge_into_global(config_dict, _extract_sunscan_base_values(base_raw))
+        timing_override_locations = _sunscan_timing_override_locations(raw)
+        if timing_override_locations and not _analysis_base_allows_timing_override(raw):
+            raise ValueError(
+                f"{analysis_path}: sunscan analysis inherits common timing from analysis_base={base_path}; "
+                "do not redefine timing in the sunscan file unless "
+                "[analysis_base].allow_timing_override = true. Conflicting locations: "
+                + ", ".join(timing_override_locations)
+            )
+        provenance = dict(config_dict.get("provenance", {}) or {})
+        provenance["sunscan_analysis_base_config_path"] = str(base_path)
+        provenance["sunscan_analysis_base_config_kind"] = "converter_analysis"
+        config_dict["provenance"] = provenance
+
     _merge_into_global(config_dict, _extract_analysis_values(raw, "sunscan_analysis"))
 
     def merge_override(stream_id: str, values: Mapping[str, Any]) -> None:
