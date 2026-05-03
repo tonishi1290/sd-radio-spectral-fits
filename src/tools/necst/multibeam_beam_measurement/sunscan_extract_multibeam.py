@@ -637,7 +637,7 @@ def run_extract(
                 hpbw_factor=hpbw_factor,
                 fallback_arcsec=float(base_config.edge_fit.hpbw_init_arcsec),
             )
-        spectral_name = str(getattr(stream, "db_stream_name", None) or stream.name)
+        spectral_name = str(getattr(stream, "db_table_name", None) or getattr(stream, "db_stream_name", None) or stream.name)
         cfg_stream = base_config.with_stream_override(
             spectral_name=spectral_name,
             stream_name=str(stream.name),

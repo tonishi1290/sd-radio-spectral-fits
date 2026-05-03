@@ -472,7 +472,7 @@ def config_from_args(args: argparse.Namespace, argv: Optional[Sequence[str]] = N
     cfg.input.encoder_el_time_offset_sec = _choose_float_setting(args, argv, "--encoder-el-time-offset-sec", "encoder_el_time_offset_sec", global_cfg, "encoder_el_time_offset_sec", 0.0, stream_cfg=stream_cfg)
     cfg.input.encoder_vavg_sec = _choose_float_setting(args, argv, "--encoder-vavg-sec", "encoder_vavg_sec", global_cfg, "encoder_vavg_sec", 0.0, stream_cfg=stream_cfg)
     if selected_stream is not None:
-        cfg.input.spectral_name = str(getattr(selected_stream, "db_stream_name", None) or getattr(selected_stream, "name", cfg.input.spectral_name))
+        cfg.input.spectral_name = str(getattr(selected_stream, "db_table_name", None) or getattr(selected_stream, "db_stream_name", None) or getattr(selected_stream, "name", cfg.input.spectral_name))
         cfg.beam_override.stream_name = str(getattr(selected_stream, "name", cfg.beam_override.stream_name or "")) or cfg.beam_override.stream_name
         cfg.beam_override.beam_id = str(getattr(getattr(selected_stream, "beam", None), "beam_id", cfg.beam_override.beam_id or "")) or cfg.beam_override.beam_id
         cfg.beam_override.restfreq_hz = restfreq_hz_for_stream(selected_stream)

@@ -1760,6 +1760,39 @@ def _table_name(*parts):
         if s:
             cleaned.append(s)
     return "-".join(cleaned)
+
+
+def _necstdb_table_name_from_snapshot_path(db_namespace, telescope, value):
+    """Resolve a snapshot DB binding to the NECSTDB table filename stem.
+
+    Snapshot-aware configs carry ``db_table_path`` as a logical path such as
+    ``data/spectral/xffts/board2__13CO_J2_1``.  NECSTDB stores this topic under
+    the telescope namespace with slashes normalized to hyphens, e.g.
+    ``necst-OMU1P85M-data-spectral-xffts-board2__13CO_J2_1``.
+
+    Legacy configs may still pass a plain stream/table name such as
+    ``xffts-board1`` or an already-qualified NECSTDB table stem.  Those are
+    preserved.
+    """
+
+    s = str(value or "").strip()
+    if not s:
+        return None
+
+    # Already a fully-qualified NECSTDB table name.
+    prefix = _table_name(db_namespace, telescope) + "-"
+    if s.startswith(prefix):
+        return s
+
+    # New snapshot truth: canonical logical DB path.
+    if "/" in s:
+        return _table_name(db_namespace, telescope, *[part for part in s.strip("/").split("/") if part])
+
+    # Some callers may already pass the path with hyphens rather than slashes.
+    if s.startswith("data-") or s.startswith("tp-"):
+        return _table_name(db_namespace, telescope, s)
+
+    return s
 def _clean_upper(v):
     if v is None:
         return None
@@ -2688,7 +2721,9 @@ def extract_common_inputs(rawdata_path, db_namespace, telescope, wcs_table,
 
 def _resolve_spec_table_name(db_namespace, telescope, stream):
     if _is_meaningful_str(stream.db_table_name):
-        return str(stream.db_table_name)
+        resolved = _necstdb_table_name_from_snapshot_path(db_namespace, telescope, stream.db_table_name)
+        if _is_meaningful_str(resolved):
+            return str(resolved)
     spec_stream_name = _nonempty_str(stream.db_stream_name, default=stream.name)
     return _table_name(db_namespace, telescope, "data", "spectral", spec_stream_name)
 

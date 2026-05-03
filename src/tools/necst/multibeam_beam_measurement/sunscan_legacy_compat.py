@@ -343,6 +343,39 @@ DEFAULT_DB_NAMESPACE = "necst"
 PLANET = "sun"
 
 
+def _table_name(*parts: object) -> str:
+    cleaned = []
+    for part in parts:
+        if part is None:
+            continue
+        text = str(part).strip()
+        if text:
+            cleaned.append(text)
+    return "-".join(cleaned)
+
+
+def _necstdb_table_name_from_snapshot_path(db_namespace: str, telescope: str, value: object) -> str:
+    """Resolve snapshot ``db_table_path`` or legacy spectral name to NECSTDB table stem.
+
+    Snapshot-aware sunscan may receive ``data/spectral/xffts/board2__...`` from
+    ``db_table_path``.  NECSTDB stores the table with the namespace/telescope
+    prefix and with slashes normalized to hyphens.  Plain legacy names such as
+    ``xffts-board1`` remain valid.
+    """
+
+    s = str(value or "").strip()
+    if not s:
+        return s
+    prefix = _table_name(db_namespace, telescope) + "-"
+    if s.startswith(prefix):
+        return s
+    if "/" in s:
+        return _table_name(db_namespace, telescope, *[part for part in s.strip("/").split("/") if part])
+    if s.startswith("data-") or s.startswith("tp-"):
+        return _table_name(db_namespace, telescope, s)
+    return _table_name(db_namespace, telescope, "data", "spectral", s)
+
+
 
 
 # -----------------------------
@@ -1904,7 +1937,7 @@ def load_spectral(
     xffts_gps_suffix_means: str = "utc",
     spectrometer_time_offset_sec: float = 0.0,
 ):
-    spec_table_name = f"{str(db_namespace)}-{str(telescope)}-data-spectral-{spectral_name}"
+    spec_table_name = _necstdb_table_name_from_snapshot_path(db_namespace, telescope, spectral_name)
     arr_spec = _read_structured_array_tolerant(db, spec_table_name)
     t_spec, spec2d, time_meta, _s_field = _extract_spectral_from_structured(
         arr_spec,
