@@ -83,8 +83,12 @@ def _read_toml(path: Path) -> Dict[str, Any]:
     raise BeamModelError("Configured TOML reader has no loads() function")
 
 
+def _is_blank_value(value: Any) -> bool:
+    return isinstance(value, str) and value.strip() == ""
+
+
 def _as_float(value: Any, *, key: str, default: Optional[float] = None) -> float:
-    if value is None:
+    if value is None or _is_blank_value(value):
         if default is None:
             raise BeamModelError(f"beam field {key!r} is required")
         return float(default)
@@ -141,7 +145,7 @@ def normalize_beam_block(beam_id: str, raw_block: Mapping[str, Any]) -> Dict[str
         nested = dict(block.get("pure_rotation", {}) or {})
 
         def _nonzero_legacy_value(key: str) -> bool:
-            if key not in block or block.get(key) is None:
+            if key not in block or block.get(key) is None or _is_blank_value(block.get(key)):
                 return False
             return abs(_as_float(block.get(key), key=key)) > 0.0
 
@@ -149,7 +153,11 @@ def normalize_beam_block(beam_id: str, raw_block: Mapping[str, Any]) -> Dict[str
             key for key in ("az_offset_arcsec", "el_offset_arcsec", "reference_angle_deg", "reference_el_deg")
             if _nonzero_legacy_value(key)
         ]
-        if "rotation_slope_deg_per_deg" in block and block.get("rotation_slope_deg_per_deg") is not None:
+        if (
+            "rotation_slope_deg_per_deg" in block
+            and block.get("rotation_slope_deg_per_deg") is not None
+            and not _is_blank_value(block.get("rotation_slope_deg_per_deg"))
+        ):
             if abs(_as_float(block.get("rotation_slope_deg_per_deg"), key="rotation_slope_deg_per_deg")) > 0.0:
                 legacy_conflicts.append("rotation_slope_deg_per_deg")
         if legacy_conflicts:
@@ -159,7 +167,7 @@ def normalize_beam_block(beam_id: str, raw_block: Mapping[str, Any]) -> Dict[str
             )
 
         def _first_consistent_float(key: str, *values: Any) -> Any:
-            present = [v for v in values if v is not None]
+            present = [v for v in values if v is not None and not _is_blank_value(v)]
             if not present:
                 return None
             first = _as_float(present[0], key=key)
@@ -217,7 +225,9 @@ def normalize_beam_block(beam_id: str, raw_block: Mapping[str, Any]) -> Dict[str
         "rotation_sign": _as_float(block.get("rotation_sign", 1.0), key="rotation_sign", default=1.0),
         "rotation_slope_deg_per_deg": (
             _as_float(block.get("rotation_slope_deg_per_deg"), key="rotation_slope_deg_per_deg")
-            if block.get("rotation_slope_deg_per_deg") is not None else None
+            if block.get("rotation_slope_deg_per_deg") is not None
+            and not _is_blank_value(block.get("rotation_slope_deg_per_deg"))
+            else None
         ),
         "dewar_angle_deg": _as_float(block.get("dewar_angle_deg", 0.0), key="dewar_angle_deg", default=0.0),
         "pure_rotation_offset_x_el0_arcsec": None,

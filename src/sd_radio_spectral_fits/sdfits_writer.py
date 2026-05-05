@@ -1234,16 +1234,25 @@ class SDRadioSpectralSDFITSWriter:
             if _series_has_meaningful(values):
                 df[name] = pd.Series(list(values), dtype="object")
 
-        # Context-required columns: emit only when the overall dataset carries
-        # velocity / line semantics.  If emitted, add the whole column.
+        # Context-required columns: emit when the dataset carries line/velocity
+        # semantics.  A topocentric FREQ axis can still need row-dependent
+        # RESTFREQ/VELDEF, especially in snapshot-driven multi-line outputs
+        # where each recorded stream may have a different rest frequency.  Do
+        # not rely only on the primary header default in that case.
+        line_context_active = _series_has_meaningful(b.RESTFREQ)
         velocity_context_active = (
-            any(str(x).strip().upper() != "FREQ" for x in b.CTYPE1)
+            line_context_active
+            or any(str(x).strip().upper() != "FREQ" for x in b.CTYPE1)
             or any(str(x).strip().upper() == "LSRK" for x in b.SPECSYS)
             or _series_has_meaningful(b.VFRAME)
         )
         if velocity_context_active:
             df["RESTFREQ"] = np.array(b.RESTFREQ, dtype=np.float64)
-            df["VELDEF"] = pd.Series(list(b.VELDEF), dtype="object")
+            veldef_values = [
+                ("RADIO" if (v is None or str(v).strip() == "") else str(v))
+                for v in b.VELDEF
+            ]
+            df["VELDEF"] = pd.Series(veldef_values, dtype="object")
 
         # Heterodyne LO / sideband context.  OBSFREQ and SIDEBAND are the
         # minimum pair required to interpret DATA as a specific sky-sideband
