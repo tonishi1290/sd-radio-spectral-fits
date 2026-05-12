@@ -652,8 +652,19 @@ def _extract_spectral_from_structured(
         if k in names:
             s_field = k
             break
+
+    # Snapshot-based Sun/sunscan continuum observations may read TP tables under
+    # data/tp/... rather than spectrum tables under data/spectral/....  Runtime
+    # TP chunks contain tp_mean and tp_sum, not a vector spectrum.  Treat the
+    # preferred scalar TP field as a valid one-channel signal so the downstream
+    # sunscan code can reuse the same path.
     if s_field is None:
-        raise RuntimeError(f"no spectrum-like field in spectral table. available={names}")
+        for k in ("tp_mean", "tp_sum"):
+            if k in names:
+                s_field = k
+                break
+    if s_field is None:
+        raise RuntimeError(f"no spectrum-like or TP field in spectral/TP table. available={names}")
 
     t_spec, time_meta = _select_spectral_time_from_structured(
         arr,

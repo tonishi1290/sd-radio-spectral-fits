@@ -1600,20 +1600,31 @@ def load_spectral_recording_snapshot_config_bundle(
 
     layouts_all = list(srsnap.extract_stream_layouts(snapshot))
     spectral_layouts = [layout for layout in layouts_all if not bool(getattr(layout, "is_tp"))]
+    tp_layouts = [layout for layout in layouts_all if bool(getattr(layout, "is_tp"))]
+
+    # Normal spectral snapshots should continue to expose spectral products.
+    # Sun/sunscan continuum observations may intentionally create TP-only
+    # snapshots (recording_mode='tp', recording_table_kind='tp').  In that case,
+    # materialize TP streams as one-channel analysis streams so that sunscan can
+    # read data/tp/... tables via the same snapshot-aware path.  Mixed snapshots
+    # keep the historical spectral-first behavior to avoid surprising converter
+    # use cases.
+    materialized_layouts = spectral_layouts if spectral_layouts else tp_layouts
+
     if stream_ids is not None:
         wanted = {str(x) for x in stream_ids}
-        by_name = {str(layout.stream_id): layout for layout in spectral_layouts}
+        by_name = {str(layout.stream_id): layout for layout in materialized_layouts}
         missing = sorted(wanted - set(by_name))
         if missing:
-            raise ValueError(f"requested snapshot stream_id(s) are not available as spectral streams: {missing}")
-        spectral_layouts = [layout for layout in spectral_layouts if str(layout.stream_id) in wanted]
-    if not spectral_layouts:
-        raise ValueError("snapshot has no spectral streams available for converter/sunscan materialization")
+            raise ValueError(f"requested snapshot stream_id(s) are not available for analysis: {missing}")
+        materialized_layouts = [layout for layout in materialized_layouts if str(layout.stream_id) in wanted]
+    if not materialized_layouts:
+        raise ValueError("snapshot has no spectral or TP streams available for converter/sunscan materialization")
 
     raw_streams = dict(snapshot.get("streams", {}) or {})
     beams = _resolved_beams_from_snapshot(snapshot)
     streams: List[ResolvedStream] = []
-    for idx, layout in enumerate(spectral_layouts):
+    for idx, layout in enumerate(materialized_layouts):
         stream_id = str(layout.stream_id)
         raw_entry = dict(raw_streams.get(stream_id, {}) or {})
         frequency_axis = _snapshot_axis_to_legacy_frequency_axis(
