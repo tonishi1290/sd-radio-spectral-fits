@@ -16,6 +16,7 @@ from .config import MapConfig
 from .core import grid_otf
 from .gridder import (
     _effective_config,
+    _canonical_projection_frame,
     _prepare_projection_table_and_coords,
     _resolve_weight_mode,
     _assemble_grid_input,
@@ -60,7 +61,9 @@ def _merge_scantables(scantables) -> object:
                 "All scantables must currently have the same input channel count before Standardizer. "
                 f"Got first nchan={nchan0}, but index {idx} has nchan={arr.shape[1]}."
             )
-        tables.append(pd.DataFrame(table).copy())
+        tbl = pd.DataFrame(table).copy()
+        tbl["OTF_TABLE_INDEX"] = int(idx)
+        tables.append(tbl)
         specs.append(np.asarray(arr, dtype=float))
     merged_table = pd.concat(tables, ignore_index=True)
     merged_data = np.vstack(specs)
@@ -93,6 +96,9 @@ def grid_otf_family(
     otf_scan_png=None,
     existing_turn_labels: str | None = None,
     otf_scan_existing_is_turn: str | None = None,
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
     output_fits: str | None = None,
     overwrite: bool = False,
 ):
@@ -142,13 +148,17 @@ def grid_otf_family(
                 stacklevel=2,
             )
 
+    coord_sys_out = _canonical_projection_frame(scantable, coord_sys, ref_coord=ref_coord, table=getattr(scantable, "table", None))
     table, x_arcsec, y_arcsec, lon0, lat0 = _prepare_projection_table_and_coords(
         scantable,
-        frame=coord_sys,
+        frame=coord_sys_out,
         projection=projection,
         ref_coord=ref_coord,
         ref_lon=ref_lon,
         ref_lat=ref_lat,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
     )
 
     out_scale_norm = str(out_scale).strip().upper()
@@ -205,11 +215,15 @@ def grid_otf_family(
     res.meta["otf_scan_summary"] = otf_scan_summary
     if isinstance(scantables, (list, tuple)):
         res.meta["merged_inputs"] = int(len(scantables))
+    if hasattr(table, "attrs"):
+        for key, value in getattr(table, "attrs", {}).items():
+            if str(key).startswith("spice_") or str(key).startswith("moon_disk_"):
+                res.meta[key] = value
 
     bundle = gridresult_to_otf_bundle(
         res,
         v_tgt=v_tgt,
-        coord_sys=coord_sys,
+        coord_sys=coord_sys_out,
         projection=projection,
         lon0=lon0,
         lat0=lat0,
@@ -218,7 +232,7 @@ def grid_otf_family(
         rep_beameff=rep_beameff,
         family_label=family_label,
         extra_meta={
-            "coord_sys": str(coord_sys),
+            "coord_sys": str(coord_sys_out),
             "projection": str(projection),
             "ref_lon": float(lon0),
             "ref_lat": float(lat0),
@@ -227,6 +241,8 @@ def grid_otf_family(
             "vmax_kms": None if vmax_use is None else float(vmax_use),
             "dv_kms": None if dv_use is None else float(dv_use),
             "linefree_velocity_windows_kms": list(linefree_velocity_windows_kms or []) if linefree_velocity_windows_kms is not None else None,
+            "pointing_dx_arcsec": pointing_dx_arcsec,
+            "pointing_dy_arcsec": pointing_dy_arcsec,
             "baseline_subtracted": False,
         },
     )
@@ -239,7 +255,7 @@ def grid_otf_family(
         kind="main",
         params_input={
             "family_label": str(family_label),
-            "coord_sys": str(coord_sys),
+            "coord_sys": str(coord_sys_out),
             "projection": str(projection),
             "out_scale": str(out_scale),
             "dv_kms": dv_kms,
@@ -261,7 +277,7 @@ def grid_otf_family(
         params_config=runtime_config,
         params_resolved={
             "family_label": str(family_label),
-            "coord_sys": str(coord_sys),
+            "coord_sys": str(coord_sys_out),
             "projection": str(projection),
             "ref_lon_used_deg": float(lon0),
             "ref_lat_used_deg": float(lat0),

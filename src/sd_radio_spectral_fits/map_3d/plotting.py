@@ -179,11 +179,72 @@ def _get_bunit_from_header(header: Optional[fits.Header]) -> Optional[u.UnitBase
 
 
 
+def _wcs_has_celestial(wcs: WCS) -> bool:
+    """Return True only when the WCS has two celestial axes."""
+    try:
+        cw = wcs.celestial
+        ctype = [str(cw.wcs.ctype[i]).upper() for i in range(int(cw.wcs.naxis))]
+        return int(cw.wcs.naxis) >= 2 and any("RA" in c or "GLON" in c for c in ctype)
+    except Exception:
+        return False
+
+
+def _header_has_offset_wcs(header: Optional[fits.Header]) -> bool:
+    if header is None:
+        return False
+    c1 = str(header.get("CTYPE1", "")).strip().upper()
+    c2 = str(header.get("CTYPE2", "")).strip().upper()
+    coord = str(header.get("COORDSYS", "")).strip().upper()
+    is_offset = c1 in {"OFFSETX", "XOFFSET", "DAZ", "DAZCOS"} and c2 in {"OFFSETY", "YOFFSET", "DEL"}
+    is_selenographic = (
+        coord == "SELENOGRAPHIC"
+        or (c1 in {"SELON", "SELOFFX"} and c2 in {"SELAT", "SELOFFY"})
+    )
+    return is_offset or is_selenographic or coord in {"AZEL_OFFSET", "SKY_OFFSET", "MOON_DISK_OFFSET"}
+
+
+def _spatial_wcs_from_header(header: Optional[fits.Header]) -> WCS:
+    """Return a 2D WCS suitable for plotting.
+
+    For normal sky maps this is the celestial WCS.  For moving-object dAz/dEl
+    products there is no celestial WCS by design; return the first two linear
+    axes instead so WCSAxes and generic FITS viewers can display OFFSETX/OFFSETY.
+    """
+    hdr = _copy_header(header)
+    w = WCS(hdr)
+    if _wcs_has_celestial(w):
+        return w.celestial
+    try:
+        return w.sub([1, 2])
+    except Exception:
+        hdr2 = _drop_nonspatial_wcs_keywords(hdr)
+        return WCS(hdr2)
+
+
 def _drop_nonspatial_wcs_keywords(header: fits.Header) -> fits.Header:
-    """Create a 2D celestial header from an arbitrary FITS header."""
+    """Create a 2D spatial header from an arbitrary FITS header.
+
+    Celestial maps keep their celestial WCS.  Moving-body dAz/dEl maps keep the
+    first two FITS linear axes (OFFSETX/OFFSETY) instead of forcing a celestial
+    WCS.
+    """
     hdr = _copy_header(header)
     wcs = WCS(hdr)
-    chdr = wcs.celestial.to_header()
+    if _wcs_has_celestial(wcs):
+        chdr = wcs.celestial.to_header()
+    else:
+        try:
+            chdr = wcs.sub([1, 2]).to_header()
+        except Exception:
+            chdr = fits.Header()
+            for key in (
+                "CTYPE1", "CRVAL1", "CDELT1", "CRPIX1", "CUNIT1",
+                "CTYPE2", "CRVAL2", "CDELT2", "CRPIX2", "CUNIT2",
+                "WCSNAME", "COORDSYS", "OFFSYS", "OFFBODY", "OFFREF",
+                "OFFXDEF", "OFFYDEF", "PROJTYPE", "REFOFFX", "REFOFFY",
+            ):
+                if key in hdr:
+                    chdr[key] = hdr[key]
     for key in (
         "BUNIT",
         "BMAJ",
@@ -196,20 +257,29 @@ def _drop_nonspatial_wcs_keywords(header: fits.Header) -> fits.Header:
         "RADESYS",
         "LONPOLE",
         "LATPOLE",
+        "COORDSYS",
+        "OFFSYS",
+        "OFFBODY",
+        "OFFREF",
+        "OFFXDEF",
+        "OFFYDEF",
+        "PROJTYPE",
+        "REFOFFX",
+        "REFOFFY",
     ):
         if key in hdr and key not in chdr:
             chdr[key] = hdr[key]
     return chdr
 
 
-
 def _get_celestial_ctype_list(wcs: WCS) -> List[str]:
     """Return the first two celestial CTYPE strings robustly.
 
-    Some Astropy/WCSLIB builds expose ``wcs.ctype`` as an object that accepts
-    integer indexing but not slicing. Therefore, do not use ``[:2]`` here.
+    For non-celestial linear WCS such as OFFSETX/OFFSETY, this returns the
+    first two WCS CTYPE values instead of an empty celestial projection.
     """
-    cwcs = wcs.celestial.wcs
+    base_wcs = wcs.celestial if _wcs_has_celestial(wcs) else wcs
+    cwcs = base_wcs.wcs
     out: List[str] = []
 
     try:
@@ -225,7 +295,7 @@ def _get_celestial_ctype_list(wcs: WCS) -> List[str]:
 
     if len(out) < 2:
         try:
-            chdr = wcs.celestial.to_header()
+            chdr = base_wcs.to_header()
             for key in ("CTYPE1", "CTYPE2"):
                 if key in chdr and len(out) < 2:
                     out.append(str(chdr[key]))
@@ -239,7 +309,8 @@ def _get_celestial_ctype_list(wcs: WCS) -> List[str]:
 
 
 def _infer_native_coord_system(wcs: WCS) -> str:
-    cwcs = wcs.celestial.wcs
+    base_wcs = wcs.celestial if _wcs_has_celestial(wcs) else wcs
+    cwcs = base_wcs.wcs
 
     lngtyp = str(getattr(cwcs, "lngtyp", "") or "").upper()
     lattyp = str(getattr(cwcs, "lattyp", "") or "").upper()
@@ -249,11 +320,27 @@ def _infer_native_coord_system(wcs: WCS) -> str:
         return "equatorial"
 
     ctype = [ct.upper() for ct in _get_celestial_ctype_list(wcs)]
+    try:
+        hdr = wcs.to_header()
+        coordsys = str(hdr.get("COORDSYS", "")).strip().upper()
+        wcsname = str(hdr.get("WCSNAME", "")).strip().upper()
+        if coordsys == "SELENOGRAPHIC" or wcsname.startswith("MOON-SELENO"):
+            return "selenographic"
+        if coordsys == "MOON_DISK_OFFSET" or wcsname.startswith("MOON-DISK"):
+            return "moon_disk_offset"
+        if coordsys == "SKY_OFFSET" or wcsname.startswith("BODY-SKY"):
+            return "sky_offset"
+    except Exception:
+        pass
+    if any(ct in {"OFFSETX", "XOFFSET", "DAZ", "DAZCOS"} for ct in ctype) or any("OFFSET" in ct for ct in ctype):
+        return "azel_offset"
+    if any("SLON" in ct for ct in ctype) or any("SLAT" in ct for ct in ctype):
+        return "selenographic"
     if any("GLON" in ct for ct in ctype) or any("GLAT" in ct for ct in ctype):
         return "galactic"
     if any("RA" in ct for ct in ctype) or any("DEC" in ct for ct in ctype):
         return "equatorial"
-    return "celestial"
+    return "linear"
 
 
 
@@ -263,13 +350,25 @@ def _default_axis_labels(wcs: WCS) -> Tuple[str, str]:
         return "Galactic Longitude", "Galactic Latitude"
     if mode == "equatorial":
         return "Right Ascension", "Declination"
+    if mode == "azel_offset":
+        return "Az/El offset X = dAz cos(El_body) [deg]", "Az/El offset Y = dEl [deg]"
+    if mode == "sky_offset":
+        return "Moon/Sun sky offset X = dRA cos(Dec_body) [deg]", "Moon/Sun sky offset Y = dDec [deg]"
+    if mode == "moon_disk_offset":
+        return "Moon disk X: +90 deg eastward from lunar north [deg]", "Moon disk Y: apparent lunar north [deg]"
+    if mode == "selenographic":
+        ctype = [c.upper() for c in _get_celestial_ctype_list(wcs)]
+        if any("OFF" in c for c in ctype):
+            return "Selenographic projected X [deg]", "Selenographic projected Y [deg]"
+        return "Selenographic Longitude [deg]", "Selenographic Latitude [deg]"
     ctype = _get_celestial_ctype_list(wcs)
     return ctype[0], ctype[1]
 
 
 
 def _pixel_scale_arcsec(wcs: WCS) -> float:
-    scales = proj_plane_pixel_scales(wcs.celestial)
+    base_wcs = wcs.celestial if _wcs_has_celestial(wcs) else wcs
+    scales = proj_plane_pixel_scales(base_wcs)
     return float(np.nanmean(np.abs(scales)) * 3600.0)
 
 
@@ -530,7 +629,7 @@ def _projection_to_map2d(obj: Any, meta: Optional[Dict[str, Any]] = None) -> Map
         header = obj.wcs.celestial.to_header()
     header = _copy_header(header)
     unit = _as_unit(getattr(obj, "unit", None)) or _get_bunit_from_header(header)
-    wcs = WCS(header).celestial if len(header) > 0 else obj.wcs.celestial
+    wcs = _spatial_wcs_from_header(header) if len(header) > 0 else _spatial_wcs_from_header(obj.wcs.to_header())
     if unit is not None and "BUNIT" not in header:
         header["BUNIT"] = unit.to_string()
     return Map2D(data=data, header=header, wcs=wcs, unit=unit, meta=dict(meta or {}))
@@ -560,7 +659,7 @@ def resolve_map_input(
                 f"Selected OTFBundle source is not 2D (ext={meta.get('ext')!r}, ndim={arr.ndim})."
             )
         hdr2d = _drop_nonspatial_wcs_keywords(hdr)
-        return Map2D(data=arr, header=hdr2d, wcs=WCS(hdr2d).celestial, unit=unit, meta=meta)
+        return Map2D(data=arr, header=hdr2d, wcs=_spatial_wcs_from_header(hdr2d), unit=unit, meta=meta)
 
     if data is not None:
         if header is None:
@@ -573,7 +672,7 @@ def resolve_map_input(
         return Map2D(
             data=arr,
             header=hdr,
-            wcs=WCS(hdr).celestial,
+            wcs=_spatial_wcs_from_header(hdr),
             unit=unit,
             meta={"source_kind": "header_data"},
         )
@@ -587,7 +686,7 @@ def resolve_map_input(
             raise ValueError(f"Expected a 2D HDU, got ndim={arr.ndim}.")
         hdr = _drop_nonspatial_wcs_keywords(source.header)
         unit = _get_bunit_from_header(source.header)
-        return Map2D(data=arr, header=hdr, wcs=WCS(hdr).celestial, unit=unit, meta={"source_kind": "hdu"})
+        return Map2D(data=arr, header=hdr, wcs=_spatial_wcs_from_header(hdr), unit=unit, meta={"source_kind": "hdu"})
 
     if Projection is not None and isinstance(source, Projection):
         return _projection_to_map2d(source, meta={"source_kind": "projection"})
@@ -607,7 +706,7 @@ def resolve_map_input(
             return Map2D(
                 data=arr,
                 header=hdr,
-                wcs=WCS(hdr).celestial,
+                wcs=_spatial_wcs_from_header(hdr),
                 unit=unit,
                 meta={"source_kind": "fits", "source": str(source), "ext": ext},
             )
@@ -637,6 +736,166 @@ def _try_resolve_map_input(
         return resolve_map_input(source=source, data=data, header=header, ext=ext)
     except Exception:
         return None
+
+
+
+
+def _try_resolve_plain_cube_input(
+    source: SourceLike,
+    *,
+    ext: Optional[Union[int, str]] = None,
+) -> Optional[Tuple[np.ndarray, fits.Header, Optional[u.UnitBase], Dict[str, Any]]]:
+    """Resolve a 3D cube without SpectralCube when spatial WCS is linear.
+
+    SpectralCube is excellent for ordinary celestial cubes, but moving-body
+    OFFSETX/OFFSETY products intentionally have no celestial axes.  This helper
+    keeps those FITS files plottable for channel maps and simple moments.
+    """
+    hdu_obj = None
+    close_after = False
+    hdul = None
+    if isinstance(source, tuple) and len(source) == 2:
+        header, data = source
+        arr = np.asarray(data, dtype=float)
+        hdr = _copy_header(header)
+        if arr.ndim == 3 and _header_has_offset_wcs(hdr):
+            return arr, hdr, _get_bunit_from_header(hdr), {"source_kind": "plain_header_data"}
+        return None
+    if isinstance(source, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)):
+        hdu_obj = source
+    else:
+        hdul, close_after = _open_hdul_if_needed(source)
+        if hdul is not None:
+            try:
+                hdu_obj = _get_hdu_from_hdul(hdul, ext=ext)
+            except Exception:
+                if close_after:
+                    hdul.close()
+                return None
+    try:
+        if hdu_obj is None or getattr(hdu_obj, "data", None) is None:
+            return None
+        arr = np.asarray(hdu_obj.data, dtype=float)
+        hdr = _copy_header(hdu_obj.header)
+        if arr.ndim != 3 or not _header_has_offset_wcs(hdr):
+            return None
+        meta = {"source_kind": "plain_fits", "ext": ext}
+        if _is_pathlike(source):
+            meta["source"] = str(source)
+        return arr, hdr, _get_bunit_from_header(hdr), meta
+    finally:
+        if close_after and hdul is not None:
+            hdul.close()
+
+
+def _plain_cube_spectral_axis(header: fits.Header, nchan: int) -> Tuple[np.ndarray, u.UnitBase]:
+    crpix = float(header.get("CRPIX3", 1.0))
+    crval = float(header.get("CRVAL3", 0.0))
+    cdelt = float(header.get("CDELT3", 1.0))
+    unit = _as_unit(header.get("CUNIT3", "")) or u.dimensionless_unscaled
+    axis = crval + (np.arange(int(nchan), dtype=float) + 1.0 - crpix) * cdelt
+    return axis, unit
+
+
+def _make_2d_map_from_plain_cube(
+    plain: Tuple[np.ndarray, fits.Header, Optional[u.UnitBase], Dict[str, Any]],
+    *,
+    mode: str,
+    chan_range: Optional[Tuple[int, int]],
+    vel_range: Optional[Tuple[float, float]],
+    mask: Optional[np.ndarray],
+    mask_mode: Optional[str],
+    zero_fill: bool,
+    nan_fill: bool,
+    fill_value: float,
+    smooth_fwhm_arcsec: Optional[float],
+    target_hpbw_arcsec: Optional[float],
+    orig_hpbw_arcsec: Optional[float],
+) -> Map2D:
+    data3d, header, data_unit, meta = plain
+    if mask_mode is not None and mask is None:
+        raise ValueError("mask_mode requires SpectralCube/celestial mask support here; provide an explicit mask array or use a 2D extension.")
+    if mask is not None:
+        data3d = _apply_mask_fill(data3d, np.asarray(mask, dtype=bool), zero_fill=zero_fill, nan_fill=nan_fill, fill_value=fill_value)
+    nchan = int(data3d.shape[0])
+    spec_axis, spec_unit = _plain_cube_spectral_axis(header, nchan)
+    chan_idx = _resolve_channel_indices(nchan, spec_axis, chan_range=chan_range, vel_range=vel_range)
+    if mode in {"moment0", "provisional_moment", "final_moment"}:
+        map_data, out_unit = _moment0_from_subset(
+            data3d,
+            spec_axis,
+            spec_unit,
+            chan_idx=chan_idx,
+            data_unit=data_unit,
+            nan_fill=nan_fill,
+        )
+    elif mode == "channel_sum":
+        sub = data3d[chan_idx, :, :]
+        map_data = np.nansum(sub, axis=0)
+        if nan_fill:
+            map_data[np.all(~np.isfinite(sub), axis=0)] = np.nan
+        out_unit = data_unit
+    elif mode == "channel_mean":
+        sub = data3d[chan_idx, :, :]
+        with np.errstate(invalid="ignore"):
+            map_data = np.nanmean(sub, axis=0)
+        if nan_fill:
+            map_data[np.all(~np.isfinite(sub), axis=0)] = np.nan
+        out_unit = data_unit
+    elif mode == "channel_slice":
+        map_data = np.asarray(data3d[int(chan_idx[0]), :, :], dtype=float)
+        out_unit = data_unit
+    elif mode == "velocity_slice":
+        if vel_range is None:
+            raise ValueError("velocity_slice requires vel_range to be given.")
+        idx = int(np.argmin(np.abs(spec_axis - float(np.mean(vel_range)))))
+        map_data = np.asarray(data3d[idx, :, :], dtype=float)
+        out_unit = data_unit
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    hdr2d = _drop_nonspatial_wcs_keywords(header)
+    wcs2d = _spatial_wcs_from_header(hdr2d)
+    orig = orig_hpbw_arcsec
+    orig_source = "explicit"
+    if orig is None:
+        orig, orig_source = _infer_orig_hpbw_arcsec(header)
+    if smooth_fwhm_arcsec is not None or target_hpbw_arcsec is not None:
+        map_data = apply_gaussian_smoothing_2d(
+            map_data,
+            wcs2d,
+            smooth_fwhm_arcsec=smooth_fwhm_arcsec,
+            target_hpbw_arcsec=target_hpbw_arcsec,
+            orig_hpbw_arcsec=orig,
+        )
+    eff_hpbw, eff_source = _effective_hpbw_arcsec(
+        smooth_fwhm_arcsec=smooth_fwhm_arcsec,
+        target_hpbw_arcsec=target_hpbw_arcsec,
+        orig_hpbw_arcsec=orig,
+    )
+    if eff_hpbw is not None:
+        hdr2d["BMAJ"] = float(eff_hpbw) / 3600.0
+        hdr2d["BMIN"] = float(eff_hpbw) / 3600.0
+    if out_unit is not None:
+        hdr2d["BUNIT"] = out_unit.to_string()
+    meta = dict(meta)
+    meta.update({
+        "mode": mode,
+        "moment_kind": "plain_offset",
+        "range_kind": "channel" if chan_range is not None else "velocity" if vel_range is not None else "all",
+        "range_value": chan_range if chan_range is not None else vel_range,
+        "smooth_info": {
+            "smooth_fwhm_arcsec": smooth_fwhm_arcsec,
+            "target_hpbw_arcsec": target_hpbw_arcsec,
+            "orig_hpbw_arcsec": orig,
+            "orig_hpbw_source": orig_source,
+            "effective_hpbw_arcsec": eff_hpbw,
+            "effective_hpbw_source": eff_source,
+        },
+        "spectral_axis_unit": str(spec_unit),
+        "spectral_axis_mode": "plain_fits_wcs3",
+    })
+    return Map2D(data=np.asarray(map_data, dtype=float), header=hdr2d, wcs=wcs2d, unit=out_unit, meta=meta)
 
 
 
@@ -1072,7 +1331,7 @@ def crop_map2d(
     return Map2D(
         data=np.asarray(cutout.data, dtype=float),
         header=hdr,
-        wcs=cutout.wcs.celestial,
+        wcs=_spatial_wcs_from_header(hdr),
         unit=map2d.unit,
         meta=meta,
     )
@@ -1470,7 +1729,7 @@ def make_2d_map(
                     },
                 }
             )
-            return Map2D(data=smoothed, header=hdr, wcs=WCS(hdr).celestial, unit=map2d.unit, meta=meta)
+            return Map2D(data=smoothed, header=hdr, wcs=_spatial_wcs_from_header(hdr), unit=map2d.unit, meta=meta)
 
         meta = dict(map2d.meta)
         meta.update(
@@ -1481,7 +1740,24 @@ def make_2d_map(
                 "ignored_make_2d_reason": ignored_reason,
             }
         )
-        return Map2D(data=np.asarray(map2d.data, dtype=float), header=fits.Header(map2d.header), wcs=WCS(map2d.header).celestial, unit=map2d.unit, meta=meta)
+        return Map2D(data=np.asarray(map2d.data, dtype=float), header=fits.Header(map2d.header), wcs=_spatial_wcs_from_header(map2d.header), unit=map2d.unit, meta=meta)
+
+    plain_cube = _try_resolve_plain_cube_input(source, ext=ext)
+    if plain_cube is not None:
+        return _make_2d_map_from_plain_cube(
+            plain_cube,
+            mode=mode,
+            chan_range=chan_range,
+            vel_range=vel_range,
+            mask=mask,
+            mask_mode=mask_mode,
+            zero_fill=zero_fill,
+            nan_fill=nan_fill,
+            fill_value=fill_value,
+            smooth_fwhm_arcsec=smooth_fwhm_arcsec,
+            target_hpbw_arcsec=target_hpbw_arcsec,
+            orig_hpbw_arcsec=orig_hpbw_arcsec,
+        )
 
     cube_input = resolve_cube_input(source, ext=ext)
     cube = cube_input.cube
@@ -1602,7 +1878,7 @@ def make_2d_map(
         raise ValueError(f"Unsupported mode: {mode}")
 
     hdr2d = _drop_nonspatial_wcs_keywords(cube_input.header)
-    wcs2d = WCS(hdr2d).celestial
+    wcs2d = _spatial_wcs_from_header(hdr2d)
 
     orig = orig_hpbw_arcsec
     orig_source = "explicit"
@@ -1864,7 +2140,8 @@ def _format_readout_value(value: Any) -> str:
 
 def _estimate_readout_coord_precision(map2d: Map2D) -> Tuple[int, int]:
     try:
-        scales = np.asarray(proj_plane_pixel_scales(map2d.wcs.celestial), dtype=float)
+        base_wcs = map2d.wcs.celestial if _wcs_has_celestial(map2d.wcs) else map2d.wcs
+        scales = np.asarray(proj_plane_pixel_scales(base_wcs), dtype=float)
         finite = scales[np.isfinite(scales) & (scales > 0)]
         if finite.size == 0:
             raise ValueError
@@ -1910,6 +2187,14 @@ def _format_lonlat_readout(map2d: Map2D, lon_deg: float, lat_deg: float) -> Tupl
 
     lon_s = f"{float(lon_deg):.{decimal_deg_precision}f}"
     lat_s = f"{float(lat_deg):.{decimal_deg_precision}f}"
+    if native == "azel_offset":
+        return (f"dAz*cosEl={lon_s} deg", f"dEl={lat_s} deg")
+    if native == "sky_offset":
+        return (f"dRA*cosDec={lon_s} deg", f"dDec={lat_s} deg")
+    if native == "moon_disk_offset":
+        return (f"moon disk X={lon_s} deg", f"moon disk Y={lat_s} deg")
+    if native == "selenographic":
+        return (f"selenographic lon={lon_s} deg", f"selenographic lat={lat_s} deg")
     return (f"lon={lon_s} deg", f"lat={lat_s} deg")
 
 
@@ -2056,6 +2341,8 @@ def _target_frame_name_from_wcs(wcs: WCS) -> str:
     mode = _infer_native_coord_system(wcs)
     if mode == "galactic":
         return "galactic"
+    if mode in {"azel_offset", "sky_offset", "moon_disk_offset", "linear", "selenographic"}:
+        raise ValueError("This WCS is not celestial RA/Dec/Galactic; use pixel/xy overlay coordinates instead of SkyCoord/world lon-lat.")
     cwcs = wcs.celestial.wcs
     radesys = _normalize_frame_name(getattr(cwcs, "radesys", None))
     if radesys in {"icrs", "fk5", "fk4"}:
@@ -3094,7 +3381,10 @@ def plot_map(
             cbar.set_label(colorbar_label, rotation=270, va="bottom")
 
     if grid:
-        ax.coords.grid(color="white", alpha=0.25, linestyle="solid")
+        try:
+            ax.coords.grid(color="white", alpha=0.25, linestyle="solid")
+        except Exception:
+            ax.grid(color="white", alpha=0.25, linestyle="solid")
 
     default_xlabel, default_ylabel = _default_axis_labels(map2d.wcs)
     ax.set_xlabel(xlabel or default_xlabel)
@@ -3115,7 +3405,10 @@ def plot_map(
 
     north_arrow_artists = None
     if north_arrow:
-        north_arrow_artists = add_north_arrow(ax, map2d, north_arrow)
+        if _infer_native_coord_system(map2d.wcs) in {"azel_offset", "sky_offset", "moon_disk_offset", "linear", "selenographic"}:
+            warnings.warn("north_arrow is only meaningful for celestial RA/Dec/Galactic WCS maps; skipping for offset/selenographic WCS.", RuntimeWarning)
+        else:
+            north_arrow_artists = add_north_arrow(ax, map2d, north_arrow)
 
     if show_readout:
         _apply_readout_formatter(ax, map2d)
@@ -3478,7 +3771,13 @@ def plot_scene(
         elif layer_kind in {"north_arrow", "compass"}:
             ann_map = _annotation_map_from_base(base_obj)
             if ann_map is not None:
-                overlay_artists.append(add_north_arrow(ax, ann_map, layer.get("config", layer)))
+                if _infer_native_coord_system(ann_map.wcs) in {"azel_offset", "sky_offset", "moon_disk_offset", "linear", "selenographic"}:
+                    warnings.warn(
+                        "north_arrow is only meaningful for celestial WCS maps; skipping for linear offset WCS.",
+                        RuntimeWarning,
+                    )
+                else:
+                    overlay_artists.append(add_north_arrow(ax, ann_map, layer.get("config", layer)))
         else:
             raise ValueError(f"Unsupported overlay kind: {layer_kind}")
 

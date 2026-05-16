@@ -14,11 +14,20 @@ import pandas as pd
 
 from ..regrid_vlsrk import Standardizer
 from .core import grid_otf
-from .wcs_proj import project_to_plane
+from .wcs_proj import (
+    project_to_plane,
+    project_azel_offset_to_plane,
+    project_sky_offset_to_plane,
+    normalize_azel_offset_coord_sys,
+    normalize_sky_offset_coord_sys,
+    normalize_moon_disk_offset_coord_sys,
+    normalize_selenographic_coord_sys,
+)
 from .config import MapConfig, GridInput, normalize_row_flag_mask
 from .fits_io import save_map_fits
 from ..tempscale import beameff_array, tempscal_array, ta_to_tr
-from ..scantable_utils import _df_to_native_endian
+from ..scantable_utils import _df_to_native_endian, _resolve_table_timestamps
+from .pointing_correction import resolve_pointing_offsets_arcsec
 
 
 class _ConfigView:
@@ -578,6 +587,549 @@ def _extract_lon_lat_arrays(table: pd.DataFrame, frame: str) -> tuple[np.ndarray
     return lon_deg, lat_deg
 
 
+def _meta_get_any(meta: dict, *keys):
+    for key in keys:
+        if key in meta and meta[key] not in (None, ""):
+            return meta[key]
+    return None
+
+
+def _object_name_from_scantable(scantable, table: pd.DataFrame | None = None):
+    meta = getattr(scantable, "meta", {}) or {}
+    value = _meta_get_any(meta, "OBJECT", "SRCNAME", "SOURCE", "TARGET")
+    if value not in (None, ""):
+        return value
+    if table is not None:
+        for col in ("OBJECT", "SRCNAME", "SOURCE", "TARGET"):
+            if col in table.columns:
+                vals = pd.Series(table[col]).dropna().astype(str)
+                vals = vals[vals.str.len() > 0]
+                if len(vals):
+                    return vals.iloc[0]
+    return None
+
+
+def _canonical_projection_frame(scantable, frame: str, ref_coord=None, table: pd.DataFrame | None = None) -> str:
+    """Canonicalize coord_sys while preserving existing ICRS/Galactic names."""
+    object_name = _object_name_from_scantable(scantable, table)
+    is_seleno, _selenobody, seleno_canonical = normalize_selenographic_coord_sys(
+        frame,
+        ref_coord=ref_coord,
+        object_name=object_name,
+    )
+    if is_seleno:
+        return seleno_canonical
+
+    is_disk_offset, disk_body, disk_canonical = normalize_moon_disk_offset_coord_sys(
+        frame,
+        ref_coord=ref_coord,
+        object_name=object_name,
+    )
+    if is_disk_offset and disk_body is None:
+        raise ValueError(
+            "coord_sys='disk_offset' requires a moving body and is currently supported only for the Moon. "
+            "Use coord_sys='moon_disk_offset', or provide ref_coord='moon' or OBJECT='MOON'."
+        )
+    if is_disk_offset:
+        if disk_body != "moon":
+            raise ValueError("Only coord_sys='moon_disk_offset' is currently supported for disk-oriented offsets.")
+        return disk_canonical
+
+    is_sky_offset, sky_body, sky_canonical = normalize_sky_offset_coord_sys(
+        frame,
+        ref_coord=ref_coord,
+        object_name=object_name,
+    )
+    if is_sky_offset and sky_body is None:
+        raise ValueError(
+            "coord_sys='sky_offset' requires a moving body. Use coord_sys='moon_sky_offset' "
+            "or coord_sys='sun_sky_offset', or provide ref_coord='moon'/'sun' or OBJECT metadata."
+        )
+    if is_sky_offset:
+        return sky_canonical
+
+    is_offset, body, canonical = normalize_azel_offset_coord_sys(
+        frame,
+        ref_coord=ref_coord,
+        object_name=object_name,
+    )
+    if is_offset and body is None:
+        raise ValueError(
+            "coord_sys='azel_offset' requires a moving body. Use coord_sys='moon_azel_offset' "
+            "or coord_sys='sun_azel_offset', or provide ref_coord='moon'/'sun' or OBJECT metadata."
+        )
+    return canonical
+
+
+def _combined_meta_for_location(scantable, table: pd.DataFrame) -> dict:
+    meta = dict(getattr(scantable, "meta", {}) or {})
+    for key in (
+        "OBSGEO-X", "OBSGEO-Y", "OBSGEO-Z", "OBSGEO_X", "OBSGEO_Y", "OBSGEO_Z",
+        "SITELAT", "SITELONG", "SITELON", "SITEELEV", "SITE_LAT", "SITE_LON", "SITE_ELEV",
+        "site_lat_deg", "site_lon_deg", "site_height_m", "site_name", "SITENAME", "OBS_SITE", "SITE",
+    ):
+        if key in meta and meta[key] not in (None, ""):
+            continue
+        if key in table.columns:
+            arr = pd.Series(table[key]).dropna()
+            if len(arr):
+                meta[key] = arr.iloc[0]
+    return meta
+
+
+def _resolve_time_for_astropy(table: pd.DataFrame):
+    ts = _resolve_table_timestamps(table)
+    if ts is None or len(ts) == 0 or ts.isna().all():
+        raise ValueError(
+            "Moving-body Az/El offset mapping requires real UTC timestamps. "
+            "Provide TIMESTAMP, MJD, or DATE-OBS/DATEOBS(+TIME) columns."
+        )
+    return ts
+
+
+
+def _meta_or_table_value(scantable, table: pd.DataFrame, *keys, default=None):
+    """Return the first non-empty value from scantable.meta or constant table columns."""
+    meta = getattr(scantable, "meta", {}) or {}
+    for key in keys:
+        for cand in (key, str(key).upper(), str(key).lower()):
+            if cand in meta and meta[cand] not in (None, ""):
+                return meta[cand]
+    for key in keys:
+        for cand in (key, str(key).upper(), str(key).lower()):
+            if cand in table.columns:
+                ser = pd.Series(table[cand]).dropna()
+                if len(ser):
+                    val = ser.iloc[0]
+                    if val not in (None, ""):
+                        return val
+    return default
+
+
+def _moving_body_radec_input_mode(scantable, table: pd.DataFrame) -> str:
+    """Resolve how RA/DEC columns should be interpreted for moving-body maps.
+
+    The safe default is ``apparent``: RA/DEC are interpreted as topocentric
+    apparent directions in the same GCRS-like frame as ``astropy.get_body``.
+    This matches coordinates reconstructed from the actual Az/El at each dump
+    and avoids reintroducing lunar parallax.
+
+    If a table stores far-field catalog ICRS/FK5/FK4 coordinates instead, set
+    one of these metadata keys to ``ICRS``/``FK5``/``FK4``:
+    ``MOVING_BODY_RADEC_FRAME``, ``BODY_RADEC_FRAME``, or
+    ``BODY_OFFSET_RADEC_FRAME``.
+    """
+    value = _meta_or_table_value(
+        scantable,
+        table,
+        "MOVING_BODY_RADEC_FRAME",
+        "BODY_RADEC_FRAME",
+        "BODY_OFFSET_RADEC_FRAME",
+        "MOVBODY_RADEC_FRAME",
+        default="apparent",
+    )
+    text = str(value).strip().lower().replace("-", "_")
+    aliases = {
+        "": "apparent",
+        "native": "apparent",
+        "apparent": "apparent",
+        "topocentric": "apparent",
+        "topocentric_apparent": "apparent",
+        "gcrs": "apparent",
+        "icrs": "icrs",
+        "j2000": "icrs",
+        "fk5": "fk5",
+        "fk4": "fk4",
+    }
+    if text not in aliases:
+        raise ValueError(
+            "Unsupported moving-body RA/DEC input frame "
+            f"{value!r}. Use 'apparent' (default), 'ICRS', 'FK5', or 'FK4'."
+        )
+    return aliases[text]
+
+
+def _beam_skycoord_in_body_frame(table: pd.DataFrame, *, body_coord, scantable):
+    """Build per-row beam directions in the same apparent frame as body_coord."""
+    import astropy.units as u
+    from astropy.coordinates import FK4, FK5, SkyCoord
+
+    body_frame = body_coord.frame.replicate_without_data()
+    if {"RA", "DEC"}.issubset(table.columns):
+        ra = pd.to_numeric(table["RA"], errors="coerce").to_numpy(dtype=float)
+        dec = pd.to_numeric(table["DEC"], errors="coerce").to_numpy(dtype=float)
+        mode = _moving_body_radec_input_mode(scantable, table)
+        if mode == "apparent":
+            return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=body_frame), mode
+        if mode == "icrs":
+            return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs").transform_to(body_frame), mode
+        equinox = _meta_or_table_value(scantable, table, "EQUINOX", "RADECEQNX", default=2000.0)
+        if mode == "fk5":
+            return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=FK5(equinox=f"J{float(equinox):.6f}")).transform_to(body_frame), mode
+        if mode == "fk4":
+            return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame=FK4(equinox=f"B{float(equinox):.6f}")).transform_to(body_frame), mode
+    elif {"GLON", "GLAT"}.issubset(table.columns):
+        glon = pd.to_numeric(table["GLON"], errors="coerce").to_numpy(dtype=float)
+        glat = pd.to_numeric(table["GLAT"], errors="coerce").to_numpy(dtype=float)
+        return SkyCoord(l=glon * u.deg, b=glat * u.deg, frame="galactic").transform_to(body_frame), "galactic"
+    else:
+        raise ValueError(
+            "Moving-body offset mapping requires per-beam RA/DEC or GLON/GLAT columns. "
+            "BORE_AZ/BORE_EL are deliberately not used because they are unsafe for multi-beam data."
+        )
+    raise RuntimeError("unreachable moving-body beam-coordinate branch")
+
+
+def _prepare_moving_body_sky_offset_table_and_coords(
+    scantable,
+    *,
+    body: str,
+    projection: str = "SFL",
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
+    pointing_table_index: int | None = None,
+):
+    """Create Moon/Sun-centered apparent sky-plane offsets.
+
+    This removes AltAz/parallactic field rotation from scans executed in dAz/dEl.
+    It intentionally does not use BORE_AZ/BORE_EL.  For multi-beam data, the
+    per-row RA/DEC or GLON/GLAT encode each beam's actual sky direction.
+    """
+    try:
+        import astropy.units as u
+        from astropy.coordinates import get_body
+        from astropy.time import Time
+    except Exception as exc:
+        raise ImportError(
+            "Moving-body sky-offset mapping requires astropy. Install astropy, or use fixed RA/Dec/Galactic mapping."
+        ) from exc
+
+    from ..doppler import earth_location_from_meta
+
+    table = _df_to_native_endian(scantable.table).copy()
+    canonical_body = str(body).strip().lower()
+    if canonical_body not in {"moon", "sun"}:
+        raise ValueError(f"Unsupported moving body for sky offset mapping: {body!r}. Use 'moon' or 'sun'.")
+
+    timestamps = _resolve_time_for_astropy(table)
+    obstime = Time(timestamps.to_pydatetime(), scale="utc")
+    location = earth_location_from_meta(_combined_meta_for_location(scantable, table))
+    body_coord = get_body(canonical_body, obstime, location=location)
+    beam_apparent, input_frame_mode = _beam_skycoord_in_body_frame(table, body_coord=body_coord, scantable=scantable)
+
+    proj = str(projection).upper()
+    if proj in ("GLS", "SFL", "SINE"):
+        dx, dy = body_coord.spherical_offsets_to(beam_apparent)
+        x_arcsec = dx.to_value(u.arcsec)
+        y_arcsec = dy.to_value(u.arcsec)
+    elif proj in ("CAR", "PLATE_CARREE", "NONE"):
+        x_arcsec, y_arcsec = project_sky_offset_to_plane(
+            beam_apparent.ra.to_value(u.deg),
+            beam_apparent.dec.to_value(u.deg),
+            body_coord.ra.to_value(u.deg),
+            body_coord.dec.to_value(u.deg),
+            projection=projection,
+        )
+    else:
+        raise ValueError(f"Unknown projection: {proj}. Supported: CAR, SFL.")
+
+    corr_dx, corr_dy = resolve_pointing_offsets_arcsec(
+        table,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
+        table_index=pointing_table_index,
+    )
+    x_arcsec = np.asarray(x_arcsec, dtype=float) + corr_dx
+    y_arcsec = np.asarray(y_arcsec, dtype=float) + corr_dy
+
+    table["DRA_BODY"] = x_arcsec / 3600.0
+    table["DDEC_BODY"] = y_arcsec / 3600.0
+    table["POINT_DX_ARCSEC"] = corr_dx
+    table["POINT_DY_ARCSEC"] = corr_dy
+    table["BODY_RA"] = body_coord.ra.to_value(u.deg)
+    table["BODY_DEC"] = body_coord.dec.to_value(u.deg)
+    table["BEAM_RA_APP"] = beam_apparent.ra.to_value(u.deg)
+    table["BEAM_DEC_APP"] = beam_apparent.dec.to_value(u.deg)
+    table["BODY_RADEC_INPUT"] = input_frame_mode
+    return table, np.asarray(x_arcsec, dtype=float), np.asarray(y_arcsec, dtype=float), 0.0, 0.0
+
+
+# IAU mean lunar north-pole direction in ICRS-like inertial coordinates.
+# This is used only to orient the apparent lunar disk.  moon_selenographic uses
+# SPICE when true body-fixed surface coordinates are requested.
+_IAU_MOON_MEAN_POLE_RA_DEG = 269.9949
+_IAU_MOON_MEAN_POLE_DEC_DEG = 66.5392
+
+
+def _apparent_lunar_north_position_angle(body_coord):
+    """Return apparent lunar-north position angle east of celestial north.
+
+    The result is one angle per row, in degrees.  It is computed by projecting
+    the IAU mean lunar spin axis onto the local tangent plane at the apparent
+    Moon center.  It is intentionally lightweight and Astropy-only; users who
+    need true surface longitude/latitude should use moon_selenographic.
+    """
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+
+    body_frame = body_coord.frame.replicate_without_data()
+    pole_icrs = SkyCoord(
+        ra=_IAU_MOON_MEAN_POLE_RA_DEG * u.deg,
+        dec=_IAU_MOON_MEAN_POLE_DEC_DEG * u.deg,
+        frame="icrs",
+    )
+    pole_in_body_frame = pole_icrs.transform_to(body_frame)
+    pa = body_coord.position_angle(pole_in_body_frame)
+    return pa.to_value(u.deg)
+
+
+def _rotate_sky_offsets_to_moon_disk(x_sky_arcsec, y_sky_arcsec, pa_north_deg):
+    """Rotate sky east/north offsets into apparent Moon-disk axes.
+
+    Input x/y are Moon-centered sky offsets: +x is increasing RA/east and +y is
+    increasing Dec/north.  pa_north_deg is the apparent lunar north-pole
+    position angle, measured east of celestial north.
+
+    Output:
+      x_disk = component along PA = pa_north + 90 deg
+      y_disk = component along apparent lunar north PA
+    """
+    x = np.asarray(x_sky_arcsec, dtype=float)
+    y = np.asarray(y_sky_arcsec, dtype=float)
+    p = np.deg2rad(np.asarray(pa_north_deg, dtype=float))
+    xp = x * np.cos(p) - y * np.sin(p)
+    yp = x * np.sin(p) + y * np.cos(p)
+    return xp, yp
+
+
+def _prepare_moon_disk_offset_table_and_coords(
+    scantable,
+    *,
+    projection: str = "SFL",
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
+    pointing_table_index: int | None = None,
+):
+    """Create apparent Moon-disk coordinates with lunar north fixed upward.
+
+    This is the preferred lightweight frame when the Moon should remain a
+    ~30-arcmin apparent disk but should not rotate with the AltAz frame.  The
+    transformation is:
+
+      Moon-centered sky offset -> pointing correction -> rotate by lunar-north PA.
+
+    The axes are not selenographic longitude/latitude.  They are linear angular
+    offsets on the apparent disk.
+    """
+    try:
+        import astropy.units as u
+        from astropy.coordinates import get_body
+        from astropy.time import Time
+    except Exception as exc:
+        raise ImportError(
+            "moon_disk_offset mapping requires astropy. Install astropy, or use fixed RA/Dec/Galactic mapping."
+        ) from exc
+
+    from ..doppler import earth_location_from_meta
+
+    table = _df_to_native_endian(scantable.table).copy()
+    timestamps = _resolve_time_for_astropy(table)
+    obstime = Time(timestamps.to_pydatetime(), scale="utc")
+    location = earth_location_from_meta(_combined_meta_for_location(scantable, table))
+    body_coord = get_body("moon", obstime, location=location)
+    beam_apparent, input_frame_mode = _beam_skycoord_in_body_frame(table, body_coord=body_coord, scantable=scantable)
+
+    proj = str(projection).upper()
+    if proj in ("GLS", "SFL", "SINE"):
+        dx, dy = body_coord.spherical_offsets_to(beam_apparent)
+        x_sky_arcsec = dx.to_value(u.arcsec)
+        y_sky_arcsec = dy.to_value(u.arcsec)
+    elif proj in ("CAR", "PLATE_CARREE", "NONE"):
+        x_sky_arcsec, y_sky_arcsec = project_sky_offset_to_plane(
+            beam_apparent.ra.to_value(u.deg),
+            beam_apparent.dec.to_value(u.deg),
+            body_coord.ra.to_value(u.deg),
+            body_coord.dec.to_value(u.deg),
+            projection=projection,
+        )
+    else:
+        raise ValueError(f"Unknown projection: {proj}. Supported: CAR, SFL.")
+
+    corr_dx, corr_dy = resolve_pointing_offsets_arcsec(
+        table,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
+        table_index=pointing_table_index,
+    )
+    # Existing runtime pointing offsets are defined in moon_sky_offset axes.
+    # Apply them before the Moon-disk rotation so the corrected line of sight is
+    # what gets displayed/gridded.
+    x_sky_corr = np.asarray(x_sky_arcsec, dtype=float) + corr_dx
+    y_sky_corr = np.asarray(y_sky_arcsec, dtype=float) + corr_dy
+    pa_north_deg = _apparent_lunar_north_position_angle(body_coord)
+    x_disk_arcsec, y_disk_arcsec = _rotate_sky_offsets_to_moon_disk(
+        x_sky_corr,
+        y_sky_corr,
+        pa_north_deg,
+    )
+
+    table["DRA_BODY"] = np.asarray(x_sky_corr, dtype=float) / 3600.0
+    table["DDEC_BODY"] = np.asarray(y_sky_corr, dtype=float) / 3600.0
+    table["MOON_DISK_X"] = np.asarray(x_disk_arcsec, dtype=float) / 3600.0
+    table["MOON_DISK_Y"] = np.asarray(y_disk_arcsec, dtype=float) / 3600.0
+    table["MOON_NORTH_PA"] = np.asarray(pa_north_deg, dtype=float)
+    table["POINT_DX_ARCSEC"] = corr_dx
+    table["POINT_DY_ARCSEC"] = corr_dy
+    table["BODY_RA"] = body_coord.ra.to_value(u.deg)
+    table["BODY_DEC"] = body_coord.dec.to_value(u.deg)
+    table["BEAM_RA_APP"] = beam_apparent.ra.to_value(u.deg)
+    table["BEAM_DEC_APP"] = beam_apparent.dec.to_value(u.deg)
+    table["BODY_RADEC_INPUT"] = input_frame_mode
+    table.attrs["moon_disk_pa_model"] = "IAU_MEAN_POLE"
+    table.attrs["moon_disk_axis_y"] = "+Y is apparent lunar north-pole direction"
+    table.attrs["moon_disk_axis_x"] = "+X is PA(lunar north)+90 deg on the sky"
+    table.attrs["moon_disk_pa_median_deg"] = float(np.nanmedian(pa_north_deg)) if np.isfinite(pa_north_deg).any() else np.nan
+    return table, np.asarray(x_disk_arcsec, dtype=float), np.asarray(y_disk_arcsec, dtype=float), 0.0, 0.0
+
+
+def _prepare_moving_body_azel_offset_table_and_coords(
+    scantable,
+    *,
+    body: str,
+    projection: str = "SFL",
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
+    pointing_table_index: int | None = None,
+):
+    """Create dAz/dEl coordinates from each row's beam sky position minus Sun/Moon.
+
+    This intentionally does not use BORE_AZ/BORE_EL.  For multi-beam data, the
+    per-row RA/DEC or GLON/GLAT already encode the actual beam direction; we
+    transform that direction to topocentric AltAz at the row time and subtract
+    the moving-body center at the same time and site.
+    """
+    try:
+        import astropy.units as u
+        from astropy.coordinates import AltAz, SkyCoord, get_body
+        from astropy.time import Time
+    except Exception as exc:
+        raise ImportError(
+            "Moving-body dAz/dEl mapping requires astropy. Install astropy, or use fixed RA/Dec/Galactic mapping."
+        ) from exc
+
+    from ..doppler import earth_location_from_meta
+
+    table = _df_to_native_endian(scantable.table).copy()
+    canonical_body = str(body).strip().lower()
+    if canonical_body not in {"moon", "sun"}:
+        raise ValueError(f"Unsupported moving body for Az/El offset mapping: {body!r}. Use 'moon' or 'sun'.")
+
+    timestamps = _resolve_time_for_astropy(table)
+    obstime = Time(timestamps.to_pydatetime(), scale="utc")
+    location = earth_location_from_meta(_combined_meta_for_location(scantable, table))
+    altaz_frame = AltAz(obstime=obstime, location=location)
+
+    body_coord = get_body(canonical_body, obstime, location=location)
+    beam_coord, input_frame_mode = _beam_skycoord_in_body_frame(table, body_coord=body_coord, scantable=scantable)
+    beam_altaz = beam_coord.transform_to(altaz_frame)
+    body_altaz = body_coord.transform_to(altaz_frame)
+
+    x_arcsec, y_arcsec = project_azel_offset_to_plane(
+        beam_altaz.az.to_value(u.deg),
+        beam_altaz.alt.to_value(u.deg),
+        body_altaz.az.to_value(u.deg),
+        body_altaz.alt.to_value(u.deg),
+        projection=projection,
+    )
+    corr_dx, corr_dy = resolve_pointing_offsets_arcsec(
+        table,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
+        table_index=pointing_table_index,
+    )
+    if np.any(corr_dx != 0.0) or np.any(corr_dy != 0.0):
+        warnings.warn(
+            "pointing correction is defined in moving-body sky-offset coordinates; "
+            "for Az/El-offset maps it is recorded but not applied. Use moon_sky_offset "
+            "or moon_selenographic when applying dx_arcsec/dy_arcsec.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    table["POINT_DX_ARCSEC"] = corr_dx
+    table["POINT_DY_ARCSEC"] = corr_dy
+
+    table["DAZ_BODY"] = x_arcsec / 3600.0
+    table["DEL_BODY"] = y_arcsec / 3600.0
+    table["BODY_AZ"] = body_altaz.az.to_value(u.deg)
+    table["BODY_EL"] = body_altaz.alt.to_value(u.deg)
+    table["BEAM_AZ"] = beam_altaz.az.to_value(u.deg)
+    table["BEAM_EL"] = beam_altaz.alt.to_value(u.deg)
+    table["BODY_RADEC_INPUT"] = input_frame_mode
+    return table, x_arcsec, y_arcsec, 0.0, 0.0
+
+
+def _prepare_moon_selenographic_table_and_coords(
+    scantable,
+    *,
+    projection: str = "CAR",
+    ref_coord=None,
+    ref_lon: float | None = None,
+    ref_lat: float | None = None,
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
+    pointing_table_index: int | None = None,
+):
+    """Create Moon-fixed selenographic coordinates using SpiceyPy lazily.
+
+    This path is separate from moving-body dAz/dEl offsets.  It intersects each
+    per-row beam line of sight with a SPICE Moon ellipsoid and grids the
+    resulting east-positive selenographic longitude and planetocentric latitude.
+    """
+    from .spice_selenographic import compute_moon_selenographic_lonlat
+
+    table0 = _df_to_native_endian(scantable.table).copy()
+    table, lon_deg, lat_deg, spice_meta = compute_moon_selenographic_lonlat(
+        scantable,
+        table0,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
+        pointing_table_index=pointing_table_index,
+    )
+    finite = np.isfinite(lon_deg) & np.isfinite(lat_deg)
+    if not np.any(finite):
+        raise ValueError(
+            "No rows intersect the SPICE Moon ellipsoid. Check pointing coordinates, timestamps, "
+            "observatory location, and SPICE kernel coverage."
+        )
+    lon0, lat0 = _resolve_reference_lonlat(
+        ref_coord,
+        "moon_selenographic",
+        lon_deg,
+        lat_deg,
+        ref_lon=ref_lon,
+        ref_lat=ref_lat,
+    )
+    x_arcsec, y_arcsec = project_to_plane(
+        lon_deg,
+        lat_deg,
+        lon0,
+        lat0,
+        projection=projection,
+        invert_x=False,
+    )
+    for key, value in spice_meta.items():
+        table.attrs[key] = value
+    return table, x_arcsec, y_arcsec, lon0, lat0
+
+
 def _angle_like_to_deg(value) -> float:
     if isinstance(value, np.generic):
         value = value.item()
@@ -598,6 +1150,23 @@ def _angle_like_to_deg(value) -> float:
         return float(value)
     except Exception:
         return np.nan
+
+
+
+def _circular_mean_deg(values: np.ndarray) -> float:
+    vals = np.asarray(values, dtype=float)
+    vals = vals[np.isfinite(vals)]
+    if vals.size == 0:
+        return np.nan
+    ang = np.deg2rad(vals)
+    s = float(np.nanmean(np.sin(ang)))
+    c = float(np.nanmean(np.cos(ang)))
+    if not np.isfinite(s) or not np.isfinite(c) or (abs(s) < 1e-15 and abs(c) < 1e-15):
+        return float(np.nanmedian(vals))
+    out = float(np.degrees(np.arctan2(s, c)) % 360.0)
+    if abs(out - 360.0) < 1e-10:
+        out = 0.0
+    return out
 
 
 def _resolve_reference_lonlat(ref_coord, frame: str, lon_deg: np.ndarray, lat_deg: np.ndarray, *, ref_lon=None, ref_lat=None) -> tuple[float, float]:
@@ -638,7 +1207,11 @@ def _resolve_reference_lonlat(ref_coord, frame: str, lon_deg: np.ndarray, lat_de
                         return float(lon0), float(lat0)
         raise ValueError("Could not interpret ref_coord as a reference sky position.")
 
-    return float(np.nanmedian(lon_deg[valid_mask])), float(np.nanmedian(lat_deg[valid_mask]))
+    if normalize_selenographic_coord_sys(frame)[0]:
+        lon0 = _circular_mean_deg(lon_deg[valid_mask])
+    else:
+        lon0 = float(np.nanmedian(lon_deg[valid_mask]))
+    return float(lon0), float(np.nanmedian(lat_deg[valid_mask]))
 
 
 def _prepare_projection_table_and_coords(
@@ -649,12 +1222,72 @@ def _prepare_projection_table_and_coords(
     ref_coord=None,
     ref_lon: float | None = None,
     ref_lat: float | None = None,
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
+    pointing_table_index: int | None = None,
 ):
-    table = _df_to_native_endian(scantable.table).copy()
-    lon_deg, lat_deg = _extract_lon_lat_arrays(table, frame)
-    lon0, lat0 = _resolve_reference_lonlat(ref_coord, frame, lon_deg, lat_deg, ref_lon=ref_lon, ref_lat=ref_lat)
+    table0 = _df_to_native_endian(scantable.table).copy()
+    canonical_frame = _canonical_projection_frame(scantable, frame, ref_coord=ref_coord, table=table0)
+    is_seleno, _selenobody, _selenocanon = normalize_selenographic_coord_sys(canonical_frame)
+    if is_seleno:
+        return _prepare_moon_selenographic_table_and_coords(
+            scantable,
+            projection=projection,
+            ref_coord=ref_coord,
+            ref_lon=ref_lon,
+            ref_lat=ref_lat,
+            pointing_correction=pointing_correction,
+            pointing_dx_arcsec=pointing_dx_arcsec,
+            pointing_dy_arcsec=pointing_dy_arcsec,
+            pointing_table_index=pointing_table_index,
+        )
+
+    is_disk_offset, _disk_body, _ = normalize_moon_disk_offset_coord_sys(canonical_frame)
+    if is_disk_offset:
+        if ref_lon is not None or ref_lat is not None:
+            raise ValueError("ref_lon/ref_lat are not meaningful for moon_disk_offset maps.")
+        return _prepare_moon_disk_offset_table_and_coords(
+            scantable,
+            projection=projection,
+            pointing_correction=pointing_correction,
+            pointing_dx_arcsec=pointing_dx_arcsec,
+            pointing_dy_arcsec=pointing_dy_arcsec,
+            pointing_table_index=pointing_table_index,
+        )
+
+    is_sky_offset, sky_body, _ = normalize_sky_offset_coord_sys(canonical_frame)
+    if is_sky_offset:
+        if ref_lon is not None or ref_lat is not None:
+            raise ValueError("ref_lon/ref_lat are not meaningful for moving-body sky offset maps.")
+        return _prepare_moving_body_sky_offset_table_and_coords(
+            scantable,
+            body=sky_body,
+            projection=projection,
+            pointing_correction=pointing_correction,
+            pointing_dx_arcsec=pointing_dx_arcsec,
+            pointing_dy_arcsec=pointing_dy_arcsec,
+            pointing_table_index=pointing_table_index,
+        )
+
+    is_offset, body, _ = normalize_azel_offset_coord_sys(canonical_frame)
+    if is_offset:
+        if ref_lon is not None or ref_lat is not None:
+            raise ValueError("ref_lon/ref_lat are not meaningful for moving-body Az/El offset maps.")
+        return _prepare_moving_body_azel_offset_table_and_coords(
+            scantable,
+            body=body,
+            projection=projection,
+            pointing_correction=pointing_correction,
+            pointing_dx_arcsec=pointing_dx_arcsec,
+            pointing_dy_arcsec=pointing_dy_arcsec,
+            pointing_table_index=pointing_table_index,
+        )
+
+    lon_deg, lat_deg = _extract_lon_lat_arrays(table0, canonical_frame)
+    lon0, lat0 = _resolve_reference_lonlat(ref_coord, canonical_frame, lon_deg, lat_deg, ref_lon=ref_lon, ref_lat=ref_lat)
     x_arcsec, y_arcsec = project_to_plane(lon_deg, lat_deg, lon0, lat0, projection=projection)
-    return table, x_arcsec, y_arcsec, lon0, lat0
+    return table0, x_arcsec, y_arcsec, lon0, lat0
 
 
 def _resolve_projection_reference_for_scantables(
@@ -664,9 +1297,24 @@ def _resolve_projection_reference_for_scantables(
     ref_coord=None,
     ref_lon: float | None = None,
     ref_lat: float | None = None,
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
 ) -> tuple[float, float]:
     if scantables is None:
         raise ValueError('scantables must not be None.')
+    first = scantables[0] if isinstance(scantables, (list, tuple)) and len(scantables) else None
+    if first is not None:
+        table0 = getattr(first, 'table', None)
+        canonical_frame = _canonical_projection_frame(first, frame, ref_coord=ref_coord, table=table0)
+        if (normalize_azel_offset_coord_sys(canonical_frame)[0]
+                or normalize_sky_offset_coord_sys(canonical_frame)[0]
+                or normalize_moon_disk_offset_coord_sys(canonical_frame)[0]):
+            if ref_lon is not None or ref_lat is not None:
+                raise ValueError("ref_lon/ref_lat are not meaningful for moving-body offset maps.")
+            return 0.0, 0.0
+    else:
+        canonical_frame = frame
     lon_parts = []
     lat_parts = []
     for idx, scantable in enumerate(scantables):
@@ -674,7 +1322,23 @@ def _resolve_projection_reference_for_scantables(
         if table is None:
             raise ValueError(f'scantable at index {idx} does not have a .table attribute.')
         table_df = _df_to_native_endian(table)
-        lon_deg, lat_deg = _extract_lon_lat_arrays(table_df, frame)
+        frame_i = _canonical_projection_frame(scantable, frame, ref_coord=ref_coord, table=table_df)
+        if (normalize_azel_offset_coord_sys(frame_i)[0]
+                or normalize_sky_offset_coord_sys(frame_i)[0]
+                or normalize_moon_disk_offset_coord_sys(frame_i)[0]):
+            continue
+        if normalize_selenographic_coord_sys(frame_i)[0]:
+            from .spice_selenographic import compute_moon_selenographic_lonlat
+            _tbl_spice, lon_deg, lat_deg, _spice_meta = compute_moon_selenographic_lonlat(
+                scantable,
+                table_df,
+                pointing_correction=pointing_correction,
+                pointing_dx_arcsec=pointing_dx_arcsec,
+                pointing_dy_arcsec=pointing_dy_arcsec,
+                pointing_table_index=idx,
+            )
+        else:
+            lon_deg, lat_deg = _extract_lon_lat_arrays(table_df, frame_i)
         valid = np.isfinite(lon_deg) & np.isfinite(lat_deg)
         if np.any(valid):
             lon_parts.append(np.asarray(lon_deg[valid], dtype=float))
@@ -683,7 +1347,7 @@ def _resolve_projection_reference_for_scantables(
         raise ValueError('No finite coordinates found across the supplied scantables.')
     lon_all = np.concatenate(lon_parts)
     lat_all = np.concatenate(lat_parts)
-    return _resolve_reference_lonlat(ref_coord, frame, lon_all, lat_all, ref_lon=ref_lon, ref_lat=ref_lat)
+    return _resolve_reference_lonlat(ref_coord, canonical_frame, lon_all, lat_all, ref_lon=ref_lon, ref_lat=ref_lat)
 
 
 _VALID_OTF_INPUT_STATES = (
@@ -960,6 +1624,9 @@ def run_mapping_pipeline(
     otf_scan_png=None,
     existing_turn_labels: str | None = None,
     otf_scan_existing_is_turn: str | None = None,
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
 ):
     """
     Scantable から 3D FITS キューブを生成する汎用統合パイプライン。
@@ -1013,13 +1680,17 @@ def run_mapping_pipeline(
 
     # 2. 座標投影 (deg -> arcsec)
     print("2. Projecting coordinates to local plane...")
+    coord_sys_out = _canonical_projection_frame(scantable, coord_sys, ref_coord=ref_coord, table=getattr(scantable, "table", None))
     table, x_arcsec, y_arcsec, lon0, lat0 = _prepare_projection_table_and_coords(
         scantable,
-        frame=coord_sys,
+        frame=coord_sys_out,
         projection=projection,
         ref_coord=ref_coord,
         ref_lon=ref_lon,
         ref_lat=ref_lat,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
     )
 
     # 3. 温度スケールと BEAMEFF の処理
@@ -1085,6 +1756,10 @@ def run_mapping_pipeline(
         res.meta = {}
     res.meta["RESTFREQ"] = _extract_restfreq(scantable, table)
     res.meta["SPECSYS"] = "LSRK"
+    if hasattr(table, "attrs"):
+        for key, value in getattr(table, "attrs", {}).items():
+            if str(key).startswith("spice_") or str(key).startswith("moon_disk_"):
+                res.meta[key] = value
 
     beam_meta = res.meta or {}
     _print_effective_beam_summary(beam_meta)
@@ -1095,7 +1770,7 @@ def run_mapping_pipeline(
     save_map_fits(
         res,
         v_tgt,
-        coord_sys,
+        coord_sys_out,
         projection,
         lon0,
         lat0,
@@ -1110,7 +1785,7 @@ def run_mapping_pipeline(
             scantable=scantable,
             table=table,
             config=runtime_config,
-            coord_sys=coord_sys,
+            coord_sys=coord_sys_out,
             projection=projection,
             out_scale_norm=out_scale_norm,
             ref_lon=lon0,
@@ -1214,18 +1889,27 @@ def create_grid_input(
     otf_scan_png=None,
     existing_turn_labels: str | None = None,
     otf_scan_existing_is_turn: str | None = None,
+    pointing_correction=None,
+    pointing_dx_arcsec=None,
+    pointing_dy_arcsec=None,
+    pointing_table_index: int | None = None,
 ):
     """
     Scantable から GridInput を安全に生成する。
     Basket-weave と最終 gridding で同じ座標投影・同じ OTF 領域判定を使う。
     """
+    frame_out = _canonical_projection_frame(scantable, frame, ref_coord=ref_coord, table=getattr(scantable, "table", None))
     table, x_arcsec, y_arcsec, _, _ = _prepare_projection_table_and_coords(
         scantable,
-        frame=frame,
+        frame=frame_out,
         projection=projection,
         ref_coord=ref_coord,
         ref_lon=ref_lon,
         ref_lat=ref_lat,
+        pointing_correction=pointing_correction,
+        pointing_dx_arcsec=pointing_dx_arcsec,
+        pointing_dy_arcsec=pointing_dy_arcsec,
+        pointing_table_index=pointing_table_index,
     )
     grid_input, otf_scan_summary = _assemble_grid_input(
         scantable=scantable,

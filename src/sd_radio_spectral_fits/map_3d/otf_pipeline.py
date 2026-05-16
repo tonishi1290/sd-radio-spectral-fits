@@ -7,12 +7,26 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .gridder import run_mapping_pipeline, create_grid_input, _resolve_projection_reference_for_scantables
+from .gridder import (
+    run_mapping_pipeline,
+    create_grid_input,
+    _resolve_projection_reference_for_scantables,
+    _canonical_projection_frame,
+)
 from .basketweave import (
     basket_weave_inplace,
     _merge_grid_inputs,
 )
 from .otf_scan_region import format_otf_scan_summary
+from .wcs_proj import (
+    normalize_azel_offset_coord_sys,
+    normalize_sky_offset_coord_sys,
+    normalize_moon_disk_offset_coord_sys,
+)
+from .pointing_correction import (
+    select_pointing_correction_for_index,
+    select_pointing_component_for_index,
+)
 
 
 _BASKET_KW_NAMES = {
@@ -48,6 +62,33 @@ _OTF_REGION_KW_NAMES = {
     "existing_turn_labels",
     "otf_scan_existing_is_turn",
 }
+
+_POINTING_KW_NAMES = {
+    "pointing_correction",
+    "pointing_dx_arcsec",
+    "pointing_dy_arcsec",
+}
+
+
+def _moving_offset_frame_info(frame, *, ref_coord=None):
+    """Return (is_offset, canonical_frame, body) for public OTF wrappers."""
+    is_disk, disk_body, disk_canonical = normalize_moon_disk_offset_coord_sys(frame, ref_coord=ref_coord)
+    if is_disk:
+        return True, disk_canonical, disk_body
+    is_sky, sky_body, sky_canonical = normalize_sky_offset_coord_sys(frame, ref_coord=ref_coord)
+    if is_sky:
+        return True, sky_canonical, sky_body
+    is_offset, body, canonical = normalize_azel_offset_coord_sys(frame, ref_coord=ref_coord)
+    return bool(is_offset), canonical, body
+
+
+def _validate_no_reference_for_moving_offset(*, ref_lon, ref_lat, caller: str):
+    if ref_lon is not None or ref_lat is not None:
+        raise ValueError(
+            f"{caller}: ref_lon/ref_lat are not meaningful for moving-body offset maps. "
+            "Use coord_sys='moon_disk_offset', 'moon_sky_offset', 'moon_azel_offset', or the corresponding Sun frame without ref_lon/ref_lat."
+        )
+
 
 
 def _validate_multi_scantable_sequence(scantables, *, caller: str):
@@ -87,6 +128,37 @@ def _filter_nonempty_scantables(scantables, *, caller: str):
         )
     return kept, skipped
 
+
+
+
+
+def _reindex_pointing_kwargs_for_effective_inputs(pointing_kwargs: dict | None, kept_inputs: list[tuple[int, object]]) -> dict:
+    """Resolve original-input-index pointing kwargs for a filtered effective list.
+
+    Lower-level list handlers enumerate the supplied list from zero.  When
+    empty scantables have been removed, user-provided per-input lists/dicts must
+    therefore be converted to the effective-list order before calling those
+    handlers.
+    """
+    if not pointing_kwargs:
+        return {}
+    out = dict(pointing_kwargs)
+    if "pointing_correction" in out and out["pointing_correction"] is not None:
+        out["pointing_correction"] = [
+            select_pointing_correction_for_index(out["pointing_correction"], int(orig_idx))
+            for orig_idx, _sc in kept_inputs
+        ]
+    if "pointing_dx_arcsec" in out and out["pointing_dx_arcsec"] is not None:
+        out["pointing_dx_arcsec"] = [
+            select_pointing_component_for_index(out["pointing_dx_arcsec"], int(orig_idx))
+            for orig_idx, _sc in kept_inputs
+        ]
+    if "pointing_dy_arcsec" in out and out["pointing_dy_arcsec"] is not None:
+        out["pointing_dy_arcsec"] = [
+            select_pointing_component_for_index(out["pointing_dy_arcsec"], int(orig_idx))
+            for orig_idx, _sc in kept_inputs
+        ]
+    return out
 
 
 def _extract_named_kwargs(kwargs: dict, names: set[str]) -> dict:
@@ -162,6 +234,7 @@ def _materialize_single_otf_table(
     ref_lat: float | None = None,
     otf_region_kwargs: dict,
     table_index: int,
+    pointing_kwargs: dict | None = None,
 ):
     grid_input = create_grid_input(
         scantable,
@@ -171,6 +244,8 @@ def _materialize_single_otf_table(
         frame=frame,
         projection=projection,
         **otf_region_kwargs,
+        **(pointing_kwargs or {}),
+        pointing_table_index=int(table_index),
     )
     table = pd.DataFrame(scantable.table).copy()
     scan_id = None if grid_input.scan_id is None else np.asarray(grid_input.scan_id, dtype=np.int64)
@@ -206,6 +281,7 @@ def _build_multi_scantable_for_mapping(
     otf_region_kwargs: dict,
     kept_inputs: list[tuple[int, object]] | None = None,
     skipped_empty_indices: list[int] | None = None,
+    pointing_kwargs: dict | None = None,
 ):
     _validate_multi_scantable_sequence(scantables, caller='run_otf_full_pipeline_multi()')
     if kept_inputs is None or skipped_empty_indices is None:
@@ -217,13 +293,30 @@ def _build_multi_scantable_for_mapping(
         kept_inputs = [(int(idx), sc) for idx, sc in kept_inputs]
         skipped_empty_indices = [int(v) for v in skipped_empty_indices]
     effective_scantables = [sc for _, sc in kept_inputs]
-    if ref_coord is None and (ref_lon is None or ref_lat is None):
+    frame = _canonical_projection_frame(
+        effective_scantables[0],
+        frame,
+        ref_coord=ref_coord,
+        table=getattr(effective_scantables[0], "table", None),
+    )
+    is_offset, _, _ = _moving_offset_frame_info(frame, ref_coord=ref_coord)
+    if is_offset:
+        _validate_no_reference_for_moving_offset(
+            ref_lon=ref_lon,
+            ref_lat=ref_lat,
+            caller="run_otf_full_pipeline_multi()",
+        )
+        ref_coord = None
+        ref_lon = None
+        ref_lat = None
+    elif ref_coord is None and (ref_lon is None or ref_lat is None):
         ref_lon, ref_lat = _resolve_projection_reference_for_scantables(
             effective_scantables,
             frame=frame,
             ref_coord=ref_coord,
             ref_lon=ref_lon,
             ref_lat=ref_lat,
+            **(pointing_kwargs or {}),
         )
         ref_coord = (float(ref_lon), float(ref_lat))
     png_seq_all = _resolve_otf_scan_png_sequence(
@@ -246,6 +339,10 @@ def _build_multi_scantable_for_mapping(
             ref_lat=ref_lat,
             otf_region_kwargs=item_otf_kwargs,
             table_index=orig_idx,
+            pointing_kwargs={
+                **(pointing_kwargs or {}),
+                "pointing_correction": select_pointing_correction_for_index((pointing_kwargs or {}).get("pointing_correction"), orig_idx),
+            },
         )
         setattr(gi, '_source_input_index', int(orig_idx))
         grid_inputs.append(gi)
@@ -317,28 +414,43 @@ def run_otf_full_pipeline(
     basket_kwargs = _extract_named_kwargs(kwargs, _BASKET_KW_NAMES)
     runtime_kwargs = _extract_named_kwargs(kwargs, _RUNTIME_KW_NAMES)
     otf_region_kwargs = _extract_named_kwargs(kwargs, _OTF_REGION_KW_NAMES)
+    pointing_kwargs = _extract_named_kwargs(kwargs, _POINTING_KW_NAMES)
     ref_coord = kwargs.pop('ref_coord', None)
     ref_lon = kwargs.pop('ref_lon', None)
     ref_lat = kwargs.pop('ref_lat', None)
 
     frame = str(kwargs.get("coord_sys", "ICRS")).upper()
+    frame = _canonical_projection_frame(scantable, frame, ref_coord=ref_coord, table=getattr(scantable, "table", None))
+    kwargs["coord_sys"] = frame
     projection = kwargs.get("projection", "SFL")
     verbose = bool(getattr(config, 'verbose', False) or runtime_kwargs.get('verbose', False))
-    common_ref_coord = ref_coord
-    common_ref_lon = ref_lon
-    common_ref_lat = ref_lat
-    if common_ref_coord is None:
-        if common_ref_lon is not None and common_ref_lat is not None:
-            common_ref_coord = (float(common_ref_lon), float(common_ref_lat))
-        else:
-            common_ref_lon, common_ref_lat = _resolve_projection_reference_for_scantables(
-                [scantable],
-                frame=frame,
-                ref_coord=ref_coord,
-                ref_lon=ref_lon,
-                ref_lat=ref_lat,
-            )
-            common_ref_coord = (float(common_ref_lon), float(common_ref_lat))
+    is_offset_frame, _, _ = _moving_offset_frame_info(frame, ref_coord=ref_coord)
+    if is_offset_frame:
+        _validate_no_reference_for_moving_offset(
+            ref_lon=ref_lon,
+            ref_lat=ref_lat,
+            caller="run_otf_full_pipeline()",
+        )
+        common_ref_coord = None
+        common_ref_lon = None
+        common_ref_lat = None
+    else:
+        common_ref_coord = ref_coord
+        common_ref_lon = ref_lon
+        common_ref_lat = ref_lat
+        if common_ref_coord is None:
+            if common_ref_lon is not None and common_ref_lat is not None:
+                common_ref_coord = (float(common_ref_lon), float(common_ref_lat))
+            else:
+                common_ref_lon, common_ref_lat = _resolve_projection_reference_for_scantables(
+                    [scantable],
+                    frame=frame,
+                    ref_coord=ref_coord,
+                    ref_lon=ref_lon,
+                    ref_lat=ref_lat,
+                    **pointing_kwargs,
+                )
+                common_ref_coord = (float(common_ref_lon), float(common_ref_lat))
 
     if do_basket_weave:
         print("Executing Basket-weave correction...")
@@ -349,6 +461,7 @@ def run_otf_full_pipeline(
             frame=frame,
             **basket_kwargs,
             **otf_region_kwargs,
+            **pointing_kwargs,
         )
         if verbose:
             print(
@@ -373,6 +486,7 @@ def run_otf_full_pipeline(
         ref_lat=common_ref_lat,
         **runtime_kwargs,
         **otf_region_kwargs_for_mapping,
+        **pointing_kwargs,
         **kwargs,
     )
 
@@ -396,18 +510,38 @@ def run_otf_full_pipeline_multi(
     basket_kwargs = _extract_named_kwargs(kwargs, _BASKET_KW_NAMES)
     runtime_kwargs = _extract_named_kwargs(kwargs, _RUNTIME_KW_NAMES)
     otf_region_kwargs = _extract_named_kwargs(kwargs, _OTF_REGION_KW_NAMES)
+    pointing_kwargs = _extract_named_kwargs(kwargs, _POINTING_KW_NAMES)
+    effective_pointing_kwargs = _reindex_pointing_kwargs_for_effective_inputs(pointing_kwargs, kept_inputs)
     ref_coord = kwargs.pop('ref_coord', None)
     ref_lon = kwargs.pop('ref_lon', None)
     ref_lat = kwargs.pop('ref_lat', None)
 
     frame = str(kwargs.get('coord_sys', 'ICRS')).upper()
+    frame = _canonical_projection_frame(
+        effective_scantables[0],
+        frame,
+        ref_coord=ref_coord,
+        table=getattr(effective_scantables[0], "table", None),
+    )
+    kwargs['coord_sys'] = frame
     projection = kwargs.get('projection', 'SFL')
     verbose = bool(getattr(config, 'verbose', False) or runtime_kwargs.get('verbose', False))
     default_png_base = str(Path(output_fits).with_suffix(Path(output_fits).suffix + '.scan_region.png'))
-    common_ref_lon, common_ref_lat = _resolve_projection_reference_for_scantables(
-        effective_scantables, frame=frame, ref_coord=ref_coord, ref_lon=ref_lon, ref_lat=ref_lat
-    )
-    common_ref_coord = (float(common_ref_lon), float(common_ref_lat))
+    is_offset_frame, _, _ = _moving_offset_frame_info(frame, ref_coord=ref_coord)
+    if is_offset_frame:
+        _validate_no_reference_for_moving_offset(
+            ref_lon=ref_lon,
+            ref_lat=ref_lat,
+            caller="run_otf_full_pipeline_multi()",
+        )
+        common_ref_lon = None
+        common_ref_lat = None
+        common_ref_coord = None
+    else:
+        common_ref_lon, common_ref_lat = _resolve_projection_reference_for_scantables(
+            effective_scantables, frame=frame, ref_coord=ref_coord, ref_lon=ref_lon, ref_lat=ref_lat, **effective_pointing_kwargs
+        )
+        common_ref_coord = (float(common_ref_lon), float(common_ref_lat))
     otf_region_kwargs_for_multi = dict(otf_region_kwargs)
     png_seq = _resolve_otf_scan_png_sequence(
         otf_region_kwargs.get('otf_scan_png', None),
@@ -429,6 +563,7 @@ def run_otf_full_pipeline_multi(
             frame=frame,
             **basket_kwargs,
             **bw_region_kwargs,
+            **effective_pointing_kwargs,
         )
         if verbose:
             print(
@@ -453,6 +588,7 @@ def run_otf_full_pipeline_multi(
         otf_region_kwargs=otf_region_kwargs_for_multi,
         kept_inputs=kept_inputs,
         skipped_empty_indices=skipped_empty_indices,
+        pointing_kwargs=pointing_kwargs,
     )
     if verbose and merged_summary is not None:
         print(f'   {format_otf_scan_summary(merged_summary)}')
@@ -473,5 +609,6 @@ def run_otf_full_pipeline_multi(
         existing_turn_labels=None,
         otf_scan_existing_is_turn=None,
         **runtime_kwargs,
+        **pointing_kwargs,
         **kwargs,
     )

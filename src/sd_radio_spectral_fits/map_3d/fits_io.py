@@ -1,7 +1,13 @@
 # src/map/fits_io.py
 import numpy as np
 from astropy.io import fits
-from .wcs_proj import build_spatial_wcs_dict
+from .wcs_proj import (
+    build_spatial_wcs_dict,
+    normalize_azel_offset_coord_sys,
+    normalize_sky_offset_coord_sys,
+    normalize_moon_disk_offset_coord_sys,
+    normalize_selenographic_coord_sys,
+)
 
 
 def save_map_fits(
@@ -57,8 +63,73 @@ def save_map_fits(
 
 def _fill_header_metadata(header, coord_sys, lon0, lat0, out_scale, rep_beameff, grid_res):
     """ヘッダーへの観測情報の書き込み"""
-    is_galactic = coord_sys.lower() in ("galactic", "gal")
-    if is_galactic:
+    is_seleno, seleno_body, seleno_canonical = normalize_selenographic_coord_sys(coord_sys)
+    is_sky_offset, sky_body, sky_canonical = normalize_sky_offset_coord_sys(coord_sys)
+    is_disk_offset, disk_body, disk_canonical = normalize_moon_disk_offset_coord_sys(coord_sys)
+    is_offset, body, canonical = normalize_azel_offset_coord_sys(coord_sys)
+    is_galactic = str(coord_sys).lower() in ("galactic", "gal")
+    if is_seleno:
+        # Moon body-fixed surface map.  The spatial WCS uses generic LON/LAT
+        # axes for broad FITS-viewer compatibility; these keywords document the
+        # physical semantics and the SPICE assumptions.
+        header["COORDSYS"] = ("SELENOGRAPHIC", "Moon body-fixed surface coordinates")
+        header["BODY"] = ("MOON", "Solar-system body")
+        header["SELONDIR"] = ("EAST", "Selenographic longitude positive direction")
+        header["SELLAT"] = ("PLANETOCENTRIC", "Latitude definition")
+        header["SURFACE"] = ("ELLIPSOID", "SPICE surface model")
+        if getattr(grid_res, "meta", None):
+            meta = grid_res.meta
+            if meta.get("spice_moon_frame") is not None:
+                header["SELFRAME"] = (str(meta["spice_moon_frame"]), "SPICE Moon body-fixed frame")
+            if meta.get("spice_abcorr") is not None:
+                header["SPCABCOR"] = (str(meta["spice_abcorr"]), "SPICE aberration-correction label")
+            if meta.get("spice_valid_count") is not None:
+                header["SPCHITS"] = (int(meta["spice_valid_count"]), "Rows intersecting Moon ellipsoid")
+            if meta.get("spice_row_count") is not None:
+                header["SPCROWS"] = (int(meta["spice_row_count"]), "Rows attempted for SPICE intersection")
+    elif is_disk_offset:
+        # Apparent Moon-disk offsets: a linear angular coordinate system centered
+        # on the apparent Moon center, with +Y rotated to apparent lunar north.
+        # This is not RA/Dec and not selenographic longitude/latitude.
+        header["COORDSYS"] = ("MOON_DISK_OFFSET", "Spatial WCS is apparent lunar-disk offset")
+        header["OFFSYS"] = ("MOON_DISK", "Offset frame")
+        header["OFFBODY"] = ("MOON", "Moving body used as offset origin")
+        header["OFFREF"] = ("BODYCTR", "Offset origin is apparent Moon center")
+        header["REFOFFX"] = (0.0, "Reference X offset (deg)")
+        header["REFOFFY"] = (0.0, "Reference Y offset (deg)")
+        header["DISKREF"] = ("APPARENT", "Apparent lunar disk, not surface lon/lat")
+        header["DISKYPOS"] = ("LUNAR_NORTH", "+Y aligned to apparent lunar north")
+        header["DISKXPOS"] = ("PA_NORTH_PLUS_90", "+X is +90 deg from lunar north PA")
+        if getattr(grid_res, "meta", None):
+            meta = grid_res.meta
+            if meta.get("moon_disk_pa_model") is not None:
+                header["DISKPAM"] = (str(meta["moon_disk_pa_model"]), "Lunar pole PA model")
+            if np.isfinite(meta.get("moon_disk_pa_median_deg", np.nan)):
+                header["PAPOLE"] = (float(meta["moon_disk_pa_median_deg"]), "Median lunar north PA [deg]")
+    elif is_sky_offset:
+        # Moon/Sun-centered apparent sky-plane offsets.  This is the preferred
+        # frame for removing AltAz field rotation from dAz/dEl scans while still
+        # displaying the body as an approximately 30 arcmin apparent disk.
+        header["COORDSYS"] = ("SKY_OFFSET", "Spatial WCS is moving-body sky-plane offset")
+        header["OFFSYS"] = ("RADEC", "Offset frame")
+        if sky_body is not None:
+            header["OFFBODY"] = (str(sky_body).upper(), "Moving body used as offset origin")
+        header["OFFREF"] = ("BODYCTR", "Offset origin is apparent body center")
+        header["REFOFFX"] = (0.0, "Reference X offset (deg)")
+        header["REFOFFY"] = (0.0, "Reference Y offset (deg)")
+    elif is_offset:
+        # This is a physically topocentric moving-object offset map, not a fixed
+        # celestial map.  Therefore do not write OBSRA/OBSDEC as if the spatial
+        # WCS were RA/Dec.  The linear WCS itself is FITS-compliant; these
+        # keywords document the frame semantics for humans and custom readers.
+        header["COORDSYS"] = ("AZEL_OFFSET", "Spatial WCS is moving-body Az/El offset")
+        header["OFFSYS"] = ("AZEL", "Offset frame")
+        if body is not None:
+            header["OFFBODY"] = (str(body).upper(), "Moving body used as offset origin")
+        header["OFFREF"] = ("BODYCTR", "Offset origin is apparent body center")
+        header["REFOFFX"] = (0.0, "Reference X offset (deg)")
+        header["REFOFFY"] = (0.0, "Reference Y offset (deg)")
+    elif is_galactic:
         header["OBSGLON"] = (float(lon0), "Ref Galactic Longitude (deg)")
         header["OBSGLAT"] = (float(lat0), "Ref Galactic Latitude (deg)")
     else:

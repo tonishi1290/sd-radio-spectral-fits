@@ -10,6 +10,7 @@ from scipy.sparse.linalg import lsqr
 from scipy.spatial import cKDTree
 from .config import GridInput, normalize_row_flag_mask
 from .gridder import create_grid_input, _resolve_otf_processing_policy, _resolve_projection_reference_for_scantables
+from .pointing_correction import select_pointing_correction_for_index
 from ..ranges import parse_windows, window_to_mask
 
 
@@ -830,10 +831,10 @@ def estimate_basket_weave_search_radius_arcsec(input_data: GridInput, *, cross_s
             return radius
     return float(fallback_arcsec)
 
-def _as_grid_input(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None) -> GridInput:
+def _as_grid_input(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None, pointing_correction=None, pointing_dx_arcsec=None, pointing_dy_arcsec=None, pointing_table_index: int | None=None) -> GridInput:
     if isinstance(dataset_or_input_data, GridInput):
         return dataset_or_input_data
-    return create_grid_input(dataset_or_input_data, ref_coord=ref_coord, frame=frame, projection=projection, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
+    return create_grid_input(dataset_or_input_data, ref_coord=ref_coord, frame=frame, projection=projection, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn, pointing_correction=pointing_correction, pointing_dx_arcsec=pointing_dx_arcsec, pointing_dy_arcsec=pointing_dy_arcsec, pointing_table_index=pointing_table_index)
 
 def _concatenate_optional_numeric(arrays: list[np.ndarray | None], lengths: list[int]) -> np.ndarray | None:
     if all((a is None for a in arrays)):
@@ -998,7 +999,7 @@ def _merge_grid_inputs(inputs: Sequence[GridInput]) -> GridInput:
     setattr(merged, '_otf_scan_summary', merged_summary)
     return merged
 
-def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None) -> tuple[GridInput, object | None, bool, list[int] | None]:
+def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, frame: str, otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None, pointing_correction=None, pointing_dx_arcsec=None, pointing_dy_arcsec=None) -> tuple[GridInput, object | None, bool, list[int] | None]:
     """
     Normalize input into a single GridInput.
 
@@ -1026,7 +1027,13 @@ def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, fr
                     'When multi-input basketweave mixes GridInput and scantable objects, an explicit ref_coord is required '
                     'so that all inputs share the same projection reference.'
                 )
-            lon0, lat0 = _resolve_projection_reference_for_scantables(raw_items, frame=frame)
+            lon0, lat0 = _resolve_projection_reference_for_scantables(
+                raw_items,
+                frame=frame,
+                pointing_correction=pointing_correction,
+                pointing_dx_arcsec=pointing_dx_arcsec,
+                pointing_dy_arcsec=pointing_dy_arcsec,
+            )
             ref_coord_use = (float(lon0), float(lat0))
         png_paths_all = _resolve_otf_scan_png_sequence(otf_scan_png, len(dataset_or_input_data))
         grid_inputs = []
@@ -1041,6 +1048,10 @@ def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, fr
                 otf_scan_png=png_paths_all[orig_idx],
                 existing_turn_labels=existing_turn_labels,
                 otf_scan_existing_is_turn=otf_scan_existing_is_turn,
+                pointing_correction=select_pointing_correction_for_index(pointing_correction, orig_idx),
+                pointing_dx_arcsec=pointing_dx_arcsec,
+                pointing_dy_arcsec=pointing_dy_arcsec,
+                pointing_table_index=int(orig_idx),
             )
             setattr(gi, '_source_input_index', int(orig_idx))
             grid_inputs.append(gi)
@@ -1063,7 +1074,7 @@ def _prepare_input_data(dataset_or_input_data, *, projection: str, ref_coord, fr
     if isinstance(dataset_or_input_data, GridInput):
         _validate_grid_input_contract(dataset_or_input_data)
         return (dataset_or_input_data, None, False, None)
-    input_data = _as_grid_input(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
+    input_data = _as_grid_input(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn, pointing_correction=pointing_correction, pointing_dx_arcsec=pointing_dx_arcsec, pointing_dy_arcsec=pointing_dy_arcsec)
     return (input_data, dataset_or_input_data, True, None)
 
 def _sort_scan_sample_indices(indices: np.ndarray, time_values: np.ndarray | None) -> np.ndarray:
@@ -1817,7 +1828,7 @@ def apply_basket_weave_correction(input_data: GridInput, offsets_or_solution) ->
     else:
         input_data.spec -= correction_vector[:, np.newaxis]
 
-def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only', otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None) -> BasketWeaveResult:
+def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_coord=None, frame: str='ICRS', search_radius_arcsec: float | str='auto', damp: float=0.01, v_axis: np.ndarray | None=None, linefree_velocity_windows_kms: list[str] | list[tuple[float, float]] | None=None, channel_mask: np.ndarray | None=None, v_windows_kms: list[str] | list[tuple[float, float]] | None=None, cross_direction_only: bool=True, orthogonality_tolerance_deg: float=30.0, fallback_to_all_cross_scan_pairs: bool=True, pair_mode: str='segments', offset_model: str='constant', reference_mode: str | None='mean_zero', reference_direction=None, reference_scan_id: int | None=None, reference_constraint_weight: float=1000.0, reference_constrain_terms: str='offset_only', otf_input_state=None, otf_scan_region=None, otf_scan_png=None, existing_turn_labels: str | None=None, otf_scan_existing_is_turn: str | None=None, pointing_correction=None, pointing_dx_arcsec=None, pointing_dy_arcsec=None) -> BasketWeaveResult:
     _ensure_safe_basketweave_input(dataset_or_input_data, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region)
     effective_v_axis = None if v_axis is None else np.asarray(v_axis, dtype=float)
     resolved_windows = _resolve_linefree_velocity_windows(linefree_velocity_windows_kms=linefree_velocity_windows_kms, v_windows_kms=v_windows_kms)
@@ -1825,7 +1836,7 @@ def basket_weave_inplace(dataset_or_input_data, *, projection: str='SFL', ref_co
         inferred_v_axis = _infer_velocity_axis_kms_for_input(dataset_or_input_data)
         if inferred_v_axis is not None:
             effective_v_axis = np.asarray(inferred_v_axis, dtype=float)
-    input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn)
+    input_data, original_target, writeback_to_dataset, segment_lengths = _prepare_input_data(dataset_or_input_data, projection=projection, ref_coord=ref_coord, frame=frame, otf_input_state=otf_input_state, otf_scan_region=otf_scan_region, otf_scan_png=otf_scan_png, existing_turn_labels=existing_turn_labels, otf_scan_existing_is_turn=otf_scan_existing_is_turn, pointing_correction=pointing_correction, pointing_dx_arcsec=pointing_dx_arcsec, pointing_dy_arcsec=pointing_dy_arcsec)
     spec = np.asarray(input_data.spec)
     solution, diagnostics = _solve_basket_weave_core(input_data, search_radius_arcsec=search_radius_arcsec, damp=damp, v_axis=effective_v_axis, linefree_velocity_windows_kms=linefree_velocity_windows_kms, channel_mask=channel_mask, v_windows_kms=v_windows_kms, cross_direction_only=cross_direction_only, orthogonality_tolerance_deg=orthogonality_tolerance_deg, fallback_to_all_cross_scan_pairs=fallback_to_all_cross_scan_pairs, pair_mode=pair_mode, offset_model=offset_model, reference_mode=reference_mode, reference_direction=reference_direction, reference_scan_id=reference_scan_id, reference_constraint_weight=reference_constraint_weight, reference_constrain_terms=reference_constrain_terms)
     apply_basket_weave_correction(input_data, solution)
